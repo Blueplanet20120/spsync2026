@@ -1,0 +1,8 @@
+.env
+sp-cn
+installer_openpilot
+image/
+sunnypilot/
+__pycache__/
+*.pyc
+.DS_Store

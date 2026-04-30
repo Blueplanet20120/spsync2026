@@ -1,0 +1,63 @@
+name: sync-to-gitee
+
+on:
+  schedule:
+    # 每小时整点（UTC）。GitHub schedule 触发可能有数分钟抖动，属正常现象。
+    - cron: "0 * * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: sync-to-gitee
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Setup SSH agent (Gitee deploy key)
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.GITEE_SSH_PRIVATE_KEY }}
+
+      - name: Add gitee.com to known_hosts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          ssh-keyscan -t rsa,ecdsa,ed25519 gitee.com >> ~/.ssh/known_hosts
+
+      - name: Sync upstream -> patch -> push to Gitee
+        shell: bash
+        env:
+          GITEE_REPO_SSH: ${{ secrets.GITEE_REPO_SSH }}
+          # 避免 CI 因 LFS 推送耗时/不稳定而失败（脚本内部也会 setdefault）
+          GIT_LFS_SKIP_PUSH: "1"
+        run: |
+          set -euo pipefail
+
+          WORKDIR="$GITHUB_WORKSPACE/sunnypilot"
+          if [ ! -d "$WORKDIR/.git" ]; then
+            rm -rf "$WORKDIR"
+            git clone --depth=1 "https://github.com/sunnypilot/sunnypilot.git" "$WORKDIR"
+          fi
+
+          python3 "$GITHUB_WORKSPACE/tools/sync_to_gitee.py" \
+            --action all \
+            --workdir "$WORKDIR" \
+            --origin "$GITEE_REPO_SSH" \
+            --upstream "https://github.com/sunnypilot/sunnypilot.git"
+
