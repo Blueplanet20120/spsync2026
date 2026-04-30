@@ -25,10 +25,12 @@ import subprocess
 import sys
 import tempfile
 import datetime
+import time
 import urllib.error
 import urllib.request
 import traceback
 from pathlib import Path
+from dataclasses import dataclass, field
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -67,6 +69,27 @@ def run(cmd: list[str], cwd: str | None = None, env: dict[str, str] | None = Non
   if p.returncode != 0:
     raise RuntimeError(f"命令失败: {' '.join(cmd)}\n{p.stdout}")
   return p.stdout
+
+
+def log(stage: str, msg: str) -> None:
+  ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+  print(f"[{ts}] [{stage}] {msg}")
+
+
+def retry(op_name: str, fn, tries: int = 3, base_sleep_s: float = 1.0) -> any:
+  last: Exception | None = None
+  for i in range(1, tries + 1):
+    try:
+      return fn()
+    except Exception as e:
+      last = e
+      if i >= tries:
+        break
+      sleep_s = base_sleep_s * (2 ** (i - 1))
+      log("retry", f"{op_name} failed (attempt {i}/{tries}): {type(e).__name__}: {e}. sleep {sleep_s:.1f}s")
+      time.sleep(sleep_s)
+  assert last is not None
+  raise last
 
 
 def run_ssh(host: str, user: str, key_path: str, remote_cmd: str, timeout_s: int = 3600) -> str:
@@ -324,20 +347,24 @@ def prepare_git_env(root: Path) -> tuple[dict[str, str], Path | None]:
 
 
 def http_json(url: str, headers: dict[str, str] | None = None) -> dict:
-  req = urllib.request.Request(url, headers=headers or {})
-  with urllib.request.urlopen(req, timeout=30) as resp:
-    return json.loads(resp.read().decode("utf-8"))
+  def _do() -> dict:
+    req = urllib.request.Request(url, headers=headers or {})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+      return json.loads(resp.read().decode("utf-8"))
+  return retry(f"http_json {url}", _do, tries=3, base_sleep_s=1.0)
 
 
 def http_download(url: str, out_path: Path) -> None:
-  out_path.parent.mkdir(parents=True, exist_ok=True)
-  req = urllib.request.Request(url, headers={"User-Agent": "sync-to-gitee"})
-  with urllib.request.urlopen(req, timeout=60) as resp, out_path.open("wb") as f:
-    while True:
-      chunk = resp.read(1024 * 1024)
-      if not chunk:
-        break
-      f.write(chunk)
+  def _do() -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    req = urllib.request.Request(url, headers={"User-Agent": "sync-to-gitee"})
+    with urllib.request.urlopen(req, timeout=60) as resp, out_path.open("wb") as f:
+      while True:
+        chunk = resp.read(1024 * 1024)
+        if not chunk:
+          break
+        f.write(chunk)
+  return retry(f"http_download {url}", _do, tries=3, base_sleep_s=1.0)
 
 
 def http_multipart_post(url: str, fields: dict[str, str], file_field: str, filename: str, file_bytes: bytes) -> dict:
@@ -361,9 +388,11 @@ def http_multipart_post(url: str, fields: dict[str, str], file_field: str, filen
   req = urllib.request.Request(url, data=body, method="POST")
   req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
   req.add_header("Content-Length", str(len(body)))
-  with urllib.request.urlopen(req, timeout=120) as resp:
-    data = resp.read().decode("utf-8")
-    return json.loads(data) if data else {}
+  def _do() -> dict:
+    with urllib.request.urlopen(req, timeout=120) as resp:
+      data = resp.read().decode("utf-8")
+      return json.loads(data) if data else {}
+  return retry(f"http_multipart_post {url}", _do, tries=3, base_sleep_s=1.0)
 
 
 def ensure_line_in_tuple_block(src: str, key: str) -> str:
@@ -392,6 +421,24 @@ def replace_or_fail(path: Path, replacements: list[tuple[str, str]]) -> None:
     s = s.replace(a, b)
   if s != orig:
     path.write_text(s, encoding="utf-8")
+
+
+def write_if_changed(path: Path, new_text: str) -> bool:
+  old = path.read_text(encoding="utf-8") if path.exists() else ""
+  if new_text != old:
+    path.write_text(new_text, encoding="utf-8")
+    return True
+  return False
+
+
+def replace_or_fail_changed(path: Path, replacements: list[tuple[str, str]]) -> bool:
+  s = path.read_text(encoding="utf-8")
+  orig = s
+  for a, b in replacements:
+    if a not in s and b not in s:
+      raise RuntimeError(f"{path} 未找到预期内容: {a}")
+    s = s.replace(a, b)
+  return write_if_changed(path, s) if s != orig else False
 
 
 def parse_recorded_upstream_sha(commit_body: str, branch: str) -> str | None:
@@ -428,22 +475,41 @@ def should_update_submodules(recorded_upstream_sha: str | None, upstream_sha: st
     return True
 
 
-def patch_repo(root: Path) -> None:
-  # installer
+@dataclass
+class PatchResult:
+  name: str
+  changed_files: list[str] = field(default_factory=list)
+  changed: bool = False
+
+
+def _track_change(res: PatchResult, path: Path, changed: bool) -> None:
+  if changed:
+    res.changed = True
+    res.changed_files.append(str(path))
+
+
+def patch_installer_urls(root: Path) -> PatchResult:
+  res = PatchResult("installer_urls")
   installer = root / "selfdrive/ui/installer/installer.cc"
-  replace_or_fail(installer, [
+  changed = replace_or_fail_changed(installer, [
     ("https://github.com/commaai/openpilot.git", "https://gitee.com/xc2026/sunnypilot_cn.git"),
     ('#define GIT_SSH_URL "git@github.com:commaai/openpilot.git"', '#define GIT_SSH_URL "git@gitee.com:xc2026/sunnypilot_cn.git"'),
   ])
+  _track_change(res, installer, changed)
+  return res
 
-  # system/version.py
+
+def patch_version_py(root: Path) -> PatchResult:
+  res = PatchResult("system_version_py")
   version_py = root / "system/version.py"
   s = version_py.read_text(encoding="utf-8")
   s2 = ensure_line_in_tuple_block(s, "gitee.com/xc2026/sunnypilot_cn")
-  if s2 != s:
-    version_py.write_text(s2, encoding="utf-8")
+  _track_change(res, version_py, write_if_changed(version_py, s2))
+  return res
 
-  # system/updated/updated.py (inject insteadof rules if missing)
+
+def patch_updated_insteadof(root: Path) -> PatchResult:
+  res = PatchResult("updated_insteadof")
   updated_py = root / "system/updated/updated.py"
   s = updated_py.read_text(encoding="utf-8")
   if "ensure_url_insteadof(" not in s:
@@ -468,197 +534,293 @@ def patch_repo(root: Path) -> None:
   ensure_url_insteadof(\"url.git@gitee.com:xc2026/.insteadof\", \"git@github.com:\")
   ensure_url_insteadof(\"url.git@gitee.com:xc2026/.insteadof\", \"ssh://git@github.com/\")
 """
-    updated_py.write_text(s.replace(insert_after, inject), encoding="utf-8")
+    s2 = s.replace(insert_after, inject)
+    _track_change(res, updated_py, write_if_changed(updated_py, s2))
+  return res
 
-  # setup network connectivity check (avoid blocking on openpilot.comma.ai in CN)
+
+def patch_tici_setup(root: Path) -> PatchResult:
+  res = PatchResult("tici_setup")
   tici_setup = root / "system/ui/tici_setup.py"
-  if tici_setup.exists():
-    s = tici_setup.read_text(encoding="utf-8")
-    # Ensure OPENPILOT_URL points to CN-accessible installer binary (avoid requiring VPN)
-    if 'OPENPILOT_URL = "https://openpilot.comma.ai"' in s:
-      s = s.replace('OPENPILOT_URL = "https://openpilot.comma.ai"\n',
-                    'OPENPILOT_URL = "https://gitee.com/xc2026/sp-cn_install/raw/master/installer_openpilot"\n')
-      tici_setup.write_text(s, encoding="utf-8")
-      s = tici_setup.read_text(encoding="utf-8")
-    if "CONNECTIVITY_CHECK_URLS" not in s:
-      s = s.replace(
-        'OPENPILOT_URL = "https://gitee.com/xc2026/sp-cn_install/raw/master/installer_openpilot"\n',
-        'OPENPILOT_URL = "https://gitee.com/xc2026/sp-cn_install/raw/master/installer_openpilot"\n'
-        '# 国内环境可能无法访问 openpilot.comma.ai，导致安装流程卡在 “Waiting for internet”。\n'
-        '# 这里使用多个候选 URL：任意一个可访问即认为“已联网”。\n'
-        'CONNECTIVITY_CHECK_URLS = [\n'
-        '  # 恢复/刚刷机阶段系统时间可能不准，HTTPS 证书校验会失败，导致误判“无网络”\n'
-        '  # 优先使用 HTTP 探测（不依赖系统时间），再回退到 HTTPS。\n'
-        '  "http://www.baidu.com/",\n'
-        '  "https://www.baidu.com/",\n'
-        '  OPENPILOT_URL,\n'
-        ']\n'
-      )
-      # replace connectivity probe
-      s = s.replace(
-        "          urllib.request.urlopen(OPENPILOT_URL, timeout=2.0)\n",
-        "          ok = False\n"
-        "          for url in CONNECTIVITY_CHECK_URLS:\n"
-        "            try:\n"
-        "              # Hard fallback: raw TCP connect (ignores TLS/time, HTTP quirks)\n"
-        "              # Also avoid DNS dependency in recovery mode by probing well-known CN DNS IPs.\n"
-        "              if url.startswith(\"http://www.baidu.com\"):\n"
-        "                import socket\n"
-        "                for host, port in ((\"223.5.5.5\", 53), (\"114.114.114.114\", 53), (\"www.baidu.com\", 80)):\n"
-        "                  try:\n"
-        "                    socket.create_connection((host, port), timeout=2.0).close()\n"
-        "                    ok = True\n"
-        "                    break\n"
-        "                  except Exception:\n"
-        "                    continue\n"
-        "                if ok:\n"
-        "                  break\n"
-        "\n"
-        "              # Some sites don't reliably support HEAD; fall back to GET.\n"
-        "              try:\n"
-        "                req = urllib.request.Request(url, method=\"HEAD\")\n"
-        "                urllib.request.urlopen(req, timeout=2.0)\n"
-        "              except Exception:\n"
-        "                req = urllib.request.Request(url, method=\"GET\")\n"
-        "                urllib.request.urlopen(req, timeout=2.0)\n"
-        "              ok = True\n"
-        "              break\n"
-        "            except Exception:\n"
-        "              continue\n"
-        "          if not ok:\n"
-        "            raise RuntimeError(\"no connectivity\")\n"
-      )
-      tici_setup.write_text(s, encoding="utf-8")
-    else:
-      # Ensure CN-friendly order even if already patched
-      s2 = s.replace('"https://gitee.com/",\n  "https://www.baidu.com/",\n', '"http://www.baidu.com/",\n  "https://www.baidu.com/",\n')
-      if s2 != s:
-        tici_setup.write_text(s2, encoding="utf-8")
+  if not tici_setup.exists():
+    return res
 
-    # Always allow continue when Wi-Fi is connected (avoid being stuck on "Waiting for internet")
-    s = tici_setup.read_text(encoding="utf-8")
-    if "continue_enabled = self.network_connected.is_set() or self.wifi_connected.is_set()" not in s:
-      s2 = s.replace("    continue_enabled = self.network_connected.is_set()\n",
-                     "    # 只要 Wi-Fi 已连接就允许继续，避免因探测失败导致卡死（国内网络/DNS/证书等问题）\n"
-                     "    continue_enabled = self.network_connected.is_set() or self.wifi_connected.is_set()\n")
-      if s2 != s:
-        tici_setup.write_text(s2, encoding="utf-8")
+  s = tici_setup.read_text(encoding="utf-8")
+  orig = s
+  if 'OPENPILOT_URL = "https://openpilot.comma.ai"' in s:
+    s = s.replace('OPENPILOT_URL = "https://openpilot.comma.ai"\n',
+                  'OPENPILOT_URL = "https://gitee.com/xc2026/sp-cn_install/raw/master/installer_openpilot"\n')
+  if "CONNECTIVITY_CHECK_URLS" not in s:
+    s = s.replace(
+      'OPENPILOT_URL = "https://gitee.com/xc2026/sp-cn_install/raw/master/installer_openpilot"\n',
+      'OPENPILOT_URL = "https://gitee.com/xc2026/sp-cn_install/raw/master/installer_openpilot"\n'
+      '# 国内环境可能无法访问 openpilot.comma.ai，导致安装流程卡在 “Waiting for internet”。\n'
+      '# 这里使用多个候选 URL：任意一个可访问即认为“已联网”。\n'
+      'CONNECTIVITY_CHECK_URLS = [\n'
+      '  # 恢复/刚刷机阶段系统时间可能不准，HTTPS 证书校验会失败，导致误判“无网络”\n'
+      '  # 优先使用 HTTP 探测（不依赖系统时间），再回退到 HTTPS。\n'
+      '  "http://www.baidu.com/",\n'
+      '  "https://www.baidu.com/",\n'
+      '  OPENPILOT_URL,\n'
+      ']\n'
+    )
+    s = s.replace(
+      "          urllib.request.urlopen(OPENPILOT_URL, timeout=2.0)\n",
+      "          ok = False\n"
+      "          for url in CONNECTIVITY_CHECK_URLS:\n"
+      "            try:\n"
+      "              # Hard fallback: raw TCP connect (ignores TLS/time, HTTP quirks)\n"
+      "              # Also avoid DNS dependency in recovery mode by probing well-known CN DNS IPs.\n"
+      "              if url.startswith(\"http://www.baidu.com\"):\n"
+      "                import socket\n"
+      "                for host, port in ((\"223.5.5.5\", 53), (\"114.114.114.114\", 53), (\"www.baidu.com\", 80)):\n"
+      "                  try:\n"
+      "                    socket.create_connection((host, port), timeout=2.0).close()\n"
+      "                    ok = True\n"
+      "                    break\n"
+      "                  except Exception:\n"
+      "                    continue\n"
+      "                if ok:\n"
+      "                  break\n"
+      "\n"
+      "              # Some sites don't reliably support HEAD; fall back to GET.\n"
+      "              try:\n"
+      "                req = urllib.request.Request(url, method=\"HEAD\")\n"
+      "                urllib.request.urlopen(req, timeout=2.0)\n"
+      "              except Exception:\n"
+      "                req = urllib.request.Request(url, method=\"GET\")\n"
+      "                urllib.request.urlopen(req, timeout=2.0)\n"
+      "              ok = True\n"
+      "              break\n"
+      "            except Exception:\n"
+      "              continue\n"
+      "          if not ok:\n"
+      "            raise RuntimeError(\"no connectivity\")\n"
+    )
+  else:
+    s = s.replace('"https://gitee.com/",\n  "https://www.baidu.com/",\n', '"http://www.baidu.com/",\n  "https://www.baidu.com/",\n')
 
-    # Ensure Wi-Fi connected detection doesn't depend on network_type reporting
-    s = tici_setup.read_text(encoding="utf-8")
-    if "def wlan0_has_ipv4()" not in s:
-      # add subprocess import if missing
-      if "import subprocess" not in s:
-        s = s.replace("import urllib.error\n", "import urllib.error\nimport subprocess\n")
-      s2 = s.replace(
-        "  def check_network_connectivity(self):\n",
-        "  def check_network_connectivity(self):\n"
-        "    def wlan0_has_ipv4() -> bool:\n"
-        "      try:\n"
-        "        out = subprocess.check_output([\"ip\", \"-4\", \"addr\", \"show\", \"dev\", \"wlan0\"], text=True, stderr=subprocess.DEVNULL)\n"
-        "        return \"inet \" in out\n"
-        "      except Exception:\n"
-        "        return False\n\n"
-      )
-      s2 = s2.replace(
-        "          if HARDWARE.get_network_type() == NetworkType.wifi:\n"
-        "            self.wifi_connected.set()\n"
-        "          else:\n"
-        "            self.wifi_connected.clear()\n",
-        "          # Wi-Fi connect detection in recovery should not depend on network_type reporting.\n"
-        "          # If wlan0 has an IPv4 address, treat it as connected.\n"
-        "          if wlan0_has_ipv4():\n"
-        "            self.wifi_connected.set()\n"
-        "          else:\n"
-        "            self.wifi_connected.clear()\n"
-      )
-      if s2 != s:
-        tici_setup.write_text(s2, encoding="utf-8")
+  if "continue_enabled = self.network_connected.is_set() or self.wifi_connected.is_set()" not in s:
+    s = s.replace("    continue_enabled = self.network_connected.is_set()\n",
+                  "    # 只要 Wi-Fi 已连接就允许继续，避免因探测失败导致卡死（国内网络/DNS/证书等问题）\n"
+                  "    continue_enabled = self.network_connected.is_set() or self.wifi_connected.is_set()\n")
 
+  if "def wlan0_has_ipv4()" not in s:
+    if "import subprocess" not in s:
+      s = s.replace("import urllib.error\n", "import urllib.error\nimport subprocess\n")
+    s = s.replace(
+      "  def check_network_connectivity(self):\n",
+      "  def check_network_connectivity(self):\n"
+      "    def wlan0_has_ipv4() -> bool:\n"
+      "      try:\n"
+      "        out = subprocess.check_output([\"ip\", \"-4\", \"addr\", \"show\", \"dev\", \"wlan0\"], text=True, stderr=subprocess.DEVNULL)\n"
+      "        return \"inet \" in out\n"
+      "      except Exception:\n"
+      "        return False\n\n"
+    )
+    s = s.replace(
+      "          if HARDWARE.get_network_type() == NetworkType.wifi:\n"
+      "            self.wifi_connected.set()\n"
+      "          else:\n"
+      "            self.wifi_connected.clear()\n",
+      "          # Wi-Fi connect detection in recovery should not depend on network_type reporting.\n"
+      "          # If wlan0 has an IPv4 address, treat it as connected.\n"
+      "          if wlan0_has_ipv4():\n"
+      "            self.wifi_connected.set()\n"
+      "          else:\n"
+      "            self.wifi_connected.clear()\n"
+    )
+  if s != orig:
+    _track_change(res, tici_setup, write_if_changed(tici_setup, s))
+  return res
+
+
+def patch_mici_setup(root: Path) -> PatchResult:
+  res = PatchResult("mici_setup")
   mici_setup = root / "system/ui/mici_setup.py"
-  if mici_setup.exists():
-    s = mici_setup.read_text(encoding="utf-8")
-    # Ensure OPENPILOT_URL points to CN-accessible installer binary (avoid requiring VPN)
-    if 'OPENPILOT_URL = "https://openpilot.comma.ai"' in s:
-      s = s.replace('OPENPILOT_URL = "https://openpilot.comma.ai"\n',
-                    'OPENPILOT_URL = "https://gitee.com/xc2026/sp-cn_install/raw/master/installer_openpilot"\n')
-      mici_setup.write_text(s, encoding="utf-8")
-      s = mici_setup.read_text(encoding="utf-8")
-    if "CONNECTIVITY_CHECK_URLS" not in s:
-      s = s.replace(
-        'OPENPILOT_URL = "https://gitee.com/xc2026/sp-cn_install/raw/master/installer_openpilot"\n',
-        'OPENPILOT_URL = "https://gitee.com/xc2026/sp-cn_install/raw/master/installer_openpilot"\n'
-        '# 国内环境可能无法访问 openpilot.comma.ai，导致 setup 卡在 “waiting for internet...”。\n'
-        '# 这里使用多个候选 URL：任意一个可访问即认为“已联网”。\n'
-        'CONNECTIVITY_CHECK_URLS = [\n'
-        '  # 恢复/刚刷机阶段系统时间可能不准，HTTPS 证书校验会失败，导致误判“无网络”\n'
-        '  # 优先使用 HTTP 探测（不依赖系统时间），再回退到 HTTPS。\n'
-        '  "http://www.baidu.com/",\n'
-        '  "https://www.baidu.com/",\n'
-        '  OPENPILOT_URL,\n'
-        ']\n'
-      )
-      s = s.replace(
-        "          request = urllib.request.Request(OPENPILOT_URL, method=\"HEAD\")\n"
-        "          urllib.request.urlopen(request, timeout=2.0)\n",
-        "          ok = False\n"
-        "          last_err: Exception | None = None\n"
-        "          for url in CONNECTIVITY_CHECK_URLS:\n"
-        "            try:\n"
-        "              # Hard fallback: raw TCP connect (ignores TLS/time, HTTP quirks)\n"
-        "              # Also avoid DNS dependency in recovery mode by probing well-known CN DNS IPs.\n"
-        "              if url.startswith(\"http://www.baidu.com\"):\n"
-        "                import socket\n"
-        "                for host, port in ((\"223.5.5.5\", 53), (\"114.114.114.114\", 53), (\"www.baidu.com\", 80)):\n"
-        "                  try:\n"
-        "                    socket.create_connection((host, port), timeout=2.0).close()\n"
-        "                    ok = True\n"
-        "                    break\n"
-        "                  except Exception:\n"
-        "                    continue\n"
-        "                if ok:\n"
-        "                  break\n"
-        "\n"
-        "              # Some sites don't reliably support HEAD; fall back to GET.\n"
-        "              try:\n"
-        "                request = urllib.request.Request(url, method=\"HEAD\")\n"
-        "                urllib.request.urlopen(request, timeout=2.0)\n"
-        "              except Exception:\n"
-        "                request = urllib.request.Request(url, method=\"GET\")\n"
-        "                urllib.request.urlopen(request, timeout=2.0)\n"
-        "              ok = True\n"
-        "              break\n"
-        "            except urllib.error.URLError as e:\n"
-        "              last_err = e\n"
-        "            except Exception as e:\n"
-        "              last_err = e\n"
-        "          if not ok:\n"
-        "            if isinstance(last_err, urllib.error.URLError):\n"
-        "              raise last_err\n"
-        "            raise RuntimeError(\"no connectivity\")\n"
-      )
-      mici_setup.write_text(s, encoding="utf-8")
-    else:
-      s2 = s.replace('"https://gitee.com/",\n  "https://www.baidu.com/",\n', '"http://www.baidu.com/",\n  "https://www.baidu.com/",\n')
-      if s2 != s:
-        mici_setup.write_text(s2, encoding="utf-8")
+  if not mici_setup.exists():
+    return res
+  s = mici_setup.read_text(encoding="utf-8")
+  orig = s
+  if 'OPENPILOT_URL = "https://openpilot.comma.ai"' in s:
+    s = s.replace('OPENPILOT_URL = "https://openpilot.comma.ai"\n',
+                  'OPENPILOT_URL = "https://gitee.com/xc2026/sp-cn_install/raw/master/installer_openpilot"\n')
+  if "CONNECTIVITY_CHECK_URLS" not in s:
+    s = s.replace(
+      'OPENPILOT_URL = "https://gitee.com/xc2026/sp-cn_install/raw/master/installer_openpilot"\n',
+      'OPENPILOT_URL = "https://gitee.com/xc2026/sp-cn_install/raw/master/installer_openpilot"\n'
+      '# 国内环境可能无法访问 openpilot.comma.ai，导致 setup 卡在 “waiting for internet...”。\n'
+      '# 这里使用多个候选 URL：任意一个可访问即认为“已联网”。\n'
+      'CONNECTIVITY_CHECK_URLS = [\n'
+      '  # 恢复/刚刷机阶段系统时间可能不准，HTTPS 证书校验会失败，导致误判“无网络”\n'
+      '  # 优先使用 HTTP 探测（不依赖系统时间），再回退到 HTTPS。\n'
+      '  "http://www.baidu.com/",\n'
+      '  "https://www.baidu.com/",\n'
+      '  OPENPILOT_URL,\n'
+      ']\n'
+    )
+    s = s.replace(
+      "          request = urllib.request.Request(OPENPILOT_URL, method=\"HEAD\")\n"
+      "          urllib.request.urlopen(request, timeout=2.0)\n",
+      "          ok = False\n"
+      "          last_err: Exception | None = None\n"
+      "          for url in CONNECTIVITY_CHECK_URLS:\n"
+      "            try:\n"
+      "              # Hard fallback: raw TCP connect (ignores TLS/time, HTTP quirks)\n"
+      "              # Also avoid DNS dependency in recovery mode by probing well-known CN DNS IPs.\n"
+      "              if url.startswith(\"http://www.baidu.com\"):\n"
+      "                import socket\n"
+      "                for host, port in ((\"223.5.5.5\", 53), (\"114.114.114.114\", 53), (\"www.baidu.com\", 80)):\n"
+      "                  try:\n"
+      "                    socket.create_connection((host, port), timeout=2.0).close()\n"
+      "                    ok = True\n"
+      "                    break\n"
+      "                  except Exception:\n"
+      "                    continue\n"
+      "                if ok:\n"
+      "                  break\n"
+      "\n"
+      "              # Some sites don't reliably support HEAD; fall back to GET.\n"
+      "              try:\n"
+      "                request = urllib.request.Request(url, method=\"HEAD\")\n"
+      "                urllib.request.urlopen(request, timeout=2.0)\n"
+      "              except Exception:\n"
+      "                request = urllib.request.Request(url, method=\"GET\")\n"
+      "                urllib.request.urlopen(request, timeout=2.0)\n"
+      "              ok = True\n"
+      "              break\n"
+      "            except urllib.error.URLError as e:\n"
+      "              last_err = e\n"
+      "            except Exception as e:\n"
+      "              last_err = e\n"
+      "          if not ok:\n"
+      "            if isinstance(last_err, urllib.error.URLError):\n"
+      "              raise last_err\n"
+      "            raise RuntimeError(\"no connectivity\")\n"
+    )
+  else:
+    s = s.replace('"https://gitee.com/",\n  "https://www.baidu.com/",\n', '"http://www.baidu.com/",\n  "https://www.baidu.com/",\n')
 
-    # Always allow continue when Wi-Fi is connected (avoid being stuck on "waiting for internet...")
-    s = mici_setup.read_text(encoding="utf-8")
-    if "wifi_connected = self._wifi_manager.wifi_state.status == ConnectStatus.CONNECTED" not in s:
-      s2 = s.replace(
-        "    has_internet = (self._network_monitor.network_connected.is_set() and\n"
-        "                    not network_changing and\n"
-        "                    not self._network_monitor.recheck_event.is_set())\n",
-        "    # 恢复/安装流程中，某些网络环境下“联网探测”可能失败（DNS/证书/出口限制），导致卡死。\n"
-        "    # 只要 Wi-Fi 已连接，就允许继续；后续实际更新/下载阶段再做真正的网络错误提示。\n"
-        "    wifi_connected = self._wifi_manager.wifi_state.status == ConnectStatus.CONNECTED\n"
-        "    has_internet = (wifi_connected or self._network_monitor.network_connected.is_set()) and \\\n"
-        "                   (not network_changing) and \\\n"
-        "                   (not self._network_monitor.recheck_event.is_set())\n"
-      )
-      if s2 != s:
-        mici_setup.write_text(s2, encoding="utf-8")
+  if "wifi_connected = self._wifi_manager.wifi_state.status == ConnectStatus.CONNECTED" not in s:
+    s = s.replace(
+      "    has_internet = (self._network_monitor.network_connected.is_set() and\n"
+      "                    not network_changing and\n"
+      "                    not self._network_monitor.recheck_event.is_set())\n",
+      "    # 恢复/安装流程中，某些网络环境下“联网探测”可能失败（DNS/证书/出口限制），导致卡死。\n"
+      "    # 只要 Wi-Fi 已连接，就允许继续；后续实际更新/下载阶段再做真正的网络错误提示。\n"
+      "    wifi_connected = self._wifi_manager.wifi_state.status == ConnectStatus.CONNECTED\n"
+      "    has_internet = (wifi_connected or self._network_monitor.network_connected.is_set()) and \\\n"
+      "                   (not network_changing) and \\\n"
+      "                   (not self._network_monitor.recheck_event.is_set())\n"
+    )
+
+  if s != orig:
+    _track_change(res, mici_setup, write_if_changed(mici_setup, s))
+  return res
+
+
+def patch_setup_sh(root: Path) -> PatchResult:
+  res = PatchResult("tools_setup_sh")
+  setup_sh = root / "tools/setup.sh"
+  changed = replace_or_fail_changed(setup_sh, [
+    ("https://github.com/commaai/openpilot.git", "https://gitee.com/xc2026/sunnypilot_cn.git"),
+    ("https://github.com/commaai/openpilot/blob/master/docs/CONTRIBUTING.md",
+     "https://gitee.com/xc2026/sunnypilot_cn/blob/master/docs/CONTRIBUTING.md"),
+  ])
+  _track_change(res, setup_sh, changed)
+  return res
+
+
+def patch_msgq_setup(root: Path) -> PatchResult:
+  res = PatchResult("msgq_setup")
+  msgq_setup = root / "msgq_repo/setup.sh"
+  if msgq_setup.exists():
+    _track_change(res, msgq_setup, replace_or_fail_changed(msgq_setup, [
+      ("https://github.com/catchorg/Catch2.git", "https://gitee.com/xc2026/Catch2.git"),
+    ]))
+  return res
+
+
+def patch_opendbc_pyproject(root: Path) -> PatchResult:
+  res = PatchResult("opendbc_pyproject")
+  opendbc_pyproj = root / "opendbc_repo/pyproject.toml"
+  if opendbc_pyproj.exists():
+    s = opendbc_pyproj.read_text(encoding="utf-8")
+    s2 = s.replace("git+https://github.com/commaai/dependencies.git", "git+https://gitee.com/xc2026/dependencies.git")
+    _track_change(res, opendbc_pyproj, write_if_changed(opendbc_pyproj, s2))
+  return res
+
+
+def patch_models_fetcher(root: Path) -> PatchResult:
+  res = PatchResult("models_fetcher")
+  fetcher = root / "sunnypilot/models/fetcher.py"
+  _track_change(res, fetcher, replace_or_fail_changed(fetcher, [
+    ("https://raw.githubusercontent.com/sunnypilot/sunnypilot-models/",
+     "https://gitee.com/xc2026/sunnypilot-models/raw/"),
+  ]))
+  return res
+
+
+def patch_osm(root: Path) -> PatchResult:
+  res = PatchResult("osm_layout")
+  osm_py = root / "selfdrive/ui/sunnypilot/layouts/settings/osm.py"
+  _track_change(res, osm_py, replace_or_fail_changed(osm_py, [
+    ("https://raw.githubusercontent.com/pfeiferj/openpilot-mapd/main/",
+     "https://gitee.com/xc2026/openpilot-mapd/raw/main/"),
+  ]))
+  return res
+
+
+def patch_mapd_installer(root: Path) -> PatchResult:
+  res = PatchResult("mapd_installer")
+  mapd_installer = root / "sunnypilot/mapd/mapd_installer.py"
+  s = mapd_installer.read_text(encoding="utf-8")
+  if "gitee.com/xc2026/openpilot-mapd" not in s:
+    s2 = s.replace('VERSION = "v1.12.0"', 'VERSION = os.getenv("MAPD_TAG", "v1.12.0")')
+    s2 = s2.replace("https://github.com/pfeiferj/openpilot-mapd/releases/download/",
+                    "https://gitee.com/xc2026/openpilot-mapd/releases/download/")
+    _track_change(res, mapd_installer, write_if_changed(mapd_installer, s2))
+  return res
+
+
+def patch_gitmodules(root: Path) -> PatchResult:
+  res = PatchResult("gitmodules_urls")
+  gitmodules = root / ".gitmodules"
+  if not gitmodules.exists():
+    return res
+  gm = gitmodules.read_text(encoding="utf-8")
+  gm2 = gm
+  gm2 = gm2.replace("https://github.com/commaai/msgq.git", "git@gitee.com:xc2026/msgq.git")
+  gm2 = gm2.replace("https://github.com/sunnypilot/opendbc.git", "git@gitee.com:xc2026/opendbc.git")
+  gm2 = gm2.replace("https://github.com/commaai/rednose.git", "git@gitee.com:xc2026/rednose.git")
+  gm2 = gm2.replace("https://github.com/commaai/teleoprtc", "git@gitee.com:xc2026/teleoprtc.git")
+  gm2 = gm2.replace("https://github.com/sunnypilot/tinygrad.git", "git@gitee.com:xc2026/tinygrad.git")
+  gm2 = gm2.replace("https://github.com/sunnyhaibin/panda.git", "git@gitee.com:xc2026/panda.git")
+  gm2 = gm2.replace("https://github.com/sunnypilot/neural-network-data.git", "git@gitee.com:xc2026/neural_network_data.git")
+  _track_change(res, gitmodules, write_if_changed(gitmodules, gm2))
+  return res
+
+
+def patch_all(root: Path) -> list[PatchResult]:
+  patches = [
+    patch_installer_urls,
+    patch_version_py,
+    patch_updated_insteadof,
+    patch_tici_setup,
+    patch_mici_setup,
+    patch_setup_sh,
+    patch_msgq_setup,
+    patch_opendbc_pyproject,
+    patch_models_fetcher,
+    patch_osm,
+    patch_mapd_installer,
+    patch_gitmodules,
+  ]
+  results: list[PatchResult] = []
+  for fn in patches:
+    r = fn(root)
+    results.append(r)
+  return results
 
   # tools/setup.sh
   setup_sh = root / "tools/setup.sh"
@@ -1051,7 +1213,13 @@ def main() -> None:
         print(f"[skip] {branch}: SKIP_SUBMODULES=auto (no submodule pointer changes)")
 
       # apply patches (idempotent)
-      patch_repo(root)
+      log(branch, "apply patches")
+      results = patch_all(root)
+      changed = [r for r in results if r.changed]
+      if changed:
+        log(branch, "patch summary: " + ", ".join(f"{r.name}({len(r.changed_files)})" for r in changed))
+      else:
+        log(branch, "patch summary: no file changes")
 
       # patches 可能会改写 .gitmodules；同步一次 URL（不再更新 commit）
       if do_update_submodules:
