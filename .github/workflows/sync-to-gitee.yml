@@ -61,3 +61,5 @@ jobs:
             --origin "$GITEE_REPO_SSH" \
             --upstream "https://github.com/sunnypilot/sunnypilot.git"
 
+            ##
+
