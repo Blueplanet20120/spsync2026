@@ -394,6 +394,15 @@ def replace_or_fail(path: Path, replacements: list[tuple[str, str]]) -> None:
     path.write_text(s, encoding="utf-8")
 
 
+def parse_recorded_upstream_sha(commit_body: str, branch: str) -> str | None:
+  """
+  约定：在提交信息中记录本次同步对应的上游分支 HEAD，例如：
+    upstream-staging: <sha>
+  """
+  m = re.search(rf"(?m)^upstream-{re.escape(branch)}:\s*([0-9a-f]{{7,40}})\s*$", commit_body or "")
+  return m.group(1) if m else None
+
+
 def patch_repo(root: Path) -> None:
   # installer
   installer = root / "selfdrive/ui/installer/installer.cc"
@@ -966,6 +975,22 @@ def main() -> None:
       run(["git", "clean", "-fdx"], str(root), env=env)
 
     def sync_branch_local(branch: str) -> None:
+      # 若上游分支 HEAD 未变化，直接跳过（避免每小时重复跑一遍补丁/推送）
+      upstream_sha = run(["git", "rev-parse", f"upstream/{branch}"], str(root), env=env).strip()
+
+      recorded_sha: str | None = None
+      try:
+        # 只取远端最新一条提交即可（不依赖本地历史）
+        run(["git", "fetch", "--depth=1", "origin", branch], str(root), env=env)
+        body = run(["git", "log", "-1", "--format=%B", "FETCH_HEAD"], str(root), env=env)
+        recorded_sha = parse_recorded_upstream_sha(body, branch)
+      except Exception:
+        recorded_sha = None
+
+      if recorded_sha == upstream_sha:
+        print(f"[skip] {branch}: upstream sha unchanged ({upstream_sha})")
+        return
+
       # 切换分支前先强制清理一次，避免被子模块残留文件阻塞
       hard_clean_worktree()
       # sync to upstream/<branch> baseline
@@ -992,10 +1017,24 @@ def main() -> None:
       status = run(["git", "status", "--porcelain"], str(root), env=env)
       if status.strip():
         run(["git", "add", "-A"], str(root), env=env)
+        msg = (
+          "cn: redirect GitHub URLs to Gitee mirrors\n\n"
+          f"upstream-{branch}: {upstream_sha}\n"
+        )
         run(["git",
              "-c", "user.name=sunnypilot-cn-bot",
              "-c", "user.email=sunnypilot-cn-bot@local",
-             "commit", "-m", "cn: redirect GitHub URLs to Gitee mirrors"], str(root), env=env)
+             "commit", "-m", msg], str(root), env=env)
+      else:
+        # 若没有任何补丁改动但 upstream 已变化，也提交一个空提交记录 upstream SHA，便于后续跳过。
+        msg = (
+          "cn: sync upstream (no patch changes)\n\n"
+          f"upstream-{branch}: {upstream_sha}\n"
+        )
+        run(["git",
+             "-c", "user.name=sunnypilot-cn-bot",
+             "-c", "user.email=sunnypilot-cn-bot@local",
+             "commit", "--allow-empty", "-m", msg], str(root), env=env)
 
     def push_branch(branch: str) -> None:
       run(["git", "push", "-f", "-u", "origin", branch], str(root), env=env)
