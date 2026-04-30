@@ -46,8 +46,8 @@ jobs:
           GITEE_REPO_SSH: ${{ secrets.GITEE_REPO_SSH }}
           # 避免 CI 因 LFS 推送耗时/不稳定而失败（脚本内部也会 setdefault）
           GIT_LFS_SKIP_PUSH: "1"
-          # CI 里无需下载完整子模块内容即可推送 superproject（大幅提速）
-          SKIP_SUBMODULES: "1"
+          # 仅当上游子模块指针发生变化时才更新子模块（提速且更接近本地行为）
+          SKIP_SUBMODULES: "auto"
         run: |
           set -euo pipefail
 

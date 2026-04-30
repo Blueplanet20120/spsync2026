@@ -403,6 +403,31 @@ def parse_recorded_upstream_sha(commit_body: str, branch: str) -> str | None:
   return m.group(1) if m else None
 
 
+def should_update_submodules(recorded_upstream_sha: str | None, upstream_sha: str, root: Path, env: dict[str, str]) -> bool:
+  """
+  根据 upstream 两个 commit 之间的 diff 判断是否需要更新子模块。
+  - 若 `.gitmodules` 有变化：需要更新（新增/删除/URL 变更等）
+  - 若有 mode 160000 的条目变化：需要更新（子模块指针变更）
+  - 若拿不到 recorded_upstream_sha：保守起见更新一次
+  """
+  if not recorded_upstream_sha:
+    return True
+
+  try:
+    names = run(["git", "diff", "--name-only", f"{recorded_upstream_sha}..{upstream_sha}", "--", ".gitmodules"], str(root), env=env)
+    if names.strip():
+      return True
+  except Exception:
+    return True
+
+  try:
+    raw = run(["git", "diff", "--raw", f"{recorded_upstream_sha}..{upstream_sha}"], str(root), env=env)
+    # 子模块在 raw diff 中表现为 mode 160000 的 gitlink
+    return (" 160000 " in raw)
+  except Exception:
+    return True
+
+
 def patch_repo(root: Path) -> None:
   # installer
   installer = root / "selfdrive/ui/installer/installer.cc"
@@ -961,7 +986,14 @@ def main() -> None:
     run(["git", "remote", "set-url", "origin", args.origin], str(root), env=env)
 
     run(["git", "fetch", "upstream", "--prune", "--tags"], str(root), env=env)
-    skip_submodules = (env.get("SKIP_SUBMODULES", "").strip().lower() in ("1", "true", "yes", "y", "on"))
+    sm_mode = (env.get("SKIP_SUBMODULES", "auto").strip().lower() or "auto")
+    # legacy compatibility: "1/true" means always skip; "0/false" means always update
+    if sm_mode in ("1", "true", "yes", "y", "on"):
+      sm_mode = "skip"
+    elif sm_mode in ("0", "false", "no", "n", "off"):
+      sm_mode = "update"
+    elif sm_mode not in ("auto", "skip", "update"):
+      sm_mode = "auto"
 
     def hard_clean_worktree() -> None:
       """
@@ -1000,18 +1032,26 @@ def main() -> None:
       # submodules（先按 upstream 的 .gitmodules 更新到正确 commit）
       # 说明：Gitee 镜像偶尔会缺少某些 submodule commit；若先改写为镜像 URL 再 update，
       # 会触发 "not our ref"。因此先用 upstream URL 完成 submodule update，再进行国内化改写。
-      if not skip_submodules:
+      do_update_submodules = False
+      if sm_mode == "skip":
+        do_update_submodules = False
+      elif sm_mode == "update":
+        do_update_submodules = True
+      else:
+        do_update_submodules = should_update_submodules(recorded_sha, upstream_sha, root, env)
+
+      if do_update_submodules:
         run(["git", "submodule", "sync", "--recursive"], str(root), env=env)
         ensure_tinygrad_submodule_commit_reachable()
         run(["git", "submodule", "update", "--init", "--recursive"], str(root), env=env)
       else:
-        print(f"[skip] {branch}: SKIP_SUBMODULES=1 (no submodule update)")
+        print(f"[skip] {branch}: SKIP_SUBMODULES=auto (no submodule pointer changes)")
 
       # apply patches (idempotent)
       patch_repo(root)
 
       # patches 可能会改写 .gitmodules；同步一次 URL（不再更新 commit）
-      if not skip_submodules:
+      if do_update_submodules:
         run(["git", "submodule", "sync", "--recursive"], str(root), env=env)
 
       # optional: installer build (device side)
