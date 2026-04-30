@@ -961,6 +961,7 @@ def main() -> None:
     run(["git", "remote", "set-url", "origin", args.origin], str(root), env=env)
 
     run(["git", "fetch", "upstream", "--prune", "--tags"], str(root), env=env)
+    skip_submodules = (env.get("SKIP_SUBMODULES", "").strip().lower() in ("1", "true", "yes", "y", "on"))
 
     def hard_clean_worktree() -> None:
       """
@@ -999,15 +1000,19 @@ def main() -> None:
       # submodules（先按 upstream 的 .gitmodules 更新到正确 commit）
       # 说明：Gitee 镜像偶尔会缺少某些 submodule commit；若先改写为镜像 URL 再 update，
       # 会触发 "not our ref"。因此先用 upstream URL 完成 submodule update，再进行国内化改写。
-      run(["git", "submodule", "sync", "--recursive"], str(root), env=env)
-      ensure_tinygrad_submodule_commit_reachable()
-      run(["git", "submodule", "update", "--init", "--recursive"], str(root), env=env)
+      if not skip_submodules:
+        run(["git", "submodule", "sync", "--recursive"], str(root), env=env)
+        ensure_tinygrad_submodule_commit_reachable()
+        run(["git", "submodule", "update", "--init", "--recursive"], str(root), env=env)
+      else:
+        print(f"[skip] {branch}: SKIP_SUBMODULES=1 (no submodule update)")
 
       # apply patches (idempotent)
       patch_repo(root)
 
       # patches 可能会改写 .gitmodules；同步一次 URL（不再更新 commit）
-      run(["git", "submodule", "sync", "--recursive"], str(root), env=env)
+      if not skip_submodules:
+        run(["git", "submodule", "sync", "--recursive"], str(root), env=env)
 
       # optional: installer build (device side)
       if args.build_installer:
