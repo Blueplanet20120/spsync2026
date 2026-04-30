@@ -1007,7 +1007,7 @@ def main() -> None:
       # -d: 目录, -f: 强制, -x: 连同忽略文件一起清
       run(["git", "clean", "-fdx"], str(root), env=env)
 
-    def sync_branch_local(branch: str) -> None:
+    def sync_branch_local(branch: str) -> bool:
       # 若上游分支 HEAD 未变化，直接跳过（避免每小时重复跑一遍补丁/推送）
       upstream_sha = run(["git", "rev-parse", f"upstream/{branch}"], str(root), env=env).strip()
 
@@ -1022,7 +1022,7 @@ def main() -> None:
 
       if recorded_sha == upstream_sha:
         print(f"[skip] {branch}: upstream sha unchanged ({upstream_sha})")
-        return
+        return False
 
       # 切换分支前先强制清理一次，避免被子模块残留文件阻塞
       hard_clean_worktree()
@@ -1080,16 +1080,27 @@ def main() -> None:
              "-c", "user.name=sunnypilot-cn-bot",
              "-c", "user.email=sunnypilot-cn-bot@local",
              "commit", "--allow-empty", "-m", msg], str(root), env=env)
+      return True
 
     def push_branch(branch: str) -> None:
       run(["git", "push", "-f", "-u", "origin", branch], str(root), env=env)
 
-    def pull_all() -> None:
+    def pull_all() -> list[str]:
+      to_push: list[str] = []
       for b in ("master", "staging"):
-        sync_branch_local(b)
+        if sync_branch_local(b):
+          to_push.append(b)
+      return to_push
 
-    def push_all() -> None:
-      for b in ("master", "staging"):
+    def push_all(branches: list[str] | None = None) -> None:
+      branches = branches or ["master", "staging"]
+      for b in branches:
+        # 只 push 本地存在的分支，避免 src refspec 不存在
+        try:
+          run(["git", "show-ref", "--verify", "--quiet", f"refs/heads/{b}"], str(root), env=env)
+        except Exception:
+          print(f"[skip] push {b}: local branch missing")
+          continue
         push_branch(b)
 
     def maybe_sync_mapd_release() -> None:
@@ -1101,10 +1112,13 @@ def main() -> None:
       sync_mapd_release(token, env.get("MAPD_TAG", "latest"))
 
     def do_all() -> None:
-      pull_all()
+      to_push = pull_all()
       # 注意：Gitee LFS 可能导致 SSH 连接不稳定；默认跳过 LFS 上传（可自行取消环境变量）
       env.setdefault("GIT_LFS_SKIP_PUSH", "1")
-      push_all()
+      if not to_push:
+        print("[skip] no branches changed; nothing to push")
+      else:
+        push_all(to_push)
       if args.force_staging:
         run(["git", "push", "-f", "origin", "master:staging"], str(root), env=env)
       maybe_sync_mapd_release()
