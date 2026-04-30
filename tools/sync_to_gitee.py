@@ -64,34 +64,11 @@ MAPD_REPO = "openpilot-mapd"
 MAPD_UPSTREAM = "pfeiferj/openpilot-mapd"
 
 
-def run(cmd: list[str], cwd: str | None = None, env: dict[str, str] | None = None, *, stream: bool | None = None) -> str:
-  """
-  默认行为：
-  - 交互终端（TTY）下：实时输出（避免 git fetch 等长任务“看起来没反应”）
-  - CI/非交互：保持 capture（便于错误时把完整输出带回日志）
-  """
-  if stream is None:
-    stream = sys.stdout.isatty()
-
-  if not stream:
-    p = subprocess.run(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    if p.returncode != 0:
-      raise RuntimeError(f"命令失败: {' '.join(cmd)}\n{p.stdout}")
-    return p.stdout
-
-  # stream mode
-  p2 = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
-  assert p2.stdout is not None
-  out_lines: list[str] = []
-  for line in p2.stdout:
-    sys.stdout.write(line)
-    sys.stdout.flush()
-    out_lines.append(line)
-  rc = p2.wait()
-  out = "".join(out_lines)
-  if rc != 0:
-    raise RuntimeError(f"命令失败: {' '.join(cmd)}\n{out}")
-  return out
+def run(cmd: list[str], cwd: str | None = None, env: dict[str, str] | None = None) -> str:
+  p = subprocess.run(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+  if p.returncode != 0:
+    raise RuntimeError(f"命令失败: {' '.join(cmd)}\n{p.stdout}")
+  return p.stdout
 
 
 def log(stage: str, msg: str) -> None:
@@ -219,8 +196,10 @@ def build_comma_installer_staging(host: str, user: str, key_path: str, out_dir: 
   # quick connectivity check
   run_ssh(host, user, key_path, "echo connected && uname -m && test -f /TICI && echo HAS_/TICI || echo NO_/TICI", timeout_s=30)
 
-  remote_root = "/data/tmp/sp_build/sunnypilot_cn"
-  repo_url_https = "https://gitee.com/xc2026/sunnypilot_cn.git"
+  # sunnypilot 当前仓库不再包含 SCons 构建脚本（无 SConstruct/SConscript），无法用 scons 直接构建 installer。
+  # 这里改用 commaai/openpilot 的 SCons 构建系统来生成 installer 二进制，并将其中的 repo URL 指向你的 Gitee。
+  remote_root = "/data/tmp/sp_build/openpilot_installer"
+  openpilot_upstream = "https://github.com/commaai/openpilot.git"
   target = "selfdrive/ui/installer/installers/installer_openpilot_staging"
 
   remote_cmd = r"""
@@ -230,36 +209,30 @@ HOST_OK=1
 # ensure tools
 sudo -n true >/dev/null 2>&1 || true
 sudo apt-get update -y >/dev/null
-sudo apt-get install -y scons git >/dev/null
+sudo apt-get install -y scons git python3 >/dev/null
 
 mkdir -p /data/tmp/sp_build
 cd /data/tmp/sp_build
-if [ ! -d "sunnypilot_cn/.git" ]; then
-  rm -rf sunnypilot_cn
-  git clone --depth=1 --recurse-submodules """ + repo_url_https + r""" sunnypilot_cn
+if [ ! -d "openpilot_installer/.git" ]; then
+  rm -rf openpilot_installer
+  git clone --depth=1 """ + openpilot_upstream + r""" openpilot_installer
 fi
 
 cd """ + remote_root + r"""
 
-# Rewrite submodule URLs in .gitmodules to https to avoid needing SSH keys on device
+# Patch installer.cc to point to your Gitee repo (idempotent).
+# NOTE: we only need to build the installer binary; no need to sync full dependencies/venv here.
 python3 - <<'PY'
 from pathlib import Path
-p = Path(".gitmodules")
-if p.exists():
-  t = p.read_text(encoding="utf-8")
-  t2 = t.replace("git@gitee.com:", "https://gitee.com/")
-  if t2 != t:
-    p.write_text(t2, encoding="utf-8")
+p = Path("selfdrive/ui/installer/installer.cc")
+if not p.exists():
+  raise SystemExit("missing selfdrive/ui/installer/installer.cc")
+s = p.read_text(encoding="utf-8")
+s2 = s.replace("https://github.com/commaai/openpilot.git", "https://gitee.com/xc2026/sunnypilot_cn.git")
+s2 = s2.replace('#define GIT_SSH_URL "git@github.com:commaai/openpilot.git"', '#define GIT_SSH_URL "git@gitee.com:xc2026/sunnypilot_cn.git"')
+if s2 != s:
+  p.write_text(s2, encoding="utf-8")
 PY
-git submodule sync --recursive
-GIT_TERMINAL_PROMPT=0 git submodule update --init --recursive --depth=1
-
-# Ensure python deps for SCons environment (uv cache must be on /data, /home is tiny overlay)
-mkdir -p /data/tmp/uv-cache /data/tmp/uv-tmp
-export UV_CACHE_DIR=/data/tmp/uv-cache
-export TMPDIR=/data/tmp/uv-tmp
-uv sync --frozen --no-dev
-. .venv/bin/activate
 
 # Ensure staging installer target exists in selfdrive/ui/SConscript
 python3 - <<'PY'
@@ -1170,7 +1143,6 @@ def main() -> None:
       run(["git", "remote", "add", "origin", args.origin], str(root), env=env)
     run(["git", "remote", "set-url", "origin", args.origin], str(root), env=env)
 
-    log("git", "fetch upstream --prune --tags")
     run(["git", "fetch", "upstream", "--prune", "--tags"], str(root), env=env)
     sm_mode = (env.get("SKIP_SUBMODULES", "auto").strip().lower() or "auto")
     force_sync = (env.get("FORCE_SYNC", "").strip().lower() in ("1", "true", "yes", "y", "on"))
