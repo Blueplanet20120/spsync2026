@@ -1067,8 +1067,8 @@ def main() -> None:
         run(["git", "add", "-A"], str(root), env=env)
         upstream_short = upstream_sha[:7]
         msg = (
-          "cn: redirect GitHub URLs to Gitee mirrors\n\n"
-          f"based-on: sunnypilot/{branch}@{upstream_short}\n"
+          f"based-on: sunnypilot/{branch}@{upstream_short}\n\n"
+          "cn: redirect GitHub URLs to Gitee mirrors\n"
           f"upstream-{branch}: {upstream_sha}\n"
           "Made-with: tools\n"
         )
@@ -1080,8 +1080,8 @@ def main() -> None:
         # 若没有任何补丁改动但 upstream 已变化，也提交一个空提交记录 upstream SHA，便于后续跳过。
         upstream_short = upstream_sha[:7]
         msg = (
-          "cn: sync upstream (no patch changes)\n\n"
-          f"based-on: sunnypilot/{branch}@{upstream_short}\n"
+          f"based-on: sunnypilot/{branch}@{upstream_short}\n\n"
+          "cn: sync upstream (no patch changes)\n"
           f"upstream-{branch}: {upstream_sha}\n"
           "Made-with: tools\n"
         )
