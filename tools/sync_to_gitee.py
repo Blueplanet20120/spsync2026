@@ -64,11 +64,34 @@ MAPD_REPO = "openpilot-mapd"
 MAPD_UPSTREAM = "pfeiferj/openpilot-mapd"
 
 
-def run(cmd: list[str], cwd: str | None = None, env: dict[str, str] | None = None) -> str:
-  p = subprocess.run(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-  if p.returncode != 0:
-    raise RuntimeError(f"命令失败: {' '.join(cmd)}\n{p.stdout}")
-  return p.stdout
+def run(cmd: list[str], cwd: str | None = None, env: dict[str, str] | None = None, *, stream: bool | None = None) -> str:
+  """
+  默认行为：
+  - 交互终端（TTY）下：实时输出（避免 git fetch 等长任务“看起来没反应”）
+  - CI/非交互：保持 capture（便于错误时把完整输出带回日志）
+  """
+  if stream is None:
+    stream = sys.stdout.isatty()
+
+  if not stream:
+    p = subprocess.run(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    if p.returncode != 0:
+      raise RuntimeError(f"命令失败: {' '.join(cmd)}\n{p.stdout}")
+    return p.stdout
+
+  # stream mode
+  p2 = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+  assert p2.stdout is not None
+  out_lines: list[str] = []
+  for line in p2.stdout:
+    sys.stdout.write(line)
+    sys.stdout.flush()
+    out_lines.append(line)
+  rc = p2.wait()
+  out = "".join(out_lines)
+  if rc != 0:
+    raise RuntimeError(f"命令失败: {' '.join(cmd)}\n{out}")
+  return out
 
 
 def log(stage: str, msg: str) -> None:
@@ -1147,6 +1170,7 @@ def main() -> None:
       run(["git", "remote", "add", "origin", args.origin], str(root), env=env)
     run(["git", "remote", "set-url", "origin", args.origin], str(root), env=env)
 
+    log("git", "fetch upstream --prune --tags")
     run(["git", "fetch", "upstream", "--prune", "--tags"], str(root), env=env)
     sm_mode = (env.get("SKIP_SUBMODULES", "auto").strip().lower() or "auto")
     force_sync = (env.get("FORCE_SYNC", "").strip().lower() in ("1", "true", "yes", "y", "on"))
