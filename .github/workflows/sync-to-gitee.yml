@@ -82,6 +82,7 @@ jobs:
 
       - name: Cleanup old workflow runs (keep latest 20)
         if: always()
+        continue-on-error: true
         uses: actions/github-script@v8
         with:
           script: |
@@ -122,6 +123,3 @@ jobs:
                 core.warning(`Failed to delete run_id=${r.id}: ${e.message}`);
               }
             }
-
-            ##
-
