@@ -18,6 +18,7 @@ concurrency:
 
 permissions:
   contents: read
+  actions: write
 
 jobs:
   sync:
@@ -68,6 +69,49 @@ jobs:
             --workdir "$WORKDIR" \
             --origin "$GITEE_REPO_SSH" \
             --upstream "https://github.com/sunnypilot/sunnypilot.git"
+
+      - name: Cleanup old workflow runs (keep latest 20)
+        if: always()
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const workflow_id = "sync-to-gitee.yml";
+            const keep = 20;
+
+            // List runs (newest first)
+            const runs = await github.paginate(github.rest.actions.listWorkflowRuns, {
+              owner,
+              repo,
+              workflow_id,
+              per_page: 100,
+              exclude_pull_requests: true,
+            });
+
+            // Filter out the current run and any in-progress/queued runs
+            const filtered = runs.filter(r =>
+              r.id !== context.runId &&
+              r.status !== "in_progress" &&
+              r.status !== "queued"
+            );
+
+            if (filtered.length <= keep) {
+              core.info(`No cleanup needed. Runs=${filtered.length}, keep=${keep}`);
+              return;
+            }
+
+            const toDelete = filtered.slice(keep);
+            core.info(`Deleting ${toDelete.length} old workflow runs (keeping latest ${keep})`);
+
+            for (const r of toDelete) {
+              try {
+                await github.rest.actions.deleteWorkflowRun({ owner, repo, run_id: r.id });
+                core.info(`Deleted run_id=${r.id} created_at=${r.created_at} status=${r.status}`);
+              } catch (e) {
+                core.warning(`Failed to delete run_id=${r.id}: ${e.message}`);
+              }
+            }
 
             ##
 
