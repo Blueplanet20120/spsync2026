@@ -1,4 +1,10 @@
 name: sync-to-gitee
+run-name: >-
+  ${{
+    github.event_name == 'schedule' && format('sync-to-gitee (scheduled) @ {0}', github.ref_name)
+    || github.event_name == 'workflow_dispatch' && format('sync-to-gitee (manual) @ {0}', github.ref_name)
+    || format('sync-to-gitee ({0}) @ {1}', github.event_name, github.ref_name)
+  }}
 
 on:
   schedule:
