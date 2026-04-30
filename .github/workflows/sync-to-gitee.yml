@@ -2,7 +2,10 @@ name: sync-to-gitee
 run-name: >-
   ${{
     github.event_name == 'schedule' && format('sync-to-gitee (scheduled) @ {0}', github.ref_name)
-    || github.event_name == 'workflow_dispatch' && format('sync-to-gitee (manual) @ {0}', github.ref_name)
+    || github.event_name == 'workflow_dispatch' && (
+      (github.event.inputs.force_sync == 'true' && format('sync-to-gitee (manual,force) @ {0}', github.ref_name))
+      || format('sync-to-gitee (manual) @ {0}', github.ref_name)
+    )
     || format('sync-to-gitee ({0}) @ {1}', github.event_name, github.ref_name)
   }}
 
@@ -10,7 +13,13 @@ on:
   schedule:
     # 每小时整点（UTC）。GitHub schedule 触发可能有数分钟抖动，属正常现象。
     - cron: "0 * * * *"
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      force_sync:
+        description: "Force re-sync and push even if upstream SHA unchanged"
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
   group: sync-to-gitee
@@ -55,6 +64,7 @@ jobs:
           GIT_LFS_SKIP_PUSH: "1"
           # 仅当上游子模块指针发生变化时才更新子模块（提速且更接近本地行为）
           SKIP_SUBMODULES: "auto"
+          FORCE_SYNC: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.force_sync == 'true' && '1' || '' }}
         run: |
           set -euo pipefail
 

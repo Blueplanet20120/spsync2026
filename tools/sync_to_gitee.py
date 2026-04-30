@@ -987,6 +987,7 @@ def main() -> None:
 
     run(["git", "fetch", "upstream", "--prune", "--tags"], str(root), env=env)
     sm_mode = (env.get("SKIP_SUBMODULES", "auto").strip().lower() or "auto")
+    force_sync = (env.get("FORCE_SYNC", "").strip().lower() in ("1", "true", "yes", "y", "on"))
     # legacy compatibility: "1/true" means always skip; "0/false" means always update
     if sm_mode in ("1", "true", "yes", "y", "on"):
       sm_mode = "skip"
@@ -1020,9 +1021,11 @@ def main() -> None:
       except Exception:
         recorded_sha = None
 
-      if recorded_sha == upstream_sha:
+      if (not force_sync) and (recorded_sha == upstream_sha):
         print(f"[skip] {branch}: upstream sha unchanged ({upstream_sha})")
         return False
+      if force_sync and recorded_sha == upstream_sha:
+        print(f"[force] {branch}: upstream sha unchanged but FORCE_SYNC=1, will re-sync")
 
       # 切换分支前先强制清理一次，避免被子模块残留文件阻塞
       hard_clean_worktree()
@@ -1067,6 +1070,7 @@ def main() -> None:
           "cn: redirect GitHub URLs to Gitee mirrors\n\n"
           f"based-on: sunnypilot/{branch}@{upstream_short}\n"
           f"upstream-{branch}: {upstream_sha}\n"
+          "Made-with: tools\n"
         )
         run(["git",
              "-c", "user.name=sunnypilot-cn-bot",
@@ -1079,6 +1083,7 @@ def main() -> None:
           "cn: sync upstream (no patch changes)\n\n"
           f"based-on: sunnypilot/{branch}@{upstream_short}\n"
           f"upstream-{branch}: {upstream_sha}\n"
+          "Made-with: tools\n"
         )
         run(["git",
              "-c", "user.name=sunnypilot-cn-bot",
