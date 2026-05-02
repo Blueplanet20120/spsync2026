@@ -6,6 +6,8 @@
 - 脚本：[`tools/sync_to_gitee.py`](tools/sync_to_gitee.py)
 - 定时任务：[`/.github/workflows/sync-to-gitee.yml`](.github/workflows/sync-to-gitee.yml)
 
+**仓库分工**：本 GitHub 仓库存同步工具；**打补丁后的代码**推送到 **Gitee** 供国内更新（详见 Cursor 规则 [`.cursor/rules/sync-cn-boundaries.mdc`](.cursor/rules/sync-cn-boundaries.mdc)，云端勿改 `tools/sync_to_gitee_local.py`）。
+
 ## Actions 做了什么
 - 每小时（UTC 整点）触发一次（也支持手动触发）
 - 拉取上游 `sunnypilot/sunnypilot` 的 `master` + `staging`
@@ -54,6 +56,17 @@ ssh-keygen -t ed25519 -C "github-actions-sync-to-gitee" -f gitee_deploy_key -N "
 
 端口固定为 **465 + SSL**（与工作流一致）。若不用 QQ，可自行改工作流里的 `server_port` / `secure`。
 
+成功邮件标题固定为 **`[OK] sp_cn_sync-bot`**；正文由脚本写入 `GITHUB_OUTPUT`，按本次同步是「sunnypilot 相对 Gitee 记录有新版本」还是「仅手动 Force、上游 SHA 未变」切换第二段说明（输出键 `notify_variant`：`upstream_only` / `force_only` / `mixed`）。
+
+与 QQ 邮箱官方「第三方客户端」说明一致（仅需 **发信 SMTP**，无需填 IMAP/POP）：
+
+| 官方要求 | 本项目 Secrets |
+|----------|----------------|
+| 用户名 / 帐户 | `SMTP_USER` = **完整 QQ 邮箱地址** |
+| 密码 | `SMTP_PASS` = **生成的授权码**（不是 QQ 登录密码） |
+| 电子邮件地址 | `MAIL_FROM` / `MAIL_TO` 使用完整邮箱；`MAIL_FROM` 可为 `昵称 <邮箱>` |
+| 发送邮件服务器 | `SMTP_SERVER` = `smtp.qq.com`，SSL，端口 **465**（工作流已写死；官方亦允许 587） |
+
 ## 手动触发同步
 在 GitHub 仓库 `Actions` 里找到工作流 **sync-to-gitee**，点击 **Run workflow**。
 
@@ -66,6 +79,7 @@ ssh-keygen -t ed25519 -C "github-actions-sync-to-gitee" -f gitee_deploy_key -N "
 [`tools/sync_to_gitee_local.py`](tools/sync_to_gitee_local.py) 仅用于本机交互菜单（如远程编译 installer 等），**GitHub Actions 只调用 `sync_to_gitee.py`**。若不希望把本地脚本提交到 GitHub 工具仓，可将其列入 `.gitignore`（见仓库内 `.gitignore`）。
 
 ## 常见排错
+- **SMTP 535 / Login fail（QQ）**：`SMTP_PASS` 必须用**授权码**，且与开启 SMTP 时生成的一致；参见 [QQ 邮箱 SMTP 登录报错说明](https://help.mail.qq.com/detail/108/1023)。短时间多次失败请间隔后再试。
 - **SSH 权限问题（Permission denied）**：检查 Gitee Deploy Key 是否勾选“可写”，以及 `GITEE_REPO_SSH` 是否正确。
 - **上游结构变化导致补丁失败**：`replace_or_fail` 或 **`verify_patches`** 会终止同步；按日志更新补丁或校验规则后再跑。
 - **Schedule 没按时触发**：GitHub 的定时任务可能延迟几分钟属正常；同时注意 cron 使用 **UTC**。

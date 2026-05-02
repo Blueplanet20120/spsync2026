@@ -941,10 +941,39 @@ def write_ci_github_output(state: dict[str, object]) -> None:
   pushed = bool(state.get("pushed"))
   branches = state.get("branches") or []
   br_line = ",".join(str(b) for b in branches) if branches else ""
+  reason_tags: list[str] = list(state.get("sync_reason_tags") or [])
+
+  # 成功邮件正文：区分「上游相对 Gitee 记录有新版本」与「仅 Force 强制重同步」
+  variant = "upstream_only"
+  if reason_tags:
+    uniq = set(reason_tags)
+    if uniq == {"force_same"}:
+      variant = "force_only"
+    elif uniq == {"upstream_delta"}:
+      variant = "upstream_only"
+    else:
+      variant = "mixed"
+
+  line_ok = "sunnypilot_cn → Gitee 同步成功（本轮已执行补丁校验并完成推送）。"
+  if variant == "force_only":
+    line_note = "说明：本次为手动 Force 强制重同步（sunnypilot 上游相对上次写入 Gitee 的记录无新版本）。"
+  elif variant == "upstream_only":
+    line_note = "说明：本次因 sunnypilot 上游相对上次 Gitee 提交有新版本而同步推送。"
+  else:
+    line_note = "说明：本次 master/staging 中兼有「上游有新版本」与「强制重同步」分支，详见 Actions 日志。"
+  success_body = f"{line_ok}\n\n{line_note}"
+
+  delim = "SYNC_OK_BODY_EOF"
   with open(path, "a", encoding="utf-8") as f:
     f.write(f"attempted_sync={'true' if attempted else 'false'}\n")
     f.write(f"pushed={'true' if pushed else 'false'}\n")
     f.write(f"sync_branches={br_line}\n")
+    f.write(f"notify_variant={variant}\n")
+    f.write(f"notify_success_body<<{delim}\n")
+    f.write(success_body)
+    if not success_body.endswith("\n"):
+      f.write("\n")
+    f.write(f"{delim}\n")
 
 
 def ensure_tinygrad_submodule_commit_reachable() -> None:
@@ -1197,7 +1226,7 @@ def main() -> None:
   env, shim_dir = prepare_git_env(root)
   ci_sync_state: dict[str, object] | None = None
   try:
-    ci_sync_state = {"attempted": False, "pushed": False, "branches": []}
+    ci_sync_state = {"attempted": False, "pushed": False, "branches": [], "sync_reason_tags": []}
     # load optional .env next to this repo (never committed)
     sp_dotenv = load_dotenv(REPO_ROOT / ".env")
     for k, v in sp_dotenv.items():
@@ -1258,6 +1287,11 @@ def main() -> None:
       assert ci_sync_state is not None
       ci_sync_state["attempted"] = True
       ci_sync_state.setdefault("branches", []).append(branch)
+      # 与 Gitee 上次提交里记录的 upstream-{branch} SHA 对比，用于邮件区分「有新版本」vs「仅 Force」
+      if recorded_sha is not None and recorded_sha == upstream_sha:
+        ci_sync_state.setdefault("sync_reason_tags", []).append("force_same")
+      else:
+        ci_sync_state.setdefault("sync_reason_tags", []).append("upstream_delta")
 
       # 切换分支前先强制清理一次，避免被子模块残留文件阻塞
       hard_clean_worktree()

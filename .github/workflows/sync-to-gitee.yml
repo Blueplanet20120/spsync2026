@@ -97,19 +97,10 @@ jobs:
           secure: true
           username: ${{ secrets.SMTP_USER }}
           password: ${{ secrets.SMTP_PASS }}
-          subject: >-
-            [OK] ${{ github.repository }} sync-to-gitee pushed (run ${{ github.run_id }})
+          subject: "[OK] sp_cn_sync-bot"
           to: ${{ secrets.MAIL_TO }}
           from: ${{ secrets.MAIL_FROM }}
-          body: |
-            sunnypilot_cn → Gitee 同步成功（本轮已执行补丁校验并完成推送）。
-
-            说明：包含「上游相对上次 Gitee 提交有变化」或「手动 Force 强制重同步」两种入口。
-
-            branches: ${{ steps.sync.outputs.sync_branches }}
-            attempted_sync=${{ steps.sync.outputs.attempted_sync }} pushed=${{ steps.sync.outputs.pushed }}
-
-            Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          body: ${{ steps.sync.outputs.notify_success_body }}
 
       - name: Notify mail — sync FAILED (after sync attempt)
         if: >-

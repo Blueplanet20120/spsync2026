@@ -1,0 +1,26 @@
+---
+description: sunnypilot_cn 工具仓与 Gitee 镜像分工；CI 仅改 sync_to_gitee.py
+alwaysApply: true
+---
+
+# sunnypilot_cn 同步（必读）
+
+## 仓库分工
+
+- **GitHub `Blueplanet20120/sunnypilot_cn`**：只放同步**工具**（`tools/sync_to_gitee.py`、`.github/workflows/`、`README` 等）。Actions 在这里跑。
+- **Gitee `sunnypilot_cn`**：放**打完国内化补丁后的完整 sunnypilot 代码**，供国内拉取更新；由脚本从上游拉取并补丁后**推送**过去。
+
+## 改动边界（避免搞混）
+
+| 场景 | 改哪个脚本 |
+|------|------------|
+| GitHub Actions / 云端 CI、定时同步、校验、邮件通知 | **仅** [`tools/sync_to_gitee.py`](tools/sync_to_gitee.py) 与工作流 YAML |
+| 本机交互菜单、远程编译 installer、mapd 等纯本地流程 | [`tools/sync_to_gitee_local.py`](tools/sync_to_gitee_local.py)（及本地入口 `sp-sync`） |
+
+**禁止**：为 CI/云端需求去改 `tools/sync_to_gitee_local.py`。本地封装脚本**不参与**云端逻辑。
+
+## 实施前自检
+
+- 若任务写「Actions」「workflow」「定时」「Gitee 推送」「verify_patches」「邮件通知」→ 只动 `sync_to_gitee.py` / `.github/workflows/sync-to-gitee.yml`。
+- 若任务明确「本地菜单」「comma SSH」「选项 4/5」→ 再考虑 `sync_to_gitee_local.py`。
+- 如果只是推送或者同步，都是指的推送到GitHub上的sunnypilot_cn
