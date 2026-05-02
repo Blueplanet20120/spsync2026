@@ -807,34 +807,75 @@ def patch_mapd_installer(root: Path) -> PatchResult:
   return res
 
 
+_DM_SENTINEL_AWARENESS = "cn_dm_relaxed: avoid awarenessStatus<0 (forceDecel)"
+_DM_SENTINEL_TERMINAL = "cn_dm_relaxed: no terminal strike lockout"
+
+# 容忍上游微调空格/换行；仍绑定具体标识符名，若改名应失败并提示人工更新。
+_RE_DM_AWARENESS_FLOOR = re.compile(
+  r"^([ \t]*)self\.awareness\s*=\s*max\s*\(\s*self\.awareness\s*-\s*self\.step_change\s*,\s*-0\.1\s*\)\s*$",
+  re.MULTILINE,
+)
+_RE_DM_TERMINAL_STRIKES = re.compile(
+  r"^([ \t]+)if\s+self\.awareness\s*<=\s*(?:0\.|0)\s*:\s*\n"
+  r"[ \t]*#\s*terminal red alert[^\n]*\n"
+  r"[ \t]*alert\s*=\s*EventName\.driverDistracted3\s+if\s+self\.active_monitoring_mode\s+else\s+EventName\.driverUnresponsive3\s*\n"
+  r"[ \t]*self\.terminal_time\s*\+=\s*1\s*\n"
+  r"[ \t]*if\s+awareness_prev\s*>\s*(?:0\.|0)\s*:\s*\n"
+  r"[ \t]*self\.terminal_alert_cnt\s*\+=\s*1",
+  re.MULTILINE,
+)
+
+
 def patch_dm_relaxed_terminal(root: Path) -> PatchResult:
   """
   国内化 DM：保留分级告警/鸣音，但削弱「第三次终端锁死」与 awareness<0 触发的纵向 forceDecel。
   - awareness 递减下限由 -0.1 改为 0，避免 driverMonitoringState.awarenessStatus<0
   - 红线阶段不再累计 terminal_time / terminal_alert_cnt，避免 DriverTooDistracted / tooDistracted 路径
-  幂等：已含 sentinel 时 replace_or_fail_changed 不报错。
+  幂等：已含两处 sentinel 则跳过。
+  匹配：用正则兼容空白差异；若上游重命名变量或改写结构导致匹配数≠1，显式报错（优于静默跳过）。
+  （AST 级改写可做终极方案，但需可导入的语法环境与更多样板代码，暂不引入。）
   """
   res = PatchResult("dm_relaxed_terminal")
   helpers = root / "selfdrive/monitoring/helpers.py"
   if not helpers.exists():
     return res
-  changed = replace_or_fail_changed(helpers, [
-    (
-      "        self.awareness = max(self.awareness - self.step_change, -0.1)",
-      "        self.awareness = max(self.awareness - self.step_change, 0.)  # cn_dm_relaxed: avoid awarenessStatus<0 (forceDecel)",
-    ),
-    (
-      "    if self.awareness <= 0.:\n"
-      "      # terminal red alert: disengagement required\n"
-      "      alert = EventName.driverDistracted3 if self.active_monitoring_mode else EventName.driverUnresponsive3\n"
-      "      self.terminal_time += 1\n"
-      "      if awareness_prev > 0.:\n"
-      "        self.terminal_alert_cnt += 1",
-      "    if self.awareness <= 0.:\n"
-      "      # terminal red alert: disengagement required (cn_dm_relaxed: no terminal strike lockout)\n"
-      "      alert = EventName.driverDistracted3 if self.active_monitoring_mode else EventName.driverUnresponsive3",
-    ),
-  ])
+
+  s = helpers.read_text(encoding="utf-8")
+  if _DM_SENTINEL_AWARENESS in s and _DM_SENTINEL_TERMINAL in s:
+    return res
+
+  aw_matches = list(_RE_DM_AWARENESS_FLOOR.finditer(s))
+  if len(aw_matches) != 1:
+    raise RuntimeError(
+      f"{helpers}: patch_dm_relaxed_terminal 期望恰好 1 处 awareness max(..., -0.1) 赋值，实际 {len(aw_matches)}。"
+      " 上游 selfdrive/monitoring/helpers.py 可能已改版，请人工调整 _RE_DM_AWARENESS_FLOOR。"
+    )
+
+  def _repl_aw(m: re.Match) -> str:
+    ind = m.group(1)
+    return f"{ind}self.awareness = max(self.awareness - self.step_change, 0.)  # {_DM_SENTINEL_AWARENESS}"
+
+  s = _RE_DM_AWARENESS_FLOOR.sub(_repl_aw, s, count=1)
+
+  term_matches = list(_RE_DM_TERMINAL_STRIKES.finditer(s))
+  if len(term_matches) != 1:
+    raise RuntimeError(
+      f"{helpers}: patch_dm_relaxed_terminal 期望恰好 1 处红线 terminal 累计块，实际 {len(term_matches)}。"
+      " 上游 selfdrive/monitoring/helpers.py 可能已改版，请人工调整 _RE_DM_TERMINAL_STRIKES。"
+    )
+
+  def _repl_term(m: re.Match) -> str:
+    ind_if = m.group(1)
+    ind_body = ind_if + "  "
+    return (
+      f"{ind_if}if self.awareness <= 0.:\n"
+      f"{ind_body}# terminal red alert: disengagement required ({_DM_SENTINEL_TERMINAL})\n"
+      f"{ind_body}alert = EventName.driverDistracted3 if self.active_monitoring_mode else EventName.driverUnresponsive3"
+    )
+
+  s = _RE_DM_TERMINAL_STRIKES.sub(_repl_term, s, count=1)
+
+  changed = write_if_changed(helpers, s)
   _track_change(res, helpers, changed)
   return res
 
@@ -944,9 +985,9 @@ def verify_patches(root: Path) -> None:
   helpers_dm = root / "selfdrive/monitoring/helpers.py"
   if helpers_dm.exists():
     hm = rt("selfdrive/monitoring/helpers.py")
-    if "cn_dm_relaxed: avoid awarenessStatus<0 (forceDecel)" not in hm:
+    if _DM_SENTINEL_AWARENESS not in hm:
       errors.append("selfdrive/monitoring/helpers.py: 缺少 DM 补丁 sentinel（awareness 下限）")
-    if "cn_dm_relaxed: no terminal strike lockout" not in hm:
+    if _DM_SENTINEL_TERMINAL not in hm:
       errors.append("selfdrive/monitoring/helpers.py: 缺少 DM 补丁 sentinel（terminal 累计）")
     if "max(self.awareness - self.step_change, -0.1)" in hm:
       errors.append("selfdrive/monitoring/helpers.py: 仍存在原版 -0.1 awareness 下限，DM 补丁未生效")
