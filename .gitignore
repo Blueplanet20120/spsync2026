@@ -11,3 +11,4 @@ sunnypilot/
 __pycache__/
 *.pyc
 .DS_Store
+spcn_install.sh

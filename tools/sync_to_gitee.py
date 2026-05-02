@@ -807,6 +807,38 @@ def patch_mapd_installer(root: Path) -> PatchResult:
   return res
 
 
+def patch_dm_relaxed_terminal(root: Path) -> PatchResult:
+  """
+  国内化 DM：保留分级告警/鸣音，但削弱「第三次终端锁死」与 awareness<0 触发的纵向 forceDecel。
+  - awareness 递减下限由 -0.1 改为 0，避免 driverMonitoringState.awarenessStatus<0
+  - 红线阶段不再累计 terminal_time / terminal_alert_cnt，避免 DriverTooDistracted / tooDistracted 路径
+  幂等：已含 sentinel 时 replace_or_fail_changed 不报错。
+  """
+  res = PatchResult("dm_relaxed_terminal")
+  helpers = root / "selfdrive/monitoring/helpers.py"
+  if not helpers.exists():
+    return res
+  changed = replace_or_fail_changed(helpers, [
+    (
+      "        self.awareness = max(self.awareness - self.step_change, -0.1)",
+      "        self.awareness = max(self.awareness - self.step_change, 0.)  # cn_dm_relaxed: avoid awarenessStatus<0 (forceDecel)",
+    ),
+    (
+      "    if self.awareness <= 0.:\n"
+      "      # terminal red alert: disengagement required\n"
+      "      alert = EventName.driverDistracted3 if self.active_monitoring_mode else EventName.driverUnresponsive3\n"
+      "      self.terminal_time += 1\n"
+      "      if awareness_prev > 0.:\n"
+      "        self.terminal_alert_cnt += 1",
+      "    if self.awareness <= 0.:\n"
+      "      # terminal red alert: disengagement required (cn_dm_relaxed: no terminal strike lockout)\n"
+      "      alert = EventName.driverDistracted3 if self.active_monitoring_mode else EventName.driverUnresponsive3",
+    ),
+  ])
+  _track_change(res, helpers, changed)
+  return res
+
+
 def patch_gitmodules(root: Path) -> PatchResult:
   res = PatchResult("gitmodules_urls")
   gitmodules = root / ".gitmodules"
@@ -838,6 +870,7 @@ def patch_all(root: Path) -> list[PatchResult]:
     patch_models_fetcher,
     patch_osm,
     patch_mapd_installer,
+    patch_dm_relaxed_terminal,
     patch_gitmodules,
   ]
   results: list[PatchResult] = []
@@ -908,6 +941,21 @@ def verify_patches(root: Path) -> None:
       if "OPENPILOT_URL" in tx and "gitee.com/xc2026/sp-cn_install" not in tx:
         errors.append(f"{label}: 仍存在 OPENPILOT_URL 但未指向 Gitee sp-cn_install")
 
+  helpers_dm = root / "selfdrive/monitoring/helpers.py"
+  if helpers_dm.exists():
+    hm = rt("selfdrive/monitoring/helpers.py")
+    if "cn_dm_relaxed: avoid awarenessStatus<0 (forceDecel)" not in hm:
+      errors.append("selfdrive/monitoring/helpers.py: 缺少 DM 补丁 sentinel（awareness 下限）")
+    if "cn_dm_relaxed: no terminal strike lockout" not in hm:
+      errors.append("selfdrive/monitoring/helpers.py: 缺少 DM 补丁 sentinel（terminal 累计）")
+    if "max(self.awareness - self.step_change, -0.1)" in hm:
+      errors.append("selfdrive/monitoring/helpers.py: 仍存在原版 -0.1 awareness 下限，DM 补丁未生效")
+    if (
+      "alert = EventName.driverDistracted3 if self.active_monitoring_mode else EventName.driverUnresponsive3\n"
+      "      self.terminal_time += 1\n"
+    ) in hm:
+      errors.append("selfdrive/monitoring/helpers.py: 红线分支仍在累计 terminal_time，DM 补丁未生效")
+
   # 语法兜底（不验证逻辑正确性）
   py_verify = [
     "system/version.py",
@@ -917,6 +965,7 @@ def verify_patches(root: Path) -> None:
     "sunnypilot/models/fetcher.py",
     "selfdrive/ui/sunnypilot/layouts/settings/osm.py",
     "sunnypilot/mapd/mapd_installer.py",
+    "selfdrive/monitoring/helpers.py",
   ]
   for rel in py_verify:
     p = root / rel
