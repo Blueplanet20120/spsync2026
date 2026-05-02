@@ -81,8 +81,10 @@ jobs:
             --origin "$GITEE_REPO_SSH" \
             --upstream "https://github.com/sunnypilot/sunnypilot.git"
 
-      # 仅两种场景发信：上游相对 Gitee 有更新且 (成功推送 | 补丁/同步失败)。未配置 SMTP 相关 secrets 时本步骤可能报错，已 continue-on-error。
-      - name: Notify mail — sync OK (upstream changed + pushed)
+      # 成功通知条件（三者同时满足，AND）：作业成功 + 至少跑过一轮完整同步(attempted_sync) + 已推送(pushed)。
+      # attempted_sync 含：上游相对 Gitee 记录有变化；或手动勾选 Force（FORCE_SYNC）即使上游 SHA 未变。
+      # 未配置 SMTP 时本步骤可能报错，已 continue-on-error。
+      - name: Notify mail — sync OK (ran sync + pushed to Gitee)
         if: >-
           success() &&
           steps.sync.outputs.attempted_sync == 'true' &&
@@ -100,14 +102,16 @@ jobs:
           to: ${{ secrets.MAIL_TO }}
           from: ${{ secrets.MAIL_FROM }}
           body: |
-            sunnypilot_cn → Gitee 同步成功（上游有更新且已完成推送）。
+            sunnypilot_cn → Gitee 同步成功（本轮已执行补丁校验并完成推送）。
+
+            说明：包含「上游相对上次 Gitee 提交有变化」或「手动 Force 强制重同步」两种入口。
 
             branches: ${{ steps.sync.outputs.sync_branches }}
             attempted_sync=${{ steps.sync.outputs.attempted_sync }} pushed=${{ steps.sync.outputs.pushed }}
 
             Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
-      - name: Notify mail — sync FAILED (upstream changed, blocked or error)
+      - name: Notify mail — sync FAILED (after sync attempt)
         if: >-
           failure() &&
           steps.sync.outputs.attempted_sync == 'true'
@@ -124,7 +128,7 @@ jobs:
           to: ${{ secrets.MAIL_TO }}
           from: ${{ secrets.MAIL_FROM }}
           body: |
-            sunnypilot_cn → Gitee 同步失败（已判定上游有更新并进入打补丁流程；可能为 verify_patches、git 或推送错误）。
+            sunnypilot_cn → Gitee 同步失败（已进入完整同步流程：含上游有更新或手动 Force；可能是 verify_patches、git 或推送错误）。
 
             branches: ${{ steps.sync.outputs.sync_branches }}
             attempted_sync=${{ steps.sync.outputs.attempted_sync }} pushed=${{ steps.sync.outputs.pushed }}

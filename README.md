@@ -39,9 +39,11 @@ ssh-keygen -t ed25519 -C "github-actions-sync-to-gitee" -f gitee_deploy_key -N "
 - **（可选）`GITEE_TOKEN`**：仅当你要启用脚本的 `--sync-mapd-release` / 发布 Release 等功能时需要
 
 ### 4) （可选）邮件通知（QQ 邮箱 SMTP）
-工作流在 **两种** 情况下尝试发信（均要求：本轮已判定「上游相对 Gitee 有更新」并进入打补丁流程）：
-- **成功**：补丁校验通过且已推送到 Gitee。
-- **失败**：补丁校验失败、git 错误或未完成推送等（不会把未通过校验的树推向 Gitee）。
+工作流在 **两种** 情况下尝试发信（均要求：本轮**实际跑过**完整同步流程 `attempted_sync`，而不是「定时跳过」那种未进入补丁的情形）：
+- **成功**：`success()` 且 **已完成推送** `pushed`（补丁校验通过后才提交/推送）。
+- **失败**：已进入同步流程但作业失败（如 `verify_patches`、git、推送错误等）。
+
+说明：**「上游是否有新变化」与「是否发成功信」不是简单等同**。通知用的是 **`attempted_sync`（本轮是否执行了检出+补丁流程）** 与 **`pushed`** 的组合（AND）。手动勾选 **Force re-sync** 时，即使上游 SHA 相对 Gitee **未变**，也会设置 `attempted_sync`，推送成功后同样会发成功通知。
 
 在 Actions Secrets 中增加（不配则通知步骤可能报错，已设置 `continue-on-error`，不影响同步结果）：
 - **`SMTP_SERVER`**：QQ 邮箱填 `smtp.qq.com`
