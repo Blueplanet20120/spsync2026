@@ -57,6 +57,7 @@ jobs:
           ssh-keyscan -t rsa,ecdsa,ed25519 gitee.com >> ~/.ssh/known_hosts
 
       - name: Sync upstream -> patch -> push to Gitee
+        id: sync
         shell: bash
         env:
           GITEE_REPO_SSH: ${{ secrets.GITEE_REPO_SSH }}
@@ -79,6 +80,56 @@ jobs:
             --workdir "$WORKDIR" \
             --origin "$GITEE_REPO_SSH" \
             --upstream "https://github.com/sunnypilot/sunnypilot.git"
+
+      # 仅两种场景发信：上游相对 Gitee 有更新且 (成功推送 | 补丁/同步失败)。未配置 SMTP 相关 secrets 时本步骤可能报错，已 continue-on-error。
+      - name: Notify mail — sync OK (upstream changed + pushed)
+        if: >-
+          success() &&
+          steps.sync.outputs.attempted_sync == 'true' &&
+          steps.sync.outputs.pushed == 'true'
+        continue-on-error: true
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.SMTP_SERVER }}
+          server_port: 465
+          secure: true
+          username: ${{ secrets.SMTP_USER }}
+          password: ${{ secrets.SMTP_PASS }}
+          subject: >-
+            [OK] ${{ github.repository }} sync-to-gitee pushed (run ${{ github.run_id }})
+          to: ${{ secrets.MAIL_TO }}
+          from: ${{ secrets.MAIL_FROM }}
+          body: |
+            sunnypilot_cn → Gitee 同步成功（上游有更新且已完成推送）。
+
+            branches: ${{ steps.sync.outputs.sync_branches }}
+            attempted_sync=${{ steps.sync.outputs.attempted_sync }} pushed=${{ steps.sync.outputs.pushed }}
+
+            Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+      - name: Notify mail — sync FAILED (upstream changed, blocked or error)
+        if: >-
+          failure() &&
+          steps.sync.outputs.attempted_sync == 'true'
+        continue-on-error: true
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.SMTP_SERVER }}
+          server_port: 465
+          secure: true
+          username: ${{ secrets.SMTP_USER }}
+          password: ${{ secrets.SMTP_PASS }}
+          subject: >-
+            [FAIL] ${{ github.repository }} sync-to-gitee (run ${{ github.run_id }})
+          to: ${{ secrets.MAIL_TO }}
+          from: ${{ secrets.MAIL_FROM }}
+          body: |
+            sunnypilot_cn → Gitee 同步失败（已判定上游有更新并进入打补丁流程；可能为 verify_patches、git 或推送错误）。
+
+            branches: ${{ steps.sync.outputs.sync_branches }}
+            attempted_sync=${{ steps.sync.outputs.attempted_sync }} pushed=${{ steps.sync.outputs.pushed }}
+
+            Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
       - name: Cleanup old workflow runs (keep latest 20)
         if: always()

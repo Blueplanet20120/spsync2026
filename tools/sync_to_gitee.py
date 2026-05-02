@@ -19,6 +19,7 @@
 import argparse
 import json
 import os
+import py_compile
 import re
 import shutil
 import subprocess
@@ -845,66 +846,105 @@ def patch_all(root: Path) -> list[PatchResult]:
     results.append(r)
   return results
 
-  # tools/setup.sh
-  setup_sh = root / "tools/setup.sh"
-  replace_or_fail(setup_sh, [
-    ("https://github.com/commaai/openpilot.git", "https://gitee.com/xc2026/sunnypilot_cn.git"),
-    ("https://github.com/commaai/openpilot/blob/master/docs/CONTRIBUTING.md",
-     "https://gitee.com/xc2026/sunnypilot_cn/blob/master/docs/CONTRIBUTING.md"),
-  ])
 
-  # msgq_repo/setup.sh (Catch2)
-  msgq_setup = root / "msgq_repo/setup.sh"
-  if msgq_setup.exists():
-    replace_or_fail(msgq_setup, [
-      ("https://github.com/catchorg/Catch2.git", "https://gitee.com/xc2026/Catch2.git"),
-    ])
+def verify_patches(root: Path) -> None:
+  """
+  补丁后的门禁校验：失败则阻止提交/推送，避免半成品国内化进入 Gitee。
+  与 patch_* 中的 replace_or_fail 互补（后者对缺字符串硬失败；此处捕获条件补丁未生效的情况）。
+  """
+  errors: list[str] = []
 
-  # opendbc_repo/pyproject.toml (commaai/dependencies -> gitee)
-  opendbc_pyproj = root / "opendbc_repo/pyproject.toml"
-  if opendbc_pyproj.exists():
-    s = opendbc_pyproj.read_text(encoding="utf-8")
-    s2 = s.replace("git+https://github.com/commaai/dependencies.git", "git+https://gitee.com/xc2026/dependencies.git")
-    if s2 != s:
-      opendbc_pyproj.write_text(s2, encoding="utf-8")
+  def rt(rel: str) -> str:
+    p = root / rel
+    if not p.exists():
+      return ""
+    return p.read_text(encoding="utf-8", errors="replace")
 
-  # models fetcher (raw -> gitee raw)
-  fetcher = root / "sunnypilot/models/fetcher.py"
-  replace_or_fail(fetcher, [
-    ("https://raw.githubusercontent.com/sunnypilot/sunnypilot-models/",
-     "https://gitee.com/xc2026/sunnypilot-models/raw/"),
-  ])
+  inst = rt("selfdrive/ui/installer/installer.cc")
+  if not inst.strip():
+    errors.append("selfdrive/ui/installer/installer.cc: 文件缺失或为空")
+  elif "gitee.com/xc2026/sunnypilot_cn" not in inst and "git@gitee.com:xc2026/sunnypilot_cn" not in inst:
+    errors.append("installer.cc: 未包含 Gitee sunnypilot_cn 安装源")
 
-  # OSM bounding boxes (raw -> gitee raw)
-  osm_py = root / "selfdrive/ui/sunnypilot/layouts/settings/osm.py"
-  replace_or_fail(osm_py, [
-    ("https://raw.githubusercontent.com/pfeiferj/openpilot-mapd/main/",
-     "https://gitee.com/xc2026/openpilot-mapd/raw/main/"),
-  ])
+  if "gitee.com/xc2026/sunnypilot_cn" not in rt("system/version.py"):
+    errors.append("system/version.py: sunnypilot_remote 元组中缺少 Gitee URL")
 
-  # mapd installer (releases -> gitee releases, allow MAPD_TAG override)
-  mapd_installer = root / "sunnypilot/mapd/mapd_installer.py"
-  s = mapd_installer.read_text(encoding="utf-8")
-  if "gitee.com/xc2026/openpilot-mapd" not in s:
-    s = s.replace('VERSION = "v1.12.0"', 'VERSION = os.getenv("MAPD_TAG", "v1.12.0")')
-    s = s.replace("https://github.com/pfeiferj/openpilot-mapd/releases/download/",
-                  "https://gitee.com/xc2026/openpilot-mapd/releases/download/")
-    mapd_installer.write_text(s, encoding="utf-8")
+  if "ensure_url_insteadof" not in rt("system/updated/updated.py"):
+    errors.append("system/updated/updated.py: 缺少 ensure_url_insteadof 注入")
 
-  # submodule urls: rewrite to gitee mirrors (ssh)
-  gitmodules = root / ".gitmodules"
-  if gitmodules.exists():
-    gm = gitmodules.read_text(encoding="utf-8")
-    gm2 = gm
-    gm2 = gm2.replace("https://github.com/commaai/msgq.git", "git@gitee.com:xc2026/msgq.git")
-    gm2 = gm2.replace("https://github.com/sunnypilot/opendbc.git", "git@gitee.com:xc2026/opendbc.git")
-    gm2 = gm2.replace("https://github.com/commaai/rednose.git", "git@gitee.com:xc2026/rednose.git")
-    gm2 = gm2.replace("https://github.com/commaai/teleoprtc", "git@gitee.com:xc2026/teleoprtc.git")
-    gm2 = gm2.replace("https://github.com/sunnypilot/tinygrad.git", "git@gitee.com:xc2026/tinygrad.git")
-    gm2 = gm2.replace("https://github.com/sunnyhaibin/panda.git", "git@gitee.com:xc2026/panda.git")
-    gm2 = gm2.replace("https://github.com/sunnypilot/neural-network-data.git", "git@gitee.com:xc2026/neural_network_data.git")
-    if gm2 != gm:
-      gitmodules.write_text(gm2, encoding="utf-8")
+  if "gitee.com/xc2026/sunnypilot_cn" not in rt("tools/setup.sh"):
+    errors.append("tools/setup.sh: 缺少 Gitee sunnypilot_cn URL")
+
+  if (root / "msgq_repo/setup.sh").exists() and "gitee.com/xc2026/Catch2" not in rt("msgq_repo/setup.sh"):
+    errors.append("msgq_repo/setup.sh: 缺少 Gitee Catch2 URL")
+
+  if (root / "opendbc_repo/pyproject.toml").exists():
+    if "gitee.com/xc2026/dependencies" not in rt("opendbc_repo/pyproject.toml"):
+      errors.append("opendbc_repo/pyproject.toml: 缺少 Gitee dependencies URL")
+
+  if "gitee.com/xc2026/sunnypilot-models" not in rt("sunnypilot/models/fetcher.py"):
+    errors.append("sunnypilot/models/fetcher.py: 缺少 Gitee models raw URL")
+
+  if "gitee.com/xc2026/openpilot-mapd" not in rt("selfdrive/ui/sunnypilot/layouts/settings/osm.py"):
+    errors.append("selfdrive/ui/sunnypilot/layouts/settings/osm.py: 缺少 Gitee mapd raw URL")
+
+  if "gitee.com/xc2026/openpilot-mapd" not in rt("sunnypilot/mapd/mapd_installer.py"):
+    errors.append("sunnypilot/mapd/mapd_installer.py: 缺少 Gitee mapd release URL")
+
+  if (root / ".gitmodules").exists():
+    gm = rt(".gitmodules")
+    stale = [
+      ("commaai/msgq", "https://github.com/commaai/msgq.git"),
+      ("sunnypilot/opendbc", "https://github.com/sunnypilot/opendbc.git"),
+      ("commaai/rednose", "https://github.com/commaai/rednose.git"),
+    ]
+    for label, needle in stale:
+      if needle in gm:
+        errors.append(f".gitmodules: 仍包含上游 GitHub URL（{label}），国内化未写完")
+
+  for rel, label in (("system/ui/tici_setup.py", "tici_setup"), ("system/ui/mici_setup.py", "mici_setup")):
+    if (root / rel).exists():
+      tx = rt(rel)
+      if "OPENPILOT_URL" in tx and "gitee.com/xc2026/sp-cn_install" not in tx:
+        errors.append(f"{label}: 仍存在 OPENPILOT_URL 但未指向 Gitee sp-cn_install")
+
+  # 语法兜底（不验证逻辑正确性）
+  py_verify = [
+    "system/version.py",
+    "system/updated/updated.py",
+    "system/ui/tici_setup.py",
+    "system/ui/mici_setup.py",
+    "sunnypilot/models/fetcher.py",
+    "selfdrive/ui/sunnypilot/layouts/settings/osm.py",
+    "sunnypilot/mapd/mapd_installer.py",
+  ]
+  for rel in py_verify:
+    p = root / rel
+    if p.exists():
+      try:
+        py_compile.compile(str(p), doraise=True)
+      except py_compile.PyCompileError as e:
+        errors.append(f"{rel}: py_compile 失败: {e}")
+
+  if errors:
+    raise RuntimeError("verify_patches 失败（不会提交/推送）：\n  - " + "\n  - ".join(errors))
+
+
+def write_ci_github_output(state: dict[str, object]) -> None:
+  """供 GitHub Actions 读取 steps.sync.outputs.*（双场景邮件条件）。"""
+  if os.environ.get("GITHUB_ACTIONS") != "true":
+    return
+  path = os.environ.get("GITHUB_OUTPUT")
+  if not path:
+    return
+  attempted = bool(state.get("attempted"))
+  pushed = bool(state.get("pushed"))
+  branches = state.get("branches") or []
+  br_line = ",".join(str(b) for b in branches) if branches else ""
+  with open(path, "a", encoding="utf-8") as f:
+    f.write(f"attempted_sync={'true' if attempted else 'false'}\n")
+    f.write(f"pushed={'true' if pushed else 'false'}\n")
+    f.write(f"sync_branches={br_line}\n")
 
 
 def ensure_tinygrad_submodule_commit_reachable() -> None:
@@ -1155,7 +1195,9 @@ def main() -> None:
     raise SystemExit(f"未找到 git 仓库: {root}")
 
   env, shim_dir = prepare_git_env(root)
+  ci_sync_state: dict[str, object] | None = None
   try:
+    ci_sync_state = {"attempted": False, "pushed": False, "branches": []}
     # load optional .env next to this repo (never committed)
     sp_dotenv = load_dotenv(REPO_ROOT / ".env")
     for k, v in sp_dotenv.items():
@@ -1213,6 +1255,10 @@ def main() -> None:
       if force_sync and recorded_sha == upstream_sha:
         print(f"[force] {branch}: upstream sha unchanged but FORCE_SYNC=1, will re-sync")
 
+      assert ci_sync_state is not None
+      ci_sync_state["attempted"] = True
+      ci_sync_state.setdefault("branches", []).append(branch)
+
       # 切换分支前先强制清理一次，避免被子模块残留文件阻塞
       hard_clean_worktree()
       # sync to upstream/<branch> baseline
@@ -1248,6 +1294,9 @@ def main() -> None:
       # patches 可能会改写 .gitmodules；同步一次 URL（不再更新 commit）
       if do_update_submodules:
         run(["git", "submodule", "sync", "--recursive"], str(root), env=env)
+
+      log(branch, "verify patches (gate before commit/push)")
+      verify_patches(root)
 
       # optional: installer build (device side)
       if args.build_installer:
@@ -1320,6 +1369,8 @@ def main() -> None:
         print("[skip] no branches changed; nothing to push")
       else:
         push_all(to_push)
+        assert ci_sync_state is not None
+        ci_sync_state["pushed"] = True
       if args.force_staging:
         run(["git", "push", "-f", "origin", "master:staging"], str(root), env=env)
       maybe_sync_mapd_release()
@@ -1414,6 +1465,11 @@ def main() -> None:
         shim_dir.rmdir()
       except Exception:
         pass
+    try:
+      if ci_sync_state is not None and args.action == "all":
+        write_ci_github_output(ci_sync_state)
+    except Exception:
+      pass
 
 
 if __name__ == "__main__":
