@@ -12,3 +12,4 @@ __pycache__/
 *.pyc
 .DS_Store
 spcn_install.sh
+installer_openpilot_staging
