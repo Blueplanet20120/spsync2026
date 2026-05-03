@@ -3,10 +3,10 @@
 本仓库用于将上游 [`sunnypilot/sunnypilot`](https://github.com/sunnypilot/sunnypilot) 的 **`staging`** 分支定时同步到你的 Gitee 仓库（**不对上游 `master` 打补丁或推送**，避免重复大包推送；设备侧使用 `staging`）。同步过程中会应用“国内化补丁”（将常见 GitHub/Raw 地址重写为 Gitee 镜像等）。
 
 同步逻辑由：
-- 脚本：[`tools/sync_to_gitee.py`](tools/sync_to_gitee.py)
-- 定时任务：[`/.github/workflows/sync-to-gitee.yml`](.github/workflows/sync-to-gitee.yml)
+- 云端 / CI：[`tools/sync_to_gitee.py`](tools/sync_to_gitee.py) + [`.github/workflows/sync-to-gitee.yml`](.github/workflows/sync-to-gitee.yml)
+- 本机菜单与扩展（mapd、installer、Windows 等）：[`tools/sync_to_gitee_local.py`](tools/sync_to_gitee_local.py)，入口见仓库根目录 `sp_sync.py`、`sp-sync`、`setup_local_venv.cmd`
 
-**仓库分工**：本 GitHub 仓库存同步工具；**打补丁后的代码**推送到 **Gitee** 供国内更新（详见 Cursor 规则 [`.cursor/rules/sync-cn-boundaries.mdc`](.cursor/rules/sync-cn-boundaries.mdc)，云端勿改 `tools/sync_to_gitee_local.py`）。
+**仓库分工**：本 GitHub 仓库存同步工具；**打补丁后的代码**推送到 **Gitee** 供国内更新（详见 [`.cursor/rules/sync-cn-boundaries.mdc`](.cursor/rules/sync-cn-boundaries.mdc)）。Actions **只执行** `sync_to_gitee.py`，**不依赖**改 `sync_to_gitee_local.py`。
 
 ## Actions 做了什么
 - 每小时（UTC 整点）触发一次（也支持手动触发）

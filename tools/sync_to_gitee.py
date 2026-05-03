@@ -6,15 +6,15 @@
 - 上游 master 不参与补丁与推送（设备/comma 使用 staging；避免重复大包推送与无关更新检测）
 - 应用国内化补丁（幂等）
 - 更新子模块（包含子依赖）
-- 可选：在 larch64 上构建 installer
-- 可选：同步 mapd 二进制到 Gitee Release（读取 GITEE_TOKEN）
+- 可选（CLI 开关；云端 Actions 不使用）：``--build-installer``、``--sync-mapd-release``（需 GITEE_TOKEN）。
+  mapd / 远端 installer 交互更适合在本机用 ``tools/sync_to_gitee_local.py``；本脚本内菜单不含这两项。
 - 提交并推送到你的 Gitee：staging
 
 用法示例：
-  python3 /home/perfume/sp/tools/sync_to_gitee.py              # 交互菜单（默认）
-  python3 /home/perfume/sp/tools/sync_to_gitee.py --action all # 一键拉取+打补丁+推送
-  python3 /home/perfume/sp/tools/sync_to_gitee.py --build-installer
-  GITEE_TOKEN=xxx python3 /home/perfume/sp/tools/sync_to_gitee.py --sync-mapd-release
+  python3 tools/sync_to_gitee.py --action all                  # CI / 一键同步（常用）
+  python3 tools/sync_to_gitee.py                               # 交互菜单：仅 1~3（pull / push / all）
+  python3 tools/sync_to_gitee.py --sync-mapd-release           # 仅脚本/自动化调用 mapd（非菜单）
+  python3 tools/sync_to_gitee.py --build-installer             # 仅脚本调用 installer（非菜单）
 """
 
 import argparse
@@ -2154,14 +2154,12 @@ def main() -> None:
         return
 
       while True:
-        print("\n=== sync_to_gitee 菜单 ===")
+        print("\n=== sync_to_gitee 菜单（CI 路径请用 --action all；mapd/installer 请用 sync_to_gitee_local.py）===")
         print("1) 拉取 upstream + 仅对 staging 应用补丁 + 更新子模块（不推送）")
         print("2) 推送本地 staging 到 Gitee（强推）")
         print("3) 一键执行（1 + 2）")
-        print("4) 仅同步 mapd release（需要 GITEE_TOKEN）")
-        print("5) 远程连接 comma：编译 staging installer → 拷贝到本机 → 同步到 sp-cn_install（文件名=installer_openpilot）")
         print("0) 退出\n")
-        choice = input("请选择操作 [0-5]: ").strip()
+        choice = input("请选择操作 [0-3]: ").strip()
         try:
           if choice == "1":
             pull_all()
@@ -2175,40 +2173,10 @@ def main() -> None:
           elif choice == "3":
             do_all()
             print("[ok] 已完成一键执行。")
-          elif choice == "4":
-            maybe_sync_mapd_release()
-            print("[ok] 已完成 mapd release 同步。")
-          elif choice == "5":
-            out_dir = Path(args.installer_outdir).expanduser().resolve()
-            host = (args.comma_host or "").strip()
-            while True:
-              try:
-                print(f"[step] 连接 comma：{args.comma_user}@{host}")
-                out = build_comma_installer_staging(host, args.comma_user, args.comma_key, out_dir)
-                break
-              except Exception as e:
-                print(f"[error] 连接/编译失败：{e}")
-                new_host = input(f"请输入新的 comma IP/域名（当前 {host}，留空退出）: ").strip()
-                if not new_host:
-                  raise
-                host = new_host
-
-            # publish to repo
-            print(f"[step] 同步二进制到仓库：{args.installer_repo} ({args.installer_repo_branch})")
-            sync_installer_to_repo(out, args.installer_repo, branch=args.installer_repo_branch)
-            if args.publish_installer_release:
-              token = env.get("GITEE_TOKEN", "").strip().strip('"')
-              if not token:
-                print("[warn] 未设置 GITEE_TOKEN，跳过发布 Release。")
-              else:
-                print("[step] 发布 Gitee Release（tag=YYYYMMDDHHMM）并上传 installer_openpilot")
-                tag = publish_installer_release(token, args.installer_repo, out)
-                print(f"[ok] 已发布 Release tag={tag}")
-            print(f"[ok] 已生成 installer 并同步到仓库：{out}")
           elif choice == "0":
             return
           else:
-            print("无效选择，请输入 0-5。")
+            print("无效选择，请输入 0-3。")
         except Exception as e:
           print(f"[error] {e}")
           print(traceback.format_exc())

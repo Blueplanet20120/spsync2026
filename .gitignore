@@ -1,9 +1,5 @@
 .env
-# 本地备忘/脚本入口，不进入云端工具仓
 readme.txt
-sp-sync
-# 本地交互封装（可选：仅本机使用，避免提交到 GitHub 工具仓）
-tools/sync_to_gitee_local.py
 sp-cn
 installer_openpilot
 image/
@@ -13,5 +9,4 @@ __pycache__/
 .DS_Store
 spcn_install.sh
 installer_openpilot_staging
-readme.txt
-.env
+.venv/

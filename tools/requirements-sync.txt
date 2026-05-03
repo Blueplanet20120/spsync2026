@@ -1,0 +1,2 @@
+# sync_to_gitee.py / sync_to_gitee_local.py：Python 3.11+ 标准库即可（含 zoneinfo）。
+# 若日后加入第三方依赖，写在此处；tools/setup_local_venv.py 会 pip install -r 本文件。
