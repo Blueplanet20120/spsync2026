@@ -470,6 +470,151 @@ def replace_or_fail_changed(path: Path, replacements: list[tuple[str, str]]) -> 
   return write_if_changed(path, s) if s != orig else False
 
 
+# ---------------------------------------------------------------------------
+# 弹性补丁基元：降低上游在引号、.git 后缀、少量空白/换行上的差异导致的失败率
+# ---------------------------------------------------------------------------
+
+def _with_git_url_variants(url: str) -> list[str]:
+  """同一逻辑 URL 的常见字符串变体（顺序尝试，去重）。"""
+  u = url.strip()
+  out: list[str] = [u]
+  if u.endswith(".git"):
+    out.append(u[:-4])
+  else:
+    out.append(u + ".git")
+  if u.startswith("https://github.com/"):
+    out.append("http://" + u[8:])
+  if u.startswith("http://github.com/"):
+    out.append("https://" + u[7:])
+  # 去重保序
+  seen: set[str] = set()
+  uniq: list[str] = []
+  for x in out:
+    if x not in seen:
+      seen.add(x)
+      uniq.append(x)
+  return uniq
+
+
+def replace_first_alias(s: str, old_candidates: list[str], new: str) -> str:
+  """
+  在 old_candidates 中按顺序找第一个真实出现在 s 里的串，做全局 replace(old, new)；
+  若均不存在则原样返回（由调用方决定是否报错）。
+  """
+  for o in old_candidates:
+    if o in s:
+      return s.replace(o, new)
+  return s
+
+
+def apply_text_replacement_rows(
+  s: str,
+  rows: list[tuple[list[str], str]],
+  *,
+  path: Path,
+  require_all: bool = False,
+  skip_row_when_new_present: bool = True,
+) -> str:
+  """
+  rows: 每行 = (若干「上游可能出现的旧串」列表, 统一新串)。
+  对每行：若任旧串命中则整串替换为 new，并仅使用命中的那个旧串做 replace。
+  require_all=True：每一「未完成」行都必须能从 olds 命中一次（幂等时若 new 已在文中则跳过该行）。
+  skip_row_when_new_present：若整段 new 已在 s 中，视为该行已打好，跳过后续 olds 匹配。
+  """
+  missing: list[str] = []
+  for i, (olds, new) in enumerate(rows):
+    if skip_row_when_new_present and new and new in s:
+      continue
+    before = s
+    s = replace_first_alias(s, olds, new)
+    if s == before and require_all:
+      missing.append(f"  行 {i+1}: 未匹配任一候选（首项 {olds[0]!r}…）")
+  if missing and require_all:
+    raise RuntimeError(
+      f"{path}: 弹性替换未完全命中（上游可能已改 URL/宏）：\n" + "\n".join(missing)
+    )
+  return s
+
+
+def ensure_gitee_in_sunnypilot_remote_tuple_flex(s: str, gitee_key: str) -> str:
+  """
+  在 version.py 的 sunnypilot_remote 元组中注入 Gitee 识别串；比单点 insert 多几种上游形态。
+  """
+  if gitee_key in s:
+    return s
+  # 原实现：def sunnypilot_remote 块
+  m = re.search(
+    r"(def\s+sunnypilot_remote\(self\)\s*->\s*bool:\s*\n\s*return\s+self\.git_normalized_origin\s+in\s+\()",
+    s,
+    re.MULTILINE,
+  )
+  if m:
+    close_idx = s.find(")", m.end())
+    if close_idx != -1:
+      before = s[:close_idx].rstrip()
+      after = s[close_idx:]
+      if not before.endswith(","):
+        before = before + ","
+      before = before + f'\n                                          "{gitee_key}"'
+      return before + after
+  # 备用：元组跨行、return 后换行不同
+  m2 = re.search(
+    r"(return\s+self\.git_normalized_origin\s+in\s+\()",
+    s,
+    re.MULTILINE,
+  )
+  if m2:
+    close_idx = s.find(")", m2.end())
+    if close_idx != -1:
+      before = s[:close_idx].rstrip()
+      after = s[close_idx:]
+      if not before.endswith(","):
+        before = before + ","
+      before = before + f'\n                                          "{gitee_key}"'
+      return before + after
+  raise RuntimeError("version.py: 未找到 sunnypilot_remote 元组块，无法注入 Gitee URL")
+
+
+def inject_updated_insteadof_block_flex(s: str) -> str:
+  """在 updated.py 中注入 ensure_url_insteadof；兼容上游微调 for option 循环。"""
+  if "ensure_url_insteadof(" in s:
+    return s
+  block = """
+
+  def ensure_url_insteadof(url_key: str, instead_of: str) -> None:
+    \"\"\"Idempotently add a url.<base>.insteadof rewrite rule to the repo config.\"\"\"
+    try:
+      existing = run([\"git\", \"config\", \"--get-all\", url_key], cwd).splitlines()
+    except subprocess.CalledProcessError:
+      existing = []
+    if instead_of in existing:
+      return
+    run([\"git\", \"config\", \"--add\", url_key, instead_of], cwd)
+
+  # 国内化：将常见 GitHub 源自动重写到 Gitee 镜像（同时覆盖 https 与 ssh）。
+  ensure_url_insteadof(\"url.https://gitee.com/xc2026/.insteadof\", \"https://github.com/\")
+  ensure_url_insteadof(\"url.https://gitee.com/xc2026/.insteadof\", \"https://raw.githubusercontent.com/\")
+  ensure_url_insteadof(\"url.git@gitee.com:xc2026/.insteadof\", \"git@github.com:\")
+  ensure_url_insteadof(\"url.git@gitee.com:xc2026/.insteadof\", \"ssh://git@github.com/\")
+"""
+  anchors = [
+    "for option, value in git_cfg:\n    run([\"git\", \"config\", option, value], cwd)\n",
+    "for option, value in git_cfg:\n        run([\"git\", \"config\", option, value], cwd)\n",
+    "for option, value in git_cfg:\n    run(['git', 'config', option, value], cwd)\n",
+  ]
+  for a in anchors:
+    if a in s:
+      return s.replace(a, a + block)
+  m = re.search(
+    r"(for\s+option,\s*value\s+in\s+git_cfg:\s*\n\s*run\(\[[^\]]+\],\s*cwd\)\s*\n)",
+    s,
+    re.MULTILINE,
+  )
+  if m:
+    return s.replace(m.group(1), m.group(1) + block)
+  raise RuntimeError("updated.py 结构变化，无法自动注入 insteadof 规则（未匹配 git_cfg 循环）")
+
+
 def parse_recorded_upstream_sha(commit_body: str, branch: str) -> str | None:
   """
   约定：在提交信息中记录本次同步对应的上游分支 HEAD，例如：
@@ -738,11 +883,27 @@ def _track_change(res: PatchResult, path: Path, changed: bool) -> None:
 def patch_installer_urls(root: Path) -> PatchResult:
   res = PatchResult("installer_urls")
   installer = root / "selfdrive/ui/installer/installer.cc"
-  changed = replace_or_fail_changed(installer, [
-    ("https://github.com/commaai/openpilot.git", "https://gitee.com/xc2026/sunnypilot_cn.git"),
-    ('#define GIT_SSH_URL "git@github.com:commaai/openpilot.git"', '#define GIT_SSH_URL "git@gitee.com:xc2026/sunnypilot_cn.git"'),
-  ])
-  _track_change(res, installer, changed)
+  s = installer.read_text(encoding="utf-8")
+  s2 = apply_text_replacement_rows(
+    s,
+    [
+      (
+        _with_git_url_variants("https://github.com/commaai/openpilot.git"),
+        "https://gitee.com/xc2026/sunnypilot_cn.git",
+      ),
+      (
+        [
+          '#define GIT_SSH_URL "git@github.com:commaai/openpilot.git"',
+          "#define GIT_SSH_URL 'git@github.com:commaai/openpilot.git'",
+          '#define GIT_SSH_URL "git@github.com:commaai/openpilot"',
+        ],
+        '#define GIT_SSH_URL "git@gitee.com:xc2026/sunnypilot_cn.git"',
+      ),
+    ],
+    path=installer,
+    require_all=True,
+  )
+  _track_change(res, installer, write_if_changed(installer, s2))
   return res
 
 
@@ -750,7 +911,13 @@ def patch_version_py(root: Path) -> PatchResult:
   res = PatchResult("system_version_py")
   version_py = root / "system/version.py"
   s = version_py.read_text(encoding="utf-8")
-  s2 = ensure_line_in_tuple_block(s, "gitee.com/xc2026/sunnypilot_cn")
+  key = "gitee.com/xc2026/sunnypilot_cn"
+  if key in s:
+    return res
+  try:
+    s2 = ensure_gitee_in_sunnypilot_remote_tuple_flex(s, key)
+  except RuntimeError:
+    s2 = ensure_line_in_tuple_block(s, key)
   _track_change(res, version_py, write_if_changed(version_py, s2))
   return res
 
@@ -759,30 +926,8 @@ def patch_updated_insteadof(root: Path) -> PatchResult:
   res = PatchResult("updated_insteadof")
   updated_py = root / "system/updated/updated.py"
   s = updated_py.read_text(encoding="utf-8")
-  if "ensure_url_insteadof(" not in s:
-    insert_after = "for option, value in git_cfg:\n    run([\"git\", \"config\", option, value], cwd)\n"
-    if insert_after not in s:
-      raise RuntimeError("updated.py 结构变化，无法自动注入 insteadof 规则")
-    inject = insert_after + """
-
-  def ensure_url_insteadof(url_key: str, instead_of: str) -> None:
-    \"\"\"Idempotently add a url.<base>.insteadof rewrite rule to the repo config.\"\"\"
-    try:
-      existing = run([\"git\", \"config\", \"--get-all\", url_key], cwd).splitlines()
-    except subprocess.CalledProcessError:
-      existing = []
-    if instead_of in existing:
-      return
-    run([\"git\", \"config\", \"--add\", url_key, instead_of], cwd)
-
-  # 国内化：将常见 GitHub 源自动重写到 Gitee 镜像（同时覆盖 https 与 ssh）。
-  ensure_url_insteadof(\"url.https://gitee.com/xc2026/.insteadof\", \"https://github.com/\")
-  ensure_url_insteadof(\"url.https://gitee.com/xc2026/.insteadof\", \"https://raw.githubusercontent.com/\")
-  ensure_url_insteadof(\"url.git@gitee.com:xc2026/.insteadof\", \"git@github.com:\")
-  ensure_url_insteadof(\"url.git@gitee.com:xc2026/.insteadof\", \"ssh://git@github.com/\")
-"""
-    s2 = s.replace(insert_after, inject)
-    _track_change(res, updated_py, write_if_changed(updated_py, s2))
+  s2 = inject_updated_insteadof_block_flex(s)
+  _track_change(res, updated_py, write_if_changed(updated_py, s2))
   return res
 
 
@@ -794,9 +939,15 @@ def patch_tici_setup(root: Path) -> PatchResult:
 
   s = tici_setup.read_text(encoding="utf-8")
   orig = s
-  if 'OPENPILOT_URL = "https://openpilot.comma.ai"' in s:
-    s = s.replace('OPENPILOT_URL = "https://openpilot.comma.ai"\n',
-                  'OPENPILOT_URL = "https://gitee.com/xc2026/sp-cn_install/raw/master/installer_openpilot"\n')
+  gitee_install = 'OPENPILOT_URL = "https://gitee.com/xc2026/sp-cn_install/raw/master/installer_openpilot"\n'
+  s = replace_first_alias(
+    s,
+    [
+      'OPENPILOT_URL = "https://openpilot.comma.ai"\n',
+      "OPENPILOT_URL = 'https://openpilot.comma.ai'\n",
+    ],
+    gitee_install,
+  )
   if "CONNECTIVITY_CHECK_URLS" not in s:
     s = s.replace(
       'OPENPILOT_URL = "https://gitee.com/xc2026/sp-cn_install/raw/master/installer_openpilot"\n',
@@ -889,9 +1040,15 @@ def patch_mici_setup(root: Path) -> PatchResult:
     return res
   s = mici_setup.read_text(encoding="utf-8")
   orig = s
-  if 'OPENPILOT_URL = "https://openpilot.comma.ai"' in s:
-    s = s.replace('OPENPILOT_URL = "https://openpilot.comma.ai"\n',
-                  'OPENPILOT_URL = "https://gitee.com/xc2026/sp-cn_install/raw/master/installer_openpilot"\n')
+  gitee_install = 'OPENPILOT_URL = "https://gitee.com/xc2026/sp-cn_install/raw/master/installer_openpilot"\n'
+  s = replace_first_alias(
+    s,
+    [
+      'OPENPILOT_URL = "https://openpilot.comma.ai"\n',
+      "OPENPILOT_URL = 'https://openpilot.comma.ai'\n",
+    ],
+    gitee_install,
+  )
   if "CONNECTIVITY_CHECK_URLS" not in s:
     s = s.replace(
       'OPENPILOT_URL = "https://gitee.com/xc2026/sp-cn_install/raw/master/installer_openpilot"\n',
@@ -969,15 +1126,27 @@ def patch_mici_setup(root: Path) -> PatchResult:
 def patch_setup_sh(root: Path) -> PatchResult:
   res = PatchResult("tools_setup_sh")
   setup_sh = root / "tools/setup.sh"
-  changed = replace_or_fail_changed(setup_sh, [
-    ("https://github.com/commaai/openpilot.git", "https://gitee.com/xc2026/sunnypilot_cn.git"),
-    ("https://github.com/commaai/openpilot/blob/master/docs/CONTRIBUTING.md",
-     "https://gitee.com/xc2026/sunnypilot_cn/blob/staging/docs/CONTRIBUTING.md"),
-  ])
-  _track_change(res, setup_sh, changed)
-  # 此前补丁写入 blob/master；远端已无 master 时需迁移为 staging
   s = setup_sh.read_text(encoding="utf-8")
-  s2 = s.replace(
+  s2 = apply_text_replacement_rows(
+    s,
+    [
+      (
+        _with_git_url_variants("https://github.com/commaai/openpilot.git"),
+        "https://gitee.com/xc2026/sunnypilot_cn.git",
+      ),
+      (
+        [
+          "https://github.com/commaai/openpilot/blob/master/docs/CONTRIBUTING.md",
+          "https://github.com/commaai/openpilot/blob/staging/docs/CONTRIBUTING.md",
+        ],
+        "https://gitee.com/xc2026/sunnypilot_cn/blob/staging/docs/CONTRIBUTING.md",
+      ),
+    ],
+    path=setup_sh,
+    require_all=True,
+  )
+  # 此前补丁写入 blob/master；远端已无 master 时需迁移为 staging
+  s2 = s2.replace(
     "https://gitee.com/xc2026/sunnypilot_cn/blob/master/docs/CONTRIBUTING.md",
     "https://gitee.com/xc2026/sunnypilot_cn/blob/staging/docs/CONTRIBUTING.md",
   )
@@ -989,9 +1158,19 @@ def patch_msgq_setup(root: Path) -> PatchResult:
   res = PatchResult("msgq_setup")
   msgq_setup = root / "msgq_repo/setup.sh"
   if msgq_setup.exists():
-    _track_change(res, msgq_setup, replace_or_fail_changed(msgq_setup, [
-      ("https://github.com/catchorg/Catch2.git", "https://gitee.com/xc2026/Catch2.git"),
-    ]))
+    s = msgq_setup.read_text(encoding="utf-8")
+    s2 = apply_text_replacement_rows(
+      s,
+      [
+        (
+          _with_git_url_variants("https://github.com/catchorg/Catch2.git"),
+          "https://gitee.com/xc2026/Catch2.git",
+        ),
+      ],
+      path=msgq_setup,
+      require_all=True,
+    )
+    _track_change(res, msgq_setup, write_if_changed(msgq_setup, s2))
   return res
 
 
@@ -1000,7 +1179,21 @@ def patch_opendbc_pyproject(root: Path) -> PatchResult:
   opendbc_pyproj = root / "opendbc_repo/pyproject.toml"
   if opendbc_pyproj.exists():
     s = opendbc_pyproj.read_text(encoding="utf-8")
-    s2 = s.replace("git+https://github.com/commaai/dependencies.git", "git+https://gitee.com/xc2026/dependencies.git")
+    s2 = apply_text_replacement_rows(
+      s,
+      [
+        (
+          [
+            "git+https://github.com/commaai/dependencies.git",
+            "git+https://github.com/commaai/dependencies",
+            "git+http://github.com/commaai/dependencies.git",
+          ],
+          "git+https://gitee.com/xc2026/dependencies.git",
+        ),
+      ],
+      path=opendbc_pyproj,
+      require_all=True,
+    )
     _track_change(res, opendbc_pyproj, write_if_changed(opendbc_pyproj, s2))
   return res
 
@@ -1008,20 +1201,44 @@ def patch_opendbc_pyproject(root: Path) -> PatchResult:
 def patch_models_fetcher(root: Path) -> PatchResult:
   res = PatchResult("models_fetcher")
   fetcher = root / "sunnypilot/models/fetcher.py"
-  _track_change(res, fetcher, replace_or_fail_changed(fetcher, [
-    ("https://raw.githubusercontent.com/sunnypilot/sunnypilot-models/",
-     "https://gitee.com/xc2026/sunnypilot-models/raw/"),
-  ]))
+  s = fetcher.read_text(encoding="utf-8")
+  s2 = apply_text_replacement_rows(
+    s,
+    [
+      (
+        [
+          "https://raw.githubusercontent.com/sunnypilot/sunnypilot-models/",
+          "https://raw.githubusercontent.com/sunnypilot/sunnypilot-models",
+        ],
+        "https://gitee.com/xc2026/sunnypilot-models/raw/",
+      ),
+    ],
+    path=fetcher,
+    require_all=True,
+  )
+  _track_change(res, fetcher, write_if_changed(fetcher, s2))
   return res
 
 
 def patch_osm(root: Path) -> PatchResult:
   res = PatchResult("osm_layout")
   osm_py = root / "selfdrive/ui/sunnypilot/layouts/settings/osm.py"
-  _track_change(res, osm_py, replace_or_fail_changed(osm_py, [
-    ("https://raw.githubusercontent.com/pfeiferj/openpilot-mapd/main/",
-     "https://gitee.com/xc2026/openpilot-mapd/raw/main/"),
-  ]))
+  s = osm_py.read_text(encoding="utf-8")
+  s2 = apply_text_replacement_rows(
+    s,
+    [
+      (
+        [
+          "https://raw.githubusercontent.com/pfeiferj/openpilot-mapd/main/",
+          "https://raw.githubusercontent.com/pfeiferj/openpilot-mapd/main",
+        ],
+        "https://gitee.com/xc2026/openpilot-mapd/raw/main/",
+      ),
+    ],
+    path=osm_py,
+    require_all=True,
+  )
+  _track_change(res, osm_py, write_if_changed(osm_py, s2))
   return res
 
 
@@ -1029,23 +1246,48 @@ def patch_mapd_installer(root: Path) -> PatchResult:
   res = PatchResult("mapd_installer")
   mapd_installer = root / "sunnypilot/mapd/mapd_installer.py"
   s = mapd_installer.read_text(encoding="utf-8")
-  if "gitee.com/xc2026/openpilot-mapd" not in s:
-    s2 = s.replace('VERSION = "v1.12.0"', 'VERSION = os.getenv("MAPD_TAG", "v1.12.0")')
-    s2 = s2.replace("https://github.com/pfeiferj/openpilot-mapd/releases/download/",
-                    "https://gitee.com/xc2026/openpilot-mapd/releases/download/")
-    _track_change(res, mapd_installer, write_if_changed(mapd_installer, s2))
+  if "gitee.com/xc2026/openpilot-mapd" in s:
+    return res
+  s2 = s
+  if 'os.getenv("MAPD_TAG"' not in s and "os.getenv('MAPD_TAG'" not in s:
+    s2 = re.sub(
+      r"^VERSION\s*=\s*(?:\"[^\"]+\"|'[^']+')",
+      'VERSION = os.getenv("MAPD_TAG", "v1.12.0")',
+      s2,
+      count=1,
+      flags=re.MULTILINE,
+    )
+    if s2 == s:
+      raise RuntimeError(f"{mapd_installer}: 未找到 VERSION = \"…\" 赋值行，上游 mapd_installer 可能已改版")
+  s2 = apply_text_replacement_rows(
+    s2,
+    [
+      (
+        [
+          "https://github.com/pfeiferj/openpilot-mapd/releases/download/",
+          "http://github.com/pfeiferj/openpilot-mapd/releases/download/",
+        ],
+        "https://gitee.com/xc2026/openpilot-mapd/releases/download/",
+      ),
+    ],
+    path=mapd_installer,
+    require_all=True,
+  )
+  _track_change(res, mapd_installer, write_if_changed(mapd_installer, s2))
   return res
 
 
 _DM_SENTINEL_AWARENESS = "cn_dm_relaxed: avoid awarenessStatus<0 (forceDecel)"
 _DM_SENTINEL_TERMINAL = "cn_dm_relaxed: no terminal strike lockout"
 
-# 容忍上游微调空格/换行；仍绑定具体标识符名，若改名应失败并提示人工更新。
-_RE_DM_AWARENESS_FLOOR = re.compile(
-  r"^([ \t]*)self\.awareness\s*=\s*max\s*\(\s*self\.awareness\s*-\s*self\.step_change\s*,\s*-0\.1\s*\)\s*$",
+# 宽松匹配「递减下限 -0.1」：不绑定整行/赋值左侧写法，便于上游换行、注释微调。
+_RE_DM_AWARENESS_FLOOR_LOOSE = re.compile(
+  r"max\s*\(\s*self\.awareness\s*-\s*self\.step_change\s*,\s*-0\.1\s*\)",
   re.MULTILINE,
 )
-_RE_DM_TERMINAL_STRIKES = re.compile(
+
+# 策略 1：与历史上游结构一致（整段替换 if 分支体）。
+_RE_DM_TERMINAL_STRIKES_STRICT = re.compile(
   r"^([ \t]+)if\s+self\.awareness\s*<=\s*(?:0\.|0)\s*:\s*\n"
   r"[ \t]*#\s*terminal red alert[^\n]*\n"
   r"[ \t]*alert\s*=\s*EventName\.driverDistracted3\s+if\s+self\.active_monitoring_mode\s+else\s+EventName\.driverUnresponsive3\s*\n"
@@ -1055,6 +1297,79 @@ _RE_DM_TERMINAL_STRIKES = re.compile(
   re.MULTILINE,
 )
 
+# 策略 2：只搜「红线 alert 行 + 累计 terminal」片段，吞掉可选的内层 if（sed 式剥层）。
+_RE_DM_TERMINAL_STRIP = re.compile(
+  r"(^[ \t]*alert\s*=\s*EventName\.driverDistracted3\b[^\n]*\n)"
+  r"(^[ \t]*self\.terminal_time\s*\+=\s*1\s*\n)"
+  r"(?:^[ \t]*if\s+awareness_prev\b[^\n]*:\s*\n"
+  r"^[ \t]*self\.terminal_alert_cnt\s*\+=\s*1\s*\n)?",
+  re.MULTILINE,
+)
+
+
+def _patch_dm_awareness_flexible(s: str, path_for_err: Path) -> str:
+  """将 max(..., -0.1) 改为 0. 并带 sentinel；匹配处数必须为 1。"""
+  if _DM_SENTINEL_AWARENESS in s:
+    return s
+  matches = list(_RE_DM_AWARENESS_FLOOR_LOOSE.finditer(s))
+  if len(matches) == 0:
+    raise RuntimeError(
+      f"{path_for_err}: 未找到 max(self.awareness - self.step_change, -0.1)；"
+      "上游可能已改名 step_change 或改写递减逻辑，请人工对照 selfdrive/monitoring/helpers.py。"
+    )
+  if len(matches) > 1:
+    raise RuntimeError(
+      f"{path_for_err}: awareness 下限 -0.1 出现 {len(matches)} 处，无法自动判定，请人工打补丁。"
+    )
+  repl = f"max(self.awareness - self.step_change, 0.)  # {_DM_SENTINEL_AWARENESS}"
+  return _RE_DM_AWARENESS_FLOOR_LOOSE.sub(repl, s, count=1)
+
+
+def _patch_dm_terminal_flexible(s: str, path_for_err: Path) -> str:
+  """去掉红线阶段对 terminal_time / terminal_alert_cnt 的累计；保留告警赋值。多策略依次尝试。"""
+  if _DM_SENTINEL_TERMINAL in s:
+    return s
+
+  def _strict(m: re.Match) -> str:
+    ind_if = m.group(1)
+    ind_body = ind_if + "  "
+    return (
+      f"{ind_if}if self.awareness <= 0.:\n"
+      f"{ind_body}# terminal red alert: disengagement required ({_DM_SENTINEL_TERMINAL})\n"
+      f"{ind_body}alert = EventName.driverDistracted3 if self.active_monitoring_mode else EventName.driverUnresponsive3"
+    )
+
+  strict_hits = list(_RE_DM_TERMINAL_STRIKES_STRICT.finditer(s))
+  if len(strict_hits) == 1:
+    return _RE_DM_TERMINAL_STRIKES_STRICT.sub(_strict, s, count=1)
+  if len(strict_hits) > 1:
+    raise RuntimeError(
+      f"{path_for_err}: 严格模式匹配到多处 terminal 累计块（{len(strict_hits)}），请人工处理。"
+    )
+
+  strip_hits = list(_RE_DM_TERMINAL_STRIP.finditer(s))
+  if len(strip_hits) == 1:
+    m = strip_hits[0]
+    alert_line = m.group(1)
+    ind_m = re.match(r"^([ \t]*)", alert_line)
+    ind = ind_m.group(1) if ind_m else ""
+    body_ind = ind + ("  " if ind else "    ")
+    return (
+      s[: m.start()]
+      + alert_line
+      + f"{body_ind}# {_DM_SENTINEL_TERMINAL}\n"
+      + s[m.end() :]
+    )
+  if len(strip_hits) > 1:
+    raise RuntimeError(
+      f"{path_for_err}: 宽松模式匹配到多处「driverDistracted3 + terminal_time」片段（{len(strip_hits)}），请人工处理。"
+    )
+
+  raise RuntimeError(
+    f"{path_for_err}: 无法匹配 terminal 累计块（严格/宽松均失败）。"
+    "上游若重构 DM 分支，请对照 driverDistracted3 / terminal_time 附近代码手工合并补丁。"
+  )
+
 
 def patch_dm_relaxed_terminal(root: Path) -> PatchResult:
   """
@@ -1062,8 +1377,7 @@ def patch_dm_relaxed_terminal(root: Path) -> PatchResult:
   - awareness 递减下限由 -0.1 改为 0，避免 driverMonitoringState.awarenessStatus<0
   - 红线阶段不再累计 terminal_time / terminal_alert_cnt，避免 DriverTooDistracted / tooDistracted 路径
   幂等：已含两处 sentinel 则跳过。
-  匹配：用正则兼容空白差异；若上游重命名变量或改写结构导致匹配数≠1，显式报错（优于静默跳过）。
-  （AST 级改写可做终极方案，但需可导入的语法环境与更多样板代码，暂不引入。）
+  匹配：先用宽松表达式替换 max(...,-0.1)；terminal 先尝试整段替换再尝试「剥掉累计行」（兼容上游注释/缩进微调）。
   """
   res = PatchResult("dm_relaxed_terminal")
   helpers = root / "selfdrive/monitoring/helpers.py"
@@ -1074,36 +1388,8 @@ def patch_dm_relaxed_terminal(root: Path) -> PatchResult:
   if _DM_SENTINEL_AWARENESS in s and _DM_SENTINEL_TERMINAL in s:
     return res
 
-  aw_matches = list(_RE_DM_AWARENESS_FLOOR.finditer(s))
-  if len(aw_matches) != 1:
-    raise RuntimeError(
-      f"{helpers}: patch_dm_relaxed_terminal 期望恰好 1 处 awareness max(..., -0.1) 赋值，实际 {len(aw_matches)}。"
-      " 上游 selfdrive/monitoring/helpers.py 可能已改版，请人工调整 _RE_DM_AWARENESS_FLOOR。"
-    )
-
-  def _repl_aw(m: re.Match) -> str:
-    ind = m.group(1)
-    return f"{ind}self.awareness = max(self.awareness - self.step_change, 0.)  # {_DM_SENTINEL_AWARENESS}"
-
-  s = _RE_DM_AWARENESS_FLOOR.sub(_repl_aw, s, count=1)
-
-  term_matches = list(_RE_DM_TERMINAL_STRIKES.finditer(s))
-  if len(term_matches) != 1:
-    raise RuntimeError(
-      f"{helpers}: patch_dm_relaxed_terminal 期望恰好 1 处红线 terminal 累计块，实际 {len(term_matches)}。"
-      " 上游 selfdrive/monitoring/helpers.py 可能已改版，请人工调整 _RE_DM_TERMINAL_STRIKES。"
-    )
-
-  def _repl_term(m: re.Match) -> str:
-    ind_if = m.group(1)
-    ind_body = ind_if + "  "
-    return (
-      f"{ind_if}if self.awareness <= 0.:\n"
-      f"{ind_body}# terminal red alert: disengagement required ({_DM_SENTINEL_TERMINAL})\n"
-      f"{ind_body}alert = EventName.driverDistracted3 if self.active_monitoring_mode else EventName.driverUnresponsive3"
-    )
-
-  s = _RE_DM_TERMINAL_STRIKES.sub(_repl_term, s, count=1)
+  s = _patch_dm_awareness_flexible(s, helpers)
+  s = _patch_dm_terminal_flexible(s, helpers)
 
   changed = write_if_changed(helpers, s)
   _track_change(res, helpers, changed)
@@ -1116,14 +1402,24 @@ def patch_gitmodules(root: Path) -> PatchResult:
   if not gitmodules.exists():
     return res
   gm = gitmodules.read_text(encoding="utf-8")
-  gm2 = gm
-  gm2 = gm2.replace("https://github.com/commaai/msgq.git", "git@gitee.com:xc2026/msgq.git")
-  gm2 = gm2.replace("https://github.com/sunnypilot/opendbc.git", "git@gitee.com:xc2026/opendbc.git")
-  gm2 = gm2.replace("https://github.com/commaai/rednose.git", "git@gitee.com:xc2026/rednose.git")
-  gm2 = gm2.replace("https://github.com/commaai/teleoprtc", "git@gitee.com:xc2026/teleoprtc.git")
-  gm2 = gm2.replace("https://github.com/sunnypilot/tinygrad.git", "git@gitee.com:xc2026/tinygrad.git")
-  gm2 = gm2.replace("https://github.com/sunnyhaibin/panda.git", "git@gitee.com:xc2026/panda.git")
-  gm2 = gm2.replace("https://github.com/sunnypilot/neural-network-data.git", "git@gitee.com:xc2026/neural_network_data.git")
+  teleop_old = list(dict.fromkeys(
+    _with_git_url_variants("https://github.com/commaai/teleoprtc.git")
+    + ["https://github.com/commaai/teleoprtc"],
+  ))
+  gm2 = apply_text_replacement_rows(
+    gm,
+    [
+      (_with_git_url_variants("https://github.com/commaai/msgq.git"), "git@gitee.com:xc2026/msgq.git"),
+      (_with_git_url_variants("https://github.com/sunnypilot/opendbc.git"), "git@gitee.com:xc2026/opendbc.git"),
+      (_with_git_url_variants("https://github.com/commaai/rednose.git"), "git@gitee.com:xc2026/rednose.git"),
+      (teleop_old, "git@gitee.com:xc2026/teleoprtc.git"),
+      (_with_git_url_variants("https://github.com/sunnypilot/tinygrad.git"), "git@gitee.com:xc2026/tinygrad.git"),
+      (_with_git_url_variants("https://github.com/sunnyhaibin/panda.git"), "git@gitee.com:xc2026/panda.git"),
+      (_with_git_url_variants("https://github.com/sunnypilot/neural-network-data.git"), "git@gitee.com:xc2026/neural_network_data.git"),
+    ],
+    path=gitmodules,
+    require_all=False,
+  )
   _track_change(res, gitmodules, write_if_changed(gitmodules, gm2))
   return res
 
@@ -1219,12 +1515,14 @@ def verify_patches(root: Path) -> None:
       errors.append("selfdrive/monitoring/helpers.py: 缺少 DM 补丁 sentinel（awareness 下限）")
     if _DM_SENTINEL_TERMINAL not in hm:
       errors.append("selfdrive/monitoring/helpers.py: 缺少 DM 补丁 sentinel（terminal 累计）")
-    if "max(self.awareness - self.step_change, -0.1)" in hm:
-      errors.append("selfdrive/monitoring/helpers.py: 仍存在原版 -0.1 awareness 下限，DM 补丁未生效")
-    if (
-      "alert = EventName.driverDistracted3 if self.active_monitoring_mode else EventName.driverUnresponsive3\n"
-      "      self.terminal_time += 1\n"
-    ) in hm:
+    if re.search(r"max\s*\(\s*self\.awareness\s*-\s*self\.step_change\s*,\s*-0\.1\s*\)", hm):
+      errors.append("selfdrive/monitoring/helpers.py: 仍存在原版 -0.1 awareness 下限（空白不限），DM 补丁未生效")
+    # 上游若换行/缩进与旧版不同，仍应能检出「红线 alert 下一行仍在 += terminal_time」
+    if re.search(
+      r"driverDistracted3[^\n]*\n\s*self\.terminal_time\s*\+=\s*1",
+      hm,
+      re.MULTILINE,
+    ):
       errors.append("selfdrive/monitoring/helpers.py: 红线分支仍在累计 terminal_time，DM 补丁未生效")
 
   # 语法兜底（不验证逻辑正确性）

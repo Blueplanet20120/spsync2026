@@ -13,3 +13,5 @@ __pycache__/
 .DS_Store
 spcn_install.sh
 installer_openpilot_staging
+readme.txt
+.env
