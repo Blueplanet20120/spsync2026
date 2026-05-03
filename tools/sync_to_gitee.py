@@ -474,6 +474,24 @@ def parse_recorded_upstream_sha(commit_body: str, branch: str) -> str | None:
   return m.group(1) if m else None
 
 
+def canonical_commit_sha(sha: str | None, root: Path, env: dict[str, str]) -> str | None:
+  """
+  将 7～40 位十六进制提交 ID 规范为完整小写 SHA，避免「短哈希 vs 全哈希」字符串不相等导致误判。
+  不可解析时返回 None（调用方按「无记录」保守处理）。
+  """
+  if not sha:
+    return None
+  s = sha.strip().lower()
+  if not re.fullmatch(r"[0-9a-f]{7,40}", s):
+    return None
+  try:
+    # peel to commit object（annotated tag 等）
+    spec = f"{s}^{{commit}}"
+    return run(["git", "rev-parse", "--verify", spec], str(root), env=env).strip().lower()
+  except Exception:
+    return None
+
+
 def should_update_submodules(recorded_upstream_sha: str | None, upstream_sha: str, root: Path, env: dict[str, str]) -> bool:
   """
   根据 upstream 两个 commit 之间的 diff 判断是否需要更新子模块。
@@ -1046,12 +1064,19 @@ def write_ci_github_output(state: dict[str, object]) -> None:
 
   line_ok = "sunnypilot_cn → Gitee 同步成功（本轮已执行补丁校验并完成推送）。"
   if variant == "force_only":
-    line_note = "说明：本次为手动 Force 强制重同步（sunnypilot 上游相对上次写入 Gitee 的记录无新版本）。"
+    line_note = "说明：本次为手动 Force 强制重同步（上游 superproject 提交相对上次写入 Gitee 的记录一致，仍重跑补丁并推送）。"
   elif variant == "upstream_only":
-    line_note = "说明：本次因 sunnypilot 上游相对上次 Gitee 提交有新版本而同步推送。"
+    line_note = (
+      "说明：本次检测到上游 sunnypilot 主仓库（superproject）提交与上次写入 Gitee 提交信息里的 upstream-* 行不一致，因而同步推送；"
+      "比较的是完整 Git 对象 ID（短哈希与全哈希视为同一提交）。"
+      "子模块指针变化会体现在主仓库树或 .gitmodules 的差异里；若你只看网页上的「某个依赖版本」而主仓库 commit 未变，脚本仍会认为无同步必要。"
+    )
   else:
-    line_note = "说明：本次 master/staging 中兼有「上游有新版本」与「强制重同步」分支，详见 Actions 日志。"
+    line_note = "说明：本次 master/staging 中兼有「上游 superproject 有变化」与「强制重同步」分支，详见 Actions 日志。"
   success_body = f"{line_ok}\n\n{line_note}"
+  notes = state.get("notify_branch_notes") or []
+  if notes:
+    success_body += "\n\n分支核对：\n" + "\n".join(str(x) for x in notes)
 
   delim = "SYNC_OK_BODY_EOF"
   with open(path, "a", encoding="utf-8") as f:
@@ -1357,7 +1382,7 @@ def main() -> None:
 
     def sync_branch_local(branch: str) -> bool:
       # 若上游分支 HEAD 未变化，直接跳过（避免每小时重复跑一遍补丁/推送）
-      upstream_sha = run(["git", "rev-parse", f"upstream/{branch}"], str(root), env=env).strip()
+      upstream_sha = run(["git", "rev-parse", f"upstream/{branch}"], str(root), env=env).strip().lower()
 
       recorded_sha: str | None = None
       try:
@@ -1368,20 +1393,27 @@ def main() -> None:
       except Exception:
         recorded_sha = None
 
-      if (not force_sync) and (recorded_sha == upstream_sha):
-        print(f"[skip] {branch}: upstream sha unchanged ({upstream_sha})")
+      recorded_canon = canonical_commit_sha(recorded_sha, root, env)
+
+      if (not force_sync) and (recorded_canon is not None) and (recorded_canon == upstream_sha):
+        print(f"[skip] {branch}: upstream sha unchanged ({upstream_sha[:7]})")
         return False
-      if force_sync and recorded_sha == upstream_sha:
+      if force_sync and recorded_canon is not None and recorded_canon == upstream_sha:
         print(f"[force] {branch}: upstream sha unchanged but FORCE_SYNC=1, will re-sync")
 
       assert ci_sync_state is not None
       ci_sync_state["attempted"] = True
       ci_sync_state.setdefault("branches", []).append(branch)
       # 与 Gitee 上次提交里记录的 upstream-{branch} SHA 对比，用于邮件区分「有新版本」vs「仅 Force」
-      if recorded_sha is not None and recorded_sha == upstream_sha:
+      if recorded_canon is not None and recorded_canon == upstream_sha:
         ci_sync_state.setdefault("sync_reason_tags", []).append("force_same")
       else:
         ci_sync_state.setdefault("sync_reason_tags", []).append("upstream_delta")
+
+      rec_note = recorded_sha or "（提交信息中无 upstream-{branch} 行）"
+      ci_sync_state.setdefault("notify_branch_notes", []).append(
+        f"- {branch}: 上次 Gitee 记录 upstream-{branch}={rec_note} → 规范化后 vs 当前 upstream/{branch}={upstream_sha}"
+      )
 
       # 切换分支前先强制清理一次，避免被子模块残留文件阻塞
       hard_clean_worktree()
@@ -1397,7 +1429,8 @@ def main() -> None:
       elif sm_mode == "update":
         do_update_submodules = True
       else:
-        do_update_submodules = should_update_submodules(recorded_sha, upstream_sha, root, env)
+        rec_for_diff = recorded_canon or recorded_sha
+        do_update_submodules = should_update_submodules(rec_for_diff, upstream_sha, root, env)
 
       if do_update_submodules:
         run(["git", "submodule", "sync", "--recursive"], str(root), env=env)

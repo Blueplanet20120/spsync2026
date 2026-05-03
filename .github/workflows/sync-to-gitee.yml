@@ -33,6 +33,9 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    env:
+      # GitHub 将逐步收回 Node 20；邮件步骤所用 action 已升级到 node24 版本（见 dawidd6/action-send-mail）。
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -90,7 +93,7 @@ jobs:
           steps.sync.outputs.attempted_sync == 'true' &&
           steps.sync.outputs.pushed == 'true'
         continue-on-error: true
-        uses: dawidd6/action-send-mail@v3
+        uses: dawidd6/action-send-mail@v17
         with:
           server_address: ${{ secrets.SMTP_SERVER }}
           server_port: 465
@@ -107,7 +110,7 @@ jobs:
           failure() &&
           steps.sync.outputs.attempted_sync == 'true'
         continue-on-error: true
-        uses: dawidd6/action-send-mail@v3
+        uses: dawidd6/action-send-mail@v17
         with:
           server_address: ${{ secrets.SMTP_SERVER }}
           server_port: 465
