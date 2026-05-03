@@ -492,6 +492,126 @@ def canonical_commit_sha(sha: str | None, root: Path, env: dict[str, str]) -> st
     return None
 
 
+def _git_is_shallow_repo(root: Path, env: dict[str, str]) -> bool:
+  try:
+    return run(["git", "rev-parse", "--is-shallow-repository"], str(root), env=env).strip() == "true"
+  except Exception:
+    return False
+
+
+def ensure_git_objects_for_range(root: Path, env: dict[str, str], branch: str, base: str, head: str) -> None:
+  """
+  CI 常见浅克隆导致旧提交不可见；加深或解除 shallow，便于 git log base..head 枚举。
+  """
+  base = base.strip().lower()
+  head = head.strip().lower()
+  for _ in range(14):
+    try:
+      run(["git", "merge-base", base, head], str(root), env=env)
+      run(["git", "rev-parse", "--verify", f"{base}^{{commit}}"], str(root), env=env)
+      return
+    except Exception:
+      pass
+    if _git_is_shallow_repo(root, env):
+      try:
+        run(["git", "fetch", "upstream", "--unshallow"], str(root), env=env)
+        continue
+      except Exception:
+        pass
+    try:
+      run(["git", "fetch", "upstream", branch, "--deepen=500"], str(root), env=env)
+    except Exception:
+      break
+
+
+def collect_upstream_commits_for_email(
+  root: Path,
+  env: dict[str, str],
+  branch: str,
+  base_sha: str | None,
+  head_sha: str,
+  *,
+  reason_tag: str,
+  max_commits: int = 80,
+) -> str:
+  """
+  抓取本次同步相对「上次写入 Gitee 的 upstream 记录」在上游新增提交的摘要行（与 GitHub Commits 列表一致的一行主题）。
+  """
+  head_sha = head_sha.strip().lower()
+
+  if reason_tag == "force_same":
+    return (
+      "（手动 Force：上游 HEAD 相对上次 Gitee 记录未变，无「新增提交」区间；本次仍会重跑补丁并推送。）"
+    )
+
+  if base_sha:
+    base_sha = base_sha.strip().lower()
+    ensure_git_objects_for_range(root, env, branch, base_sha, head_sha)
+    range_spec = f"{base_sha}..{head_sha}"
+    total = -1
+    try:
+      ts = run(["git", "rev-list", "--count", range_spec], str(root), env=env).strip()
+      if ts.isdigit():
+        total = int(ts)
+    except Exception:
+      pass
+
+    log_out = ""
+    try:
+      log_out = run(
+        [
+          "git", "log",
+          "--reverse",
+          f"--max-count={max_commits}",
+          "--format=%h %s",
+          range_spec,
+        ],
+        str(root),
+        env=env,
+      )
+    except Exception:
+      log_out = ""
+
+    entries = [ln.rstrip() for ln in log_out.splitlines() if ln.strip()]
+    if entries:
+      extra = ""
+      if total >= 0 and total > len(entries):
+        extra = f"\n… 另有 {total - len(entries)} 条上游提交未列出（每分支最多展示 {max_commits} 条）。"
+      return "\n".join(f"  • {e}" for e in entries) + extra
+    if total == 0:
+      return "（相对上次记录无新增 superproject 提交；若仍触发了同步，请对照「分支核对」与 Actions 日志。）"
+
+    # 区间不可用（浅历史、缺失对象）：降级为上游分支最近提交
+    try:
+      fb = run(
+        ["git", "log", "-n", "25", "--format=%h %s", f"upstream/{branch}"],
+        str(root),
+        env=env,
+      )
+      lines = [ln.rstrip() for ln in fb.splitlines() if ln.strip()]
+      if not lines:
+        return "（未能列出上游提交；请在 GitHub sunnypilot 仓库对应分支历史中查看。）"
+      hdr = f"（本地未能解析区间 {range_spec[:16]}…，下列为 upstream/{branch} 最近提交，仅供参考）\n"
+      return hdr + "\n".join(f"  • {e}" for e in lines)
+    except Exception:
+      return "（未能列出上游提交；请在 GitHub sunnypilot 仓库对应分支历史中查看。）"
+
+  # 无上次记录：展示上游分支近期提交，便于首同步或记录缺失时对照
+  try:
+    fb = run(
+      ["git", "log", "-n", "25", "--format=%h %s", f"upstream/{branch}"],
+      str(root),
+      env=env,
+    )
+    lines = [ln.rstrip() for ln in fb.splitlines() if ln.strip()]
+    if not lines:
+      return "（无上次 upstream 记录且未能枚举上游提交。）"
+    hdr = f"（Gitee 侧无 upstream-{branch} 记录或不可解析；下列为 upstream/{branch} 最近提交）\n"
+    return hdr + "\n".join(f"  • {e}" for e in lines)
+  except Exception:
+    return "（未能列出上游提交。）"
+
+
 def should_update_submodules(recorded_upstream_sha: str | None, upstream_sha: str, root: Path, env: dict[str, str]) -> bool:
   """
   根据 upstream 两个 commit 之间的 diff 判断是否需要更新子模块。
@@ -1077,6 +1197,16 @@ def write_ci_github_output(state: dict[str, object]) -> None:
   notes = state.get("notify_branch_notes") or []
   if notes:
     success_body += "\n\n分支核对：\n" + "\n".join(str(x) for x in notes)
+  commit_blocks = state.get("upstream_commit_blocks") or []
+  if commit_blocks:
+    if variant == "force_only":
+      sec_title = "上游提交说明（本次为 Force 重同步，下列为各分支情况）"
+    elif variant == "mixed":
+      sec_title = "上游提交摘要（主仓库 subject，与 GitHub 一致；可能含 Force 分支的说明行）"
+    else:
+      sec_title = "上游新提交摘要（sunnypilot 主仓库，与 GitHub 提交列表 subject 一致）"
+    success_body += f"\n\n---\n{sec_title}：\n\n"
+    success_body += "\n\n".join(str(b) for b in commit_blocks)
 
   delim = "SYNC_OK_BODY_EOF"
   with open(path, "a", encoding="utf-8") as f:
@@ -1414,6 +1544,20 @@ def main() -> None:
       ci_sync_state.setdefault("notify_branch_notes", []).append(
         f"- {branch}: 上次 Gitee 记录 upstream-{branch}={rec_note} → 规范化后 vs 当前 upstream/{branch}={upstream_sha}"
       )
+
+      reason_tag = "force_same" if (recorded_canon is not None and recorded_canon == upstream_sha) else "upstream_delta"
+      try:
+        commit_block = collect_upstream_commits_for_email(
+          root,
+          env,
+          branch,
+          recorded_canon,
+          upstream_sha,
+          reason_tag=reason_tag,
+        )
+        ci_sync_state.setdefault("upstream_commit_blocks", []).append(f"【{branch}】\n{commit_block}")
+      except Exception as e:
+        log(branch, f"upstream commit list for mail skipped: {e!r}")
 
       # 切换分支前先强制清理一次，避免被子模块残留文件阻塞
       hard_clean_worktree()
