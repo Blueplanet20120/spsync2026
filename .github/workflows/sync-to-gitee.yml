@@ -69,6 +69,9 @@ jobs:
           # 仅当上游子模块指针发生变化时才更新子模块（提速且更接近本地行为）
           SKIP_SUBMODULES: "auto"
           FORCE_SYNC: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.force_sync == 'true' && '1' || '' }}
+          # 成功邮件里上游 git log：仅「当日」自然日（默认 Asia/Shanghai 0 点起），最多列 6 条最新
+          SYNC_EMAIL_LOG_TZ: "Asia/Shanghai"
+          SYNC_EMAIL_LOG_MAX: "6"
         run: |
           set -euo pipefail
 

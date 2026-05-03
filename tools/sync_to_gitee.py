@@ -32,6 +32,7 @@ import urllib.request
 import traceback
 from pathlib import Path
 from dataclasses import dataclass, field
+from zoneinfo import ZoneInfo
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -524,6 +525,32 @@ def ensure_git_objects_for_range(root: Path, env: dict[str, str], branch: str, b
       break
 
 
+def _email_log_day_start_iso() -> tuple[str, str]:
+  """
+  邮件里「当天」的自然日起点（默认 Asia/Shanghai 00:00），用于 git --since。
+  返回 (ISO 时间字符串, 时区名) 供正文说明。
+  可用环境变量 SYNC_EMAIL_LOG_TZ 覆盖时区（IANA，如 UTC、Asia/Shanghai）。
+  """
+  tz_name = (os.environ.get("SYNC_EMAIL_LOG_TZ") or "Asia/Shanghai").strip()
+  try:
+    tz = ZoneInfo(tz_name)
+  except Exception:
+    tz_name = "Asia/Shanghai"
+    tz = ZoneInfo(tz_name)
+  now = datetime.datetime.now(tz)
+  start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+  return start.isoformat(), tz_name
+
+
+def _email_log_max_shown() -> int:
+  """邮件中最多列出几条；默认 6。环境变量 SYNC_EMAIL_LOG_MAX（1～50）。"""
+  raw = (os.environ.get("SYNC_EMAIL_LOG_MAX") or "6").strip()
+  try:
+    return max(1, min(int(raw), 50))
+  except Exception:
+    return 6
+
+
 def collect_upstream_commits_for_email(
   root: Path,
   env: dict[str, str],
@@ -532,27 +559,45 @@ def collect_upstream_commits_for_email(
   head_sha: str,
   *,
   reason_tag: str,
-  max_commits: int = 80,
+  max_commits: int | None = None,
 ) -> str:
   """
-  抓取本次同步相对「上次写入 Gitee 的 upstream 记录」在上游新增提交的摘要行（与 GitHub Commits 列表一致的一行主题）。
+  抓取上游新增提交的摘要行（与 GitHub Commits 的 subject 一致）。
+
+  规则（与设计一致）：
+  - 仅收录「当天」自然日内的提交：默认按 SYNC_EMAIL_LOG_TZ（未设则为 Asia/Shanghai）当日 0 点起。
+  - 同一同步区间内若仍过多，只展示「最新」若干条（默认 6 条），其余省略说明。
+  - max_commits 参数若传入则覆盖环境变量（仅供测试）；CI 通常不传。
   """
   head_sha = head_sha.strip().lower()
+  since_iso, tz_label = _email_log_day_start_iso()
+  max_n = max_commits if max_commits is not None else _email_log_max_shown()
+  day_hint = f"（自然日按 {tz_label}，自当日 0:00 起）"
 
   if reason_tag == "force_same":
     return (
       "（手动 Force：上游 HEAD 相对上次 Gitee 记录未变，无「新增提交」区间；本次仍会重跑补丁并推送。）"
     )
 
-  if base_sha:
-    base_sha = base_sha.strip().lower()
-    ensure_git_objects_for_range(root, env, branch, base_sha, head_sha)
-    range_spec = f"{base_sha}..{head_sha}"
-    total = -1
+  def _log_today_in_range(range_spec: str) -> tuple[list[str], int, int]:
+    """返回 (展示行, 今日区间内总数, 区间内全部提交数（不限今日）)。"""
+    total_all = -1
     try:
-      ts = run(["git", "rev-list", "--count", range_spec], str(root), env=env).strip()
-      if ts.isdigit():
-        total = int(ts)
+      ta = run(["git", "rev-list", "--count", range_spec], str(root), env=env).strip()
+      if ta.isdigit():
+        total_all = int(ta)
+    except Exception:
+      pass
+
+    total_today = -1
+    try:
+      tt = run(
+        ["git", "rev-list", "--count", "--since", since_iso, range_spec],
+        str(root),
+        env=env,
+      ).strip()
+      if tt.isdigit():
+        total_today = int(tt)
     except Exception:
       pass
 
@@ -561,8 +606,8 @@ def collect_upstream_commits_for_email(
       log_out = run(
         [
           "git", "log",
-          "--reverse",
-          f"--max-count={max_commits}",
+          "--since", since_iso,
+          "-n", str(max_n),
           "--format=%h %s",
           range_spec,
         ],
@@ -573,40 +618,74 @@ def collect_upstream_commits_for_email(
       log_out = ""
 
     entries = [ln.rstrip() for ln in log_out.splitlines() if ln.strip()]
+    return entries, total_today, total_all
+
+  if base_sha:
+    base_sha = base_sha.strip().lower()
+    ensure_git_objects_for_range(root, env, branch, base_sha, head_sha)
+    range_spec = f"{base_sha}..{head_sha}"
+
+    entries, total_today, total_all = _log_today_in_range(range_spec)
+
     if entries:
       extra = ""
-      if total >= 0 and total > len(entries):
-        extra = f"\n… 另有 {total - len(entries)} 条上游提交未列出（每分支最多展示 {max_commits} 条）。"
-      return "\n".join(f"  • {e}" for e in entries) + extra
-    if total == 0:
+      if total_today > max_n:
+        extra = f"\n… 另有 {total_today - max_n} 条「今日」提交未列出（最多展示 {max_n} 条）。{day_hint}"
+      elif total_today >= 0 and total_today > len(entries):
+        extra = f"\n… 另有 {total_today - len(entries)} 条未列出。{day_hint}"
+      header = f"今日上游提交（区间内）{day_hint}\n"
+      return header + "\n".join(f"  • {e}" for e in entries) + extra
+
+    if total_all == 0:
       return "（相对上次记录无新增 superproject 提交；若仍触发了同步，请对照「分支核对」与 Actions 日志。）"
 
-    # 区间不可用（浅历史、缺失对象）：降级为上游分支最近提交
+    if total_today == 0 and total_all > 0:
+      return (
+        "（同步区间内虽有提交，但提交时间均不在「今日」自然日内，故邮件不展开历史 subject；"
+        f"完整列表见 GitHub。{day_hint}"
+      )
+
+    # 区间不可用（浅历史、缺失对象）：降级为上游分支「今日」最新几条
     try:
       fb = run(
-        ["git", "log", "-n", "25", "--format=%h %s", f"upstream/{branch}"],
+        [
+          "git", "log",
+          "--since", since_iso,
+          "-n", str(max_n),
+          "--format=%h %s",
+          f"upstream/{branch}",
+        ],
         str(root),
         env=env,
       )
       lines = [ln.rstrip() for ln in fb.splitlines() if ln.strip()]
       if not lines:
-        return "（未能列出上游提交；请在 GitHub sunnypilot 仓库对应分支历史中查看。）"
-      hdr = f"（本地未能解析区间 {range_spec[:16]}…，下列为 upstream/{branch} 最近提交，仅供参考）\n"
+        return (
+          f"（未能列出上游提交或今日尚无提交落在区间内；请见 GitHub。{day_hint}"
+          f"\n（降级查询 upstream/{branch} 今日仍为空的常见原因：浅克隆未加深到含「今日」提交。）"
+        )
+      hdr = f"（区间解析不完整，下列仅为 upstream/{branch} 上「今日」最新若干条，仅供参考）{day_hint}\n"
       return hdr + "\n".join(f"  • {e}" for e in lines)
     except Exception:
       return "（未能列出上游提交；请在 GitHub sunnypilot 仓库对应分支历史中查看。）"
 
-  # 无上次记录：展示上游分支近期提交，便于首同步或记录缺失时对照
+  # 无上次记录：仅展示上游分支「今日」最新若干条
   try:
     fb = run(
-      ["git", "log", "-n", "25", "--format=%h %s", f"upstream/{branch}"],
+      [
+        "git", "log",
+        "--since", since_iso,
+        "-n", str(max_n),
+        "--format=%h %s",
+        f"upstream/{branch}",
+      ],
       str(root),
       env=env,
     )
     lines = [ln.rstrip() for ln in fb.splitlines() if ln.strip()]
     if not lines:
-      return "（无上次 upstream 记录且未能枚举上游提交。）"
-    hdr = f"（Gitee 侧无 upstream-{branch} 记录或不可解析；下列为 upstream/{branch} 最近提交）\n"
+      return f"（Gitee 侧无 upstream 记录；且 upstream/{branch} 在「今日」内无提交可列举。{day_hint}）"
+    hdr = f"（无上次 upstream 记录；下列为 upstream/{branch}「今日」提交）{day_hint}\n"
     return hdr + "\n".join(f"  • {e}" for e in lines)
   except Exception:
     return "（未能列出上游提交。）"
