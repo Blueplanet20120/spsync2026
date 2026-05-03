@@ -972,9 +972,16 @@ def patch_setup_sh(root: Path) -> PatchResult:
   changed = replace_or_fail_changed(setup_sh, [
     ("https://github.com/commaai/openpilot.git", "https://gitee.com/xc2026/sunnypilot_cn.git"),
     ("https://github.com/commaai/openpilot/blob/master/docs/CONTRIBUTING.md",
-     "https://gitee.com/xc2026/sunnypilot_cn/blob/master/docs/CONTRIBUTING.md"),
+     "https://gitee.com/xc2026/sunnypilot_cn/blob/staging/docs/CONTRIBUTING.md"),
   ])
   _track_change(res, setup_sh, changed)
+  # 此前补丁写入 blob/master；远端已无 master 时需迁移为 staging
+  s = setup_sh.read_text(encoding="utf-8")
+  s2 = s.replace(
+    "https://gitee.com/xc2026/sunnypilot_cn/blob/master/docs/CONTRIBUTING.md",
+    "https://gitee.com/xc2026/sunnypilot_cn/blob/staging/docs/CONTRIBUTING.md",
+  )
+  _track_change(res, setup_sh, write_if_changed(setup_sh, s2))
   return res
 
 
@@ -1771,7 +1778,7 @@ def main() -> None:
 
     def interactive_menu() -> None:
       if not sys.stdin.isatty():
-        # 非交互环境（比如 CI）：回退到 all，保证不挂起
+        # 非交互环境（比如 CI）：回退到 all，保证不挂起。。
         do_all()
         return
 
