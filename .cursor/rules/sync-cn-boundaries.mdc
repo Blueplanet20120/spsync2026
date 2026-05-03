@@ -23,5 +23,5 @@ alwaysApply: true
 
 - 若任务写「Actions」「workflow」「定时」「Gitee 推送」「verify_patches」「邮件通知」→ 只动 `sync_to_gitee.py` / `.github/workflows/sync-to-gitee.yml`。
 - 若任务明确「本地菜单」「comma SSH」「选项 4/5」→ 再考虑 `sync_to_gitee_local.py`。
-- 如果只是推送或者同步，都是指的推送到GBlueplanet20120/sunnypilot_cn
+- 如果只是推送或者同步，都是指的推送到Blueplanet20120/sunnypilot_cn
 - 连接不上没有密钥这些可要考虑看看本项目.env

@@ -1,6 +1,6 @@
 # sunnypilot_cn（GitHub→Gitee 自动同步闭环）
 
-本仓库用于将上游 [`sunnypilot/sunnypilot`](https://github.com/sunnypilot/sunnypilot) 的 `master`/`staging` 分支定时同步到你的 Gitee 仓库，并在同步过程中应用“国内化补丁”（将常见 GitHub/Raw 地址重写为 Gitee 镜像等）。
+本仓库用于将上游 [`sunnypilot/sunnypilot`](https://github.com/sunnypilot/sunnypilot) 的 **`staging`** 分支定时同步到你的 Gitee 仓库（**不对上游 `master` 打补丁或推送**，避免重复大包推送；设备侧使用 `staging`）。同步过程中会应用“国内化补丁”（将常见 GitHub/Raw 地址重写为 Gitee 镜像等）。
 
 同步逻辑由：
 - 脚本：[`tools/sync_to_gitee.py`](tools/sync_to_gitee.py)
@@ -10,9 +10,9 @@
 
 ## Actions 做了什么
 - 每小时（UTC 整点）触发一次（也支持手动触发）
-- 拉取上游 `sunnypilot/sunnypilot` 的 `master` + `staging`
+- `git fetch` 上游 `sunnypilot/sunnypilot`；仅对 **`upstream/staging`** 打补丁、校验并强推到 Gitee 的 **`staging`**
 - 应用补丁（幂等）
-- 强推到你配置的 Gitee 仓库（`master` + `staging`）
+- 推送失败时会自动重试（缓解 Gitee/网络偶发断连）
 
 说明：脚本会自动兼容两种目录布局：
 - 仓库根目录本身就是 git 仓库（推荐）

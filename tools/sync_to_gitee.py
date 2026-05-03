@@ -2,12 +2,13 @@
 """
 工作区级（/home/perfume/sp）同步脚本：
 
-- 拉取上游 upstream/{master,staging}
+- 拉取上游（git fetch upstream）；仅对 upstream/staging 打补丁、校验、推送 Gitee
+- 上游 master 不参与补丁与推送（设备/comma 使用 staging；避免重复大包推送与无关更新检测）
 - 应用国内化补丁（幂等）
 - 更新子模块（包含子依赖）
 - 可选：在 larch64 上构建 installer
 - 可选：同步 mapd 二进制到 Gitee Release（读取 GITEE_TOKEN）
-- 提交并推送到你的 Gitee：master + staging（可选保持旧逻辑：staging=master）
+- 提交并推送到你的 Gitee：staging
 
 用法示例：
   python3 /home/perfume/sp/tools/sync_to_gitee.py              # 交互菜单（默认）
@@ -36,6 +37,9 @@ from zoneinfo import ZoneInfo
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+# 仅同步 staging：与本仓库 CI/设备约定一致；更新有无只看 staging 相对 Gitee 的记录。
+SYNC_BRANCHES: tuple[str, ...] = ("staging",)
 
 
 def default_workdir(repo_root: Path) -> Path:
@@ -1273,7 +1277,7 @@ def write_ci_github_output(state: dict[str, object]) -> None:
       "子模块指针变化会体现在主仓库树或 .gitmodules 的差异里；若你只看网页上的「某个依赖版本」而主仓库 commit 未变，脚本仍会认为无同步必要。"
     )
   else:
-    line_note = "说明：本次 master/staging 中兼有「上游 superproject 有变化」与「强制重同步」分支，详见 Actions 日志。"
+    line_note = "说明：本次同步中兼有「上游 superproject 有变化」与「强制重同步」情况，详见 Actions 日志。"
   success_body = f"{line_ok}\n\n{line_note}"
   notes = state.get("notify_branch_notes") or []
   if notes:
@@ -1529,7 +1533,12 @@ def main() -> None:
   ap.add_argument("--workdir", default=WORKDIR_DEFAULT, help="sunnypilot 仓库根目录")
   ap.add_argument("--upstream", default=UPSTREAM_DEFAULT)
   ap.add_argument("--origin", default=REPO_DEFAULT)
-  ap.add_argument("--force-staging", action="store_true", default=False, help="(deprecated) 保持兼容：将 master 强推到 staging（不推荐）")
+  ap.add_argument(
+      "--force-staging",
+      action="store_true",
+      default=False,
+      help="已废弃：此前将本地 master 强推到远端 staging。当前仅同步 staging，此选项无操作。",
+  )
   ap.add_argument("--action",
                   choices=["menu", "pull", "push", "all"],
                   default="menu",
@@ -1715,17 +1724,20 @@ def main() -> None:
       return True
 
     def push_branch(branch: str) -> None:
-      run(["git", "push", "-f", "-u", "origin", branch], str(root), env=env)
+      def _do_push() -> None:
+        run(["git", "push", "-f", "-u", "origin", branch], str(root), env=env)
+
+      retry(f"git push origin {branch}", _do_push, tries=4, base_sleep_s=2.0)
 
     def pull_all() -> list[str]:
       to_push: list[str] = []
-      for b in ("master", "staging"):
+      for b in SYNC_BRANCHES:
         if sync_branch_local(b):
           to_push.append(b)
       return to_push
 
     def push_all(branches: list[str] | None = None) -> None:
-      branches = branches or ["master", "staging"]
+      branches = branches or list(SYNC_BRANCHES)
       for b in branches:
         # 只 push 本地存在的分支，避免 src refspec 不存在
         try:
@@ -1754,7 +1766,7 @@ def main() -> None:
         assert ci_sync_state is not None
         ci_sync_state["pushed"] = True
       if args.force_staging:
-        run(["git", "push", "-f", "origin", "master:staging"], str(root), env=env)
+        log("warn", "--force-staging 已废弃：当前仅同步 staging，不再执行 master→staging 强推。")
       maybe_sync_mapd_release()
 
     def interactive_menu() -> None:
@@ -1765,8 +1777,8 @@ def main() -> None:
 
       while True:
         print("\n=== sync_to_gitee 菜单 ===")
-        print("1) 拉取 upstream(master+staging) + 应用补丁 + 更新子模块（不推送）")
-        print("2) 推送本地 master+staging 到 Gitee（强推）")
+        print("1) 拉取 upstream + 仅对 staging 应用补丁 + 更新子模块（不推送）")
+        print("2) 推送本地 staging 到 Gitee（强推）")
         print("3) 一键执行（1 + 2）")
         print("4) 仅同步 mapd release（需要 GITEE_TOKEN）")
         print("5) 远程连接 comma：编译 staging installer → 拷贝到本机 → 同步到 sp-cn_install（文件名=installer_openpilot）")
@@ -1780,7 +1792,7 @@ def main() -> None:
             env.setdefault("GIT_LFS_SKIP_PUSH", "1")
             push_all()
             if args.force_staging:
-              run(["git", "push", "-f", "origin", "master:staging"], str(root), env=env)
+              log("warn", "--force-staging 已废弃：当前仅同步 staging，不再执行 master→staging 强推。")
             print("[ok] 已完成推送。")
           elif choice == "3":
             do_all()
@@ -1832,7 +1844,7 @@ def main() -> None:
       env.setdefault("GIT_LFS_SKIP_PUSH", "1")
       push_all()
       if args.force_staging:
-        run(["git", "push", "-f", "origin", "master:staging"], str(root), env=env)
+        log("warn", "--force-staging 已废弃：当前仅同步 staging，不再执行 master→staging 强推。")
       maybe_sync_mapd_release()
     elif args.action == "all":
       do_all()
