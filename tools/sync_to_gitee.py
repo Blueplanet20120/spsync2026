@@ -42,6 +42,31 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 SYNC_BRANCHES: tuple[str, ...] = ("staging",)
 
 
+def upstream_fetch_argv() -> tuple[list[str], str]:
+  """
+  上游首次 fetch 命令与日志说明。
+  - CI / 显式全量：git fetch upstream --prune --tags（与历史一致）。
+  - 本地（SP_SYNC_SOURCE=local）：只 fetch SYNC_BRANCHES + --prune，不主动拉全仓库 tag，
+    减少传输（objects 仍按需增量获取，非「整仓重下」）。
+  本地若需要与 CI 完全同款抓 tag：环境变量 SYNC_FULL_UPSTREAM_FETCH=1。
+  """
+  force_full = (os.environ.get("SYNC_FULL_UPSTREAM_FETCH") or "").strip().lower() in ("1", "true", "yes", "on", "y")
+  is_local = (os.environ.get("SP_SYNC_SOURCE") or "").strip().lower() == "local"
+  if is_local and not force_full:
+    br = list(SYNC_BRANCHES)
+    cmd = ["git", "fetch", "upstream"] + br + ["--prune"]
+    hint = " ".join(br)
+    label = (
+      f"fetch upstream {hint} --prune（本地精简：不拉全部 tag；"
+      "与上游差异仍为增量对象；全量同 CI 请设 SYNC_FULL_UPSTREAM_FETCH=1）"
+    )
+    return cmd, label
+  return (
+    ["git", "fetch", "upstream", "--prune", "--tags"],
+    "fetch upstream --prune --tags",
+  )
+
+
 def default_workdir(repo_root: Path) -> Path:
   """
   兼容两种布局：
@@ -70,12 +95,40 @@ MAPD_REPO = "openpilot-mapd"
 MAPD_UPSTREAM = "pfeiferj/openpilot-mapd"
 
 
+def _maybe_git_fetch_progress(cmd: list[str]) -> list[str]:
+  """由 sync_to_gitee_local 设置 SYNC_LOCAL_GIT_PROGRESS=1 时，为 git fetch 插入 --progress。"""
+  raw = (os.environ.get("SYNC_LOCAL_GIT_PROGRESS") or "").strip().lower()
+  if raw not in ("1", "true", "yes", "on", "y"):
+    return cmd
+  if len(cmd) < 2 or cmd[0] != "git" or cmd[1] != "fetch" or "--progress" in cmd:
+    return cmd
+  return [cmd[0], cmd[1], "--progress"] + cmd[2:]
+
+
+def _should_inherit_stdio_for_long_git(cmd: list[str]) -> bool:
+  """
+  fetch/clone/push、submodule update|sync：进度常为 \\r 刷新；走 PIPE 按行读会长时间无输出。
+  TTY 流式模式下改为子进程直连终端。
+  """
+  if len(cmd) < 2 or cmd[0] != "git":
+    return False
+  verb = cmd[1]
+  if verb in ("fetch", "clone", "pull", "push"):
+    return True
+  if verb == "submodule" and len(cmd) > 2 and cmd[2] in ("update", "sync"):
+    return True
+  return False
+
+
 def run(cmd: list[str], cwd: str | None = None, env: dict[str, str] | None = None, *, stream: bool | None = None) -> str:
   """
   默认行为：
   - 交互终端（TTY）下：实时输出（避免 git fetch 等长任务“看起来没反应”）
   - CI/非交互：保持 capture（便于错误时把完整输出带回日志）
+  - TTY + 长耗时 git：子进程继承当前终端 stdio（否则 PIPE 吞掉 \\r 进度）
   """
+  cmd = _maybe_git_fetch_progress(list(cmd))
+
   if stream is None:
     stream = sys.stdout.isatty()
 
@@ -85,7 +138,12 @@ def run(cmd: list[str], cwd: str | None = None, env: dict[str, str] | None = Non
       raise RuntimeError(f"命令失败: {' '.join(cmd)}\n{p.stdout}")
     return p.stdout
 
-  # stream mode
+  if _should_inherit_stdio_for_long_git(cmd):
+    p = subprocess.run(cmd, cwd=cwd, env=env)
+    if p.returncode != 0:
+      raise RuntimeError(f"命令失败: {' '.join(cmd)}")
+    return ""
+
   p2 = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
   assert p2.stdout is not None
   out_lines: list[str] = []
@@ -1872,6 +1930,20 @@ def main() -> None:
     for k, v in sp_dotenv.items():
       env.setdefault(k, v)
 
+    if (
+      os.environ.get("SP_SYNC_SOURCE", "").strip().lower() == "local"
+      and sys.stdout.isatty()
+      and args.action in ("menu", "pull", "push", "all")
+    ):
+      print(
+        "【sp-sync 本地】补丁与分支策略仍来自本脚本（与 CI 一致）。\n"
+        "  · 上游 fetch 默认只更新分支 "
+        + ", ".join(SYNC_BRANCHES)
+        + "（不扫全仓库 tag，传输更少）；需要与 CI 完全一致时请设 SYNC_FULL_UPSTREAM_FETCH=1。\n"
+        "  · 长耗时 git 直连本终端；fetch 默认带 --progress（可用 SYNC_LOCAL_GIT_PROGRESS=0 关闭）。\n",
+        flush=True,
+      )
+
     # remotes (idempotent)
     remotes = run(["git", "remote"], str(root), env=env).splitlines()
     if "upstream" not in remotes:
@@ -1881,8 +1953,9 @@ def main() -> None:
       run(["git", "remote", "add", "origin", args.origin], str(root), env=env)
     run(["git", "remote", "set-url", "origin", args.origin], str(root), env=env)
 
-    log("git", "fetch upstream --prune --tags")
-    run(["git", "fetch", "upstream", "--prune", "--tags"], str(root), env=env)
+    fu_cmd, fu_log = upstream_fetch_argv()
+    log("git", fu_log)
+    run(fu_cmd, str(root), env=env)
     sm_mode = (env.get("SKIP_SUBMODULES", "auto").strip().lower() or "auto")
     force_sync = (env.get("FORCE_SYNC", "").strip().lower() in ("1", "true", "yes", "y", "on"))
     # legacy compatibility: "1/true" means always skip; "0/false" means always update
