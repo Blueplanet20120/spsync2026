@@ -527,15 +527,17 @@ def ensure_git_objects_for_range(root: Path, env: dict[str, str], branch: str, b
 
 def _email_log_day_start_iso() -> tuple[str, str]:
   """
-  邮件里「当天」的自然日起点（默认 Asia/Shanghai 00:00），用于 git --since。
-  返回 (ISO 时间字符串, 时区名) 供正文说明。
-  可用环境变量 SYNC_EMAIL_LOG_TZ 覆盖时区（IANA，如 UTC、Asia/Shanghai）。
+  邮件里「当天」的自然日起点（用于 git --since），按所选时区当日 0:00。
+
+  默认 America/Los_Angeles（美国西海岸，与多数 GitHub 上美国作者/提交展示习惯接近；
+  也可用 America/New_York 表示美东「工作日」视角）。
+  环境变量 SYNC_EMAIL_LOG_TZ（IANA）可覆盖，例如 UTC、Asia/Shanghai。
   """
-  tz_name = (os.environ.get("SYNC_EMAIL_LOG_TZ") or "Asia/Shanghai").strip()
+  tz_name = (os.environ.get("SYNC_EMAIL_LOG_TZ") or "America/Los_Angeles").strip()
   try:
     tz = ZoneInfo(tz_name)
   except Exception:
-    tz_name = "Asia/Shanghai"
+    tz_name = "America/Los_Angeles"
     tz = ZoneInfo(tz_name)
   now = datetime.datetime.now(tz)
   start = now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -565,7 +567,7 @@ def collect_upstream_commits_for_email(
   抓取上游新增提交的摘要行（与 GitHub Commits 的 subject 一致）。
 
   规则（与设计一致）：
-  - 仅收录「当天」自然日内的提交：默认按 SYNC_EMAIL_LOG_TZ（未设则为 Asia/Shanghai）当日 0 点起。
+  - 仅收录「当天」自然日内的提交：默认按 SYNC_EMAIL_LOG_TZ（未设则为 America/Los_Angeles）当日 0 点起。
   - 同一同步区间内若仍过多，只展示「最新」若干条（默认 6 条），其余省略说明。
   - max_commits 参数若传入则覆盖环境变量（仅供测试）；CI 通常不传。
   """
