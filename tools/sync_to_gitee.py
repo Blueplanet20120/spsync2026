@@ -1443,6 +1443,7 @@ def patch_mapd_installer(root: Path) -> PatchResult:
 
 _DM_SENTINEL_AWARENESS = "cn_dm_relaxed: avoid awarenessStatus<0 (forceDecel)"
 _DM_SENTINEL_TERMINAL = "cn_dm_relaxed: no terminal strike lockout"
+_DM_SENTINEL_RED_EXIT = "cn_dm_relaxed: auto exit red after 6s attention"
 
 # 宽松匹配「递减下限 -0.1」：不绑定整行/赋值左侧写法，便于上游换行、注释微调。
 _RE_DM_AWARENESS_FLOOR_LOOSE = re.compile(
@@ -1535,6 +1536,61 @@ def _patch_dm_terminal_flexible(s: str, path_for_err: Path) -> str:
   )
 
 
+def _patch_dm_red_exit_flexible(s: str, path_for_err: Path) -> str:
+  """
+  红色告警（awareness<=0）默认会“粘住”，需要 disengage 才能恢复。
+  国内化补丁：当检测到明显“已注意”（face+low_std+filter）时，最多 6 秒自动退出红色告警。
+  幂等：已有 sentinel 则跳过。
+  """
+  if _DM_SENTINEL_RED_EXIT in s:
+    return s
+
+  # 1) 确保 __init__ 里有计数器（兼容空格/Tab 缩进）
+  #    以 terminal_time 初始化为锚点，捕获其缩进用于插入同级字段。
+  m_init = re.search(r"(?m)^(?P<ind>[ \t]+)self\.terminal_time\s*=\s*0\s*$", s)
+  if not m_init:
+    raise RuntimeError(f"{path_for_err}: 未找到 self.terminal_time = 0 初始化行，无法注入 red_exit 计数器")
+  if "self.red_recover_cnt" not in s:
+    ind = m_init.group("ind")
+    insert_line = f"{ind}self.red_recover_cnt = 0  # {_DM_SENTINEL_RED_EXIT}\n"
+    # 插入在 terminal_time 行之后
+    s = s[: m_init.end()] + "\n" + insert_line + s[m_init.end() + 1 :]
+
+  # 2) 在 _update_events 中 alert 分级块后注入“红色自动退出”逻辑。
+  #    不绑定完整 if/elif 结构，只要求存在 distracted1/unresponsive1 那行（上游常年稳定）。
+  m_alert = re.search(
+    r"(?m)^(?P<ind>[ \t]+)alert\s*=\s*EventName\.driverDistracted1\s+if\s+self\.active_monitoring_mode\s+else\s+EventName\.driverUnresponsive1\s*$",
+    s,
+  )
+  if not m_alert:
+    raise RuntimeError(f"{path_for_err}: 未找到 driverDistracted1/driverUnresponsive1 alert 行，无法注入 red_exit 逻辑（上游可能重构）")
+
+  ind = m_alert.group("ind")
+  inject = (
+    f"\n"
+    f"{ind}# {_DM_SENTINEL_RED_EXIT}\n"
+    f"{ind}# allow recovery from red without disengage.\n"
+    f"{ind}# If driver is clearly attentive again for <=6s, exit red state automatically.\n"
+    f"{ind}if self.awareness <= 0.:\n"
+    f"{ind}  attentive = (self.driver_distraction_filter.x < 0.37 and self.face_detected and self.pose.low_std)\n"
+    f"{ind}  if attentive:\n"
+    f"{ind}    self.red_recover_cnt += 1\n"
+    f"{ind}    if self.red_recover_cnt * self.settings._DT_DMON >= 6.0:\n"
+    f"{ind}      # Move just above prompt threshold so banner clears immediately.\n"
+    f"{ind}      self.awareness = min(1.0, self.threshold_prompt + 1e-3)\n"
+    f"{ind}      self.red_recover_cnt = 0\n"
+    f"{ind}      alert = None\n"
+    f"{ind}  else:\n"
+    f"{ind}    self.red_recover_cnt = 0\n"
+    f"{ind}else:\n"
+    f"{ind}  self.red_recover_cnt = 0\n"
+  )
+
+  # 幂等：如果已经有注入块（含 sentinel），前面已 return；这里直接插入到该行之后
+  s = s[: m_alert.end()] + inject + s[m_alert.end() :]
+  return s
+
+
 def patch_dm_relaxed_terminal(root: Path) -> PatchResult:
   """
   国内化 DM：保留分级告警/鸣音，但削弱「第三次终端锁死」与 awareness<0 触发的纵向 forceDecel。
@@ -1549,11 +1605,12 @@ def patch_dm_relaxed_terminal(root: Path) -> PatchResult:
     return res
 
   s = helpers.read_text(encoding="utf-8")
-  if _DM_SENTINEL_AWARENESS in s and _DM_SENTINEL_TERMINAL in s:
+  if _DM_SENTINEL_AWARENESS in s and _DM_SENTINEL_TERMINAL in s and _DM_SENTINEL_RED_EXIT in s:
     return res
 
   s = _patch_dm_awareness_flexible(s, helpers)
   s = _patch_dm_terminal_flexible(s, helpers)
+  s = _patch_dm_red_exit_flexible(s, helpers)
 
   changed = write_if_changed(helpers, s)
   _track_change(res, helpers, changed)
@@ -1679,6 +1736,8 @@ def verify_patches(root: Path) -> None:
       errors.append("selfdrive/monitoring/helpers.py: 缺少 DM 补丁 sentinel（awareness 下限）")
     if _DM_SENTINEL_TERMINAL not in hm:
       errors.append("selfdrive/monitoring/helpers.py: 缺少 DM 补丁 sentinel（terminal 累计）")
+    if _DM_SENTINEL_RED_EXIT not in hm:
+      errors.append("selfdrive/monitoring/helpers.py: 缺少 DM 补丁 sentinel（red 自动退出）")
     if re.search(r"max\s*\(\s*self\.awareness\s*-\s*self\.step_change\s*,\s*-0\.1\s*\)", hm):
       errors.append("selfdrive/monitoring/helpers.py: 仍存在原版 -0.1 awareness 下限（空白不限），DM 补丁未生效")
     # 上游若换行/缩进与旧版不同，仍应能检出「红线 alert 下一行仍在 += terminal_time」
