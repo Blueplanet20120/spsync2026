@@ -12,7 +12,7 @@ run-name: >-
 on:
   schedule:
     # 每小时整点（UTC）。GitHub schedule 触发可能有数分钟抖动，属正常现象。
-    - cron: "13 * * * *"
+    - cron: "0 * * * *"
   workflow_dispatch:
     inputs:
       force_sync:
