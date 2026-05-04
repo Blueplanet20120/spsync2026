@@ -760,6 +760,105 @@ def _email_log_max_shown() -> int:
     return 6
 
 
+def _email_master_body_max_lines() -> int:
+  """
+  master 提交除 subject 外，额外附带正文（%b）的行数上限。
+  0 表示仅 subject（单行）；默认 5。环境变量 SYNC_EMAIL_MASTER_BODY_MAX_LINES（0～30）。
+  """
+  raw = (os.environ.get("SYNC_EMAIL_MASTER_BODY_MAX_LINES") or "5").strip()
+  try:
+    return max(0, min(int(raw), 30))
+  except Exception:
+    return 5
+
+
+def parse_master_commit_from_message(body: str) -> str | None:
+  """从 staging 包装提交正文中解析 `master commit: <sha>`。"""
+  m = re.search(r"(?im)^master\s+commit:\s*([0-9a-f]{7,40})\b", body or "")
+  return m.group(1).strip().lower() if m else None
+
+
+def ensure_upstream_master_for_staging_email(root: Path, env: dict[str, str]) -> None:
+  """staging 邮件展开 master 指针前，尽量保证 upstream/master 提交对象可达。"""
+  try:
+    run(["git", "rev-parse", "--verify", "upstream/master^{commit}"], str(root), env=env)
+    return
+  except Exception:
+    pass
+  try:
+    run(["git", "fetch", "upstream", "master"], str(root), env=env)
+  except Exception:
+    pass
+
+
+def _staging_commit_display_block(root: Path, env: dict[str, str], staging_full_sha: str) -> str:
+  """
+  staging 摘要一行；若有 master 指针则下一行起为 master 真实改动：
+  先 subject（%s），可选再附若干行正文（%b），不含列表前缀「  • 」。
+  """
+  staging_full_sha = staging_full_sha.strip().lower()
+  try:
+    short = run(["git", "rev-parse", "--short", staging_full_sha], str(root), env=env).strip()
+    subj = run(["git", "log", "-1", "--format=%s", staging_full_sha], str(root), env=env).strip()
+  except Exception:
+    return f"{staging_full_sha[:7]} （无法读取 staging 提交）"
+  line_a = f"{short} {subj}"
+  body = ""
+  try:
+    body = run(["git", "log", "-1", "--format=%B", staging_full_sha], str(root), env=env)
+  except Exception:
+    pass
+  raw_m = parse_master_commit_from_message(body)
+  if not raw_m:
+    return line_a
+  master_full = canonical_commit_sha(raw_m, root, env)
+  if not master_full:
+    ensure_upstream_master_for_staging_email(root, env)
+    master_full = canonical_commit_sha(raw_m, root, env)
+  if not master_full:
+    return f"{line_a} （master commit 对象不可解析）"
+  try:
+    ms = run(["git", "rev-parse", "--short", master_full], str(root), env=env).strip()
+    msub = run(["git", "log", "-1", "--format=%s", master_full], str(root), env=env).strip()
+  except Exception:
+    return f"{line_a} （无法读取 master 提交）"
+  parts: list[str] = [line_a, f"    → master {ms} {msub}"]
+  max_body = _email_master_body_max_lines()
+  if max_body > 0:
+    mb_raw = ""
+    try:
+      mb_raw = run(["git", "log", "-1", "--format=%b", master_full], str(root), env=env)
+    except Exception:
+      mb_raw = ""
+    taken = 0
+    for ln in mb_raw.splitlines():
+      s = ln.strip()
+      if not s:
+        continue
+      if s == msub.strip():
+        continue
+      if len(s) > 220:
+        s = s[:217] + "..."
+      parts.append(f"       {s}")
+      taken += 1
+      if taken >= max_body:
+        break
+  return "\n".join(parts)
+
+
+def _bullet_prefix_entries(entries: list[str]) -> str:
+  """每条 entry 可为单行或多行（staging + master）。"""
+  lines_out: list[str] = []
+  for e in entries:
+    e = e.strip("\n")
+    if "\n" in e:
+      first, rest = e.split("\n", 1)
+      lines_out.append(f"  • {first}\n{rest}")
+    else:
+      lines_out.append(f"  • {e}")
+  return "\n".join(lines_out)
+
+
 def collect_upstream_commits_for_email(
   root: Path,
   env: dict[str, str],
@@ -772,6 +871,9 @@ def collect_upstream_commits_for_email(
 ) -> str:
   """
   抓取上游新增提交的摘要行（与 GitHub Commits 的 subject 一致）。
+
+  对 upstream/staging：包装提交的 subject 常为版本号，正文中的 master commit 指针会展开为 master 的
+  subject（及可选若干行正文，见 SYNC_EMAIL_MASTER_BODY_MAX_LINES），与上游 master 一致。
 
   规则（与设计一致）：
   - 仅收录「当天」自然日内的提交：默认按 SYNC_EMAIL_LOG_TZ（未设则为 America/Los_Angeles）当日 0 点起。
@@ -812,12 +914,13 @@ def collect_upstream_commits_for_email(
 
     log_out = ""
     try:
+      fmt = "%H" if branch == "staging" else "%h %s"
       log_out = run(
         [
           "git", "log",
           "--since", since_iso,
           "-n", str(max_n),
-          "--format=%h %s",
+          f"--format={fmt}",
           range_spec,
         ],
         str(root),
@@ -826,8 +929,33 @@ def collect_upstream_commits_for_email(
     except Exception:
       log_out = ""
 
-    entries = [ln.rstrip() for ln in log_out.splitlines() if ln.strip()]
+    raw_lines = [ln.rstrip() for ln in log_out.splitlines() if ln.strip()]
+    if branch == "staging":
+      ensure_upstream_master_for_staging_email(root, env)
+      entries = [_staging_commit_display_block(root, env, ln.strip()) for ln in raw_lines]
+    else:
+      entries = raw_lines
     return entries, total_today, total_all
+
+  def _upstream_branch_today_entries() -> list[str]:
+    """降级 / 无记录：取 upstream/<branch> 今日最新若干条，staging 时展开 master。"""
+    fmt = "%H" if branch == "staging" else "%h %s"
+    fb = run(
+      [
+        "git", "log",
+        "--since", since_iso,
+        "-n", str(max_n),
+        f"--format={fmt}",
+        f"upstream/{branch}",
+      ],
+      str(root),
+      env=env,
+    )
+    raw_lines = [ln.rstrip() for ln in fb.splitlines() if ln.strip()]
+    if branch == "staging":
+      ensure_upstream_master_for_staging_email(root, env)
+      return [_staging_commit_display_block(root, env, ln.strip()) for ln in raw_lines]
+    return raw_lines
 
   if base_sha:
     base_sha = base_sha.strip().lower()
@@ -843,7 +971,7 @@ def collect_upstream_commits_for_email(
       elif total_today >= 0 and total_today > len(entries):
         extra = f"\n… 另有 {total_today - len(entries)} 条未列出。{day_hint}"
       header = f"今日上游提交（区间内）{day_hint}\n"
-      return header + "\n".join(f"  • {e}" for e in entries) + extra
+      return header + _bullet_prefix_entries(entries) + extra
 
     if total_all == 0:
       return "（相对上次记录无新增 superproject 提交；若仍触发了同步，请对照「分支核对」与 Actions 日志。）"
@@ -856,46 +984,24 @@ def collect_upstream_commits_for_email(
 
     # 区间不可用（浅历史、缺失对象）：降级为上游分支「今日」最新几条
     try:
-      fb = run(
-        [
-          "git", "log",
-          "--since", since_iso,
-          "-n", str(max_n),
-          "--format=%h %s",
-          f"upstream/{branch}",
-        ],
-        str(root),
-        env=env,
-      )
-      lines = [ln.rstrip() for ln in fb.splitlines() if ln.strip()]
+      lines = _upstream_branch_today_entries()
       if not lines:
         return (
           f"（未能列出上游提交或今日尚无提交落在区间内；请见 GitHub。{day_hint}"
           f"\n（降级查询 upstream/{branch} 今日仍为空的常见原因：浅克隆未加深到含「今日」提交。）"
         )
       hdr = f"（区间解析不完整，下列仅为 upstream/{branch} 上「今日」最新若干条，仅供参考）{day_hint}\n"
-      return hdr + "\n".join(f"  • {e}" for e in lines)
+      return hdr + _bullet_prefix_entries(lines)
     except Exception:
       return "（未能列出上游提交；请在 GitHub sunnypilot 仓库对应分支历史中查看。）"
 
   # 无上次记录：仅展示上游分支「今日」最新若干条
   try:
-    fb = run(
-      [
-        "git", "log",
-        "--since", since_iso,
-        "-n", str(max_n),
-        "--format=%h %s",
-        f"upstream/{branch}",
-      ],
-      str(root),
-      env=env,
-    )
-    lines = [ln.rstrip() for ln in fb.splitlines() if ln.strip()]
+    lines = _upstream_branch_today_entries()
     if not lines:
       return f"（Gitee 侧无 upstream 记录；且 upstream/{branch} 在「今日」内无提交可列举。{day_hint}）"
     hdr = f"（无上次 upstream 记录；下列为 upstream/{branch}「今日」提交）{day_hint}\n"
-    return hdr + "\n".join(f"  • {e}" for e in lines)
+    return hdr + _bullet_prefix_entries(lines)
   except Exception:
     return "（未能列出上游提交。）"
 
