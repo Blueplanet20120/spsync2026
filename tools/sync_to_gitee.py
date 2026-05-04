@@ -1556,18 +1556,14 @@ def _patch_dm_red_exit_flexible(s: str, path_for_err: Path) -> str:
     # 插入在 terminal_time 行之后
     s = s[: m_init.end()] + "\n" + insert_line + s[m_init.end() + 1 :]
 
-  # 2) 在 _update_events 中 alert 分级块后注入“红色自动退出”逻辑。
-  #    不绑定完整 if/elif 结构，只要求存在 distracted1/unresponsive1 那行（上游常年稳定）。
-  m_alert = re.search(
-    r"(?m)^(?P<ind>[ \t]+)alert\s*=\s*EventName\.driverDistracted1\s+if\s+self\.active_monitoring_mode\s+else\s+EventName\.driverUnresponsive1\s*$",
-    s,
-  )
-  if not m_alert:
-    raise RuntimeError(f"{path_for_err}: 未找到 driverDistracted1/driverUnresponsive1 alert 行，无法注入 red_exit 逻辑（上游可能重构）")
+  # 2) 在 _update_events 中注入“红色自动退出”逻辑。
+  #    注入点选择 `if alert is not None:` 之前（分级逻辑之后），避免被嵌在某个 elif 分支里。
+  m_hook = re.search(r"(?m)^(?P<ind>[ \t]+)if\s+alert\s+is\s+not\s+None\s*:\s*$", s)
+  if not m_hook:
+    raise RuntimeError(f"{path_for_err}: 未找到 'if alert is not None:'，无法注入 red_exit 逻辑（上游可能重构）")
 
-  ind = m_alert.group("ind")
+  ind = m_hook.group("ind")
   inject = (
-    f"\n"
     f"{ind}# {_DM_SENTINEL_RED_EXIT}\n"
     f"{ind}# allow recovery from red without disengage.\n"
     f"{ind}# If driver is clearly attentive again for <=6s, exit red state automatically.\n"
@@ -1583,11 +1579,10 @@ def _patch_dm_red_exit_flexible(s: str, path_for_err: Path) -> str:
     f"{ind}  else:\n"
     f"{ind}    self.red_recover_cnt = 0\n"
     f"{ind}else:\n"
-    f"{ind}  self.red_recover_cnt = 0\n"
+    f"{ind}  self.red_recover_cnt = 0\n\n"
   )
 
-  # 幂等：如果已经有注入块（含 sentinel），前面已 return；这里直接插入到该行之后
-  s = s[: m_alert.end()] + inject + s[m_alert.end() :]
+  s = s[: m_hook.start()] + inject + s[m_hook.start() :]
   return s
 
 
