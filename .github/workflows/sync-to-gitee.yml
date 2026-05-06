@@ -81,11 +81,31 @@ jobs:
             git clone --depth=1 "https://github.com/sunnypilot/sunnypilot.git" "$WORKDIR"
           fi
 
-          python3 "$GITHUB_WORKSPACE/tools/sync_to_gitee.py" \
-            --action all \
-            --workdir "$WORKDIR" \
-            --origin "$GITEE_REPO_SSH" \
-            --upstream "https://github.com/sunnypilot/sunnypilot.git"
+          # 有限重试：应对偶发网络/服务抖动（push、fetch、API 临时失败等）
+          max_attempts=3
+          attempt=1
+          while true; do
+            echo "[sync] attempt ${attempt}/${max_attempts}"
+            set +e
+            python3 "$GITHUB_WORKSPACE/tools/sync_to_gitee.py" \
+              --action all \
+              --workdir "$WORKDIR" \
+              --origin "$GITEE_REPO_SSH" \
+              --upstream "https://github.com/sunnypilot/sunnypilot.git"
+            ec=$?
+            set -e
+            if [ "$ec" -eq 0 ]; then
+              break
+            fi
+            if [ "$attempt" -ge "$max_attempts" ]; then
+              echo "[sync] failed after ${max_attempts} attempts (exit_code=${ec})"
+              exit "$ec"
+            fi
+            sleep_s=$((attempt * 20))
+            echo "[sync] retrying in ${sleep_s}s (exit_code=${ec})"
+            sleep "$sleep_s"
+            attempt=$((attempt + 1))
+          done
 
       # 成功通知条件（三者同时满足，AND）：作业成功 + 至少跑过一轮完整同步(attempted_sync) + 已推送(pushed)。
       # attempted_sync 含：上游相对 Gitee 记录有变化；或手动勾选 Force（FORCE_SYNC）即使上游 SHA 未变。
