@@ -709,6 +709,16 @@ def short_sha(sha: str | None) -> str | None:
   return s[:7]
 
 
+def shorten_hashes_in_text(text: str) -> str:
+  """
+  邮件展示层：将任何 8～40 位十六进制串缩短为 7 位，避免邮件里出现完整 SHA。
+  后台对比与逻辑仍使用完整 SHA（调用方应仅在展示前使用本函数）。
+  """
+  if not text:
+    return text
+  return re.sub(r"(?i)\b([0-9a-f]{8})[0-9a-f]{0,32}\b", r"\1", text)
+
+
 def _git_is_shallow_repo(root: Path, env: dict[str, str]) -> bool:
   try:
     return run(["git", "rev-parse", "--is-shallow-repository"], str(root), env=env).strip() == "true"
@@ -807,7 +817,7 @@ def _staging_commit_display_block(root: Path, env: dict[str, str], staging_full_
   staging_full_sha = staging_full_sha.strip().lower()
   try:
     short = run(["git", "rev-parse", "--short", staging_full_sha], str(root), env=env).strip()
-    subj = run(["git", "log", "-1", "--format=%s", staging_full_sha], str(root), env=env).strip()
+    subj = shorten_hashes_in_text(run(["git", "log", "-1", "--format=%s", staging_full_sha], str(root), env=env).strip())
   except Exception:
     return f"{staging_full_sha[:7]} （无法读取 staging 提交）"
   line_a = f"{short} {subj}"
@@ -827,7 +837,7 @@ def _staging_commit_display_block(root: Path, env: dict[str, str], staging_full_
     return f"{line_a} （master commit 对象不可解析）"
   try:
     ms = run(["git", "rev-parse", "--short", master_full], str(root), env=env).strip()
-    msub = run(["git", "log", "-1", "--format=%s", master_full], str(root), env=env).strip()
+    msub = shorten_hashes_in_text(run(["git", "log", "-1", "--format=%s", master_full], str(root), env=env).strip())
   except Exception:
     return f"{line_a} （无法读取 master 提交）"
   parts: list[str] = [line_a, f"    → master {ms} {msub}"]
@@ -845,6 +855,7 @@ def _staging_commit_display_block(root: Path, env: dict[str, str], staging_full_
         continue
       if s == msub.strip():
         continue
+      s = shorten_hashes_in_text(s)
       if len(s) > 220:
         s = s[:217] + "..."
       parts.append(f"       {s}")
