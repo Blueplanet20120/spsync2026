@@ -700,6 +700,15 @@ def canonical_commit_sha(sha: str | None, root: Path, env: dict[str, str]) -> st
     return None
 
 
+def short_sha(sha: str | None) -> str | None:
+  if not sha:
+    return None
+  s = sha.strip().lower()
+  if not re.fullmatch(r"[0-9a-f]{7,40}", s):
+    return None
+  return s[:7]
+
+
 def _git_is_shallow_repo(root: Path, env: dict[str, str]) -> bool:
   try:
     return run(["git", "rev-parse", "--is-shallow-repository"], str(root), env=env).strip() == "true"
@@ -1539,42 +1548,35 @@ def _patch_dm_terminal_flexible(s: str, path_for_err: Path) -> str:
 def _patch_dm_red_exit_flexible(s: str, path_for_err: Path) -> str:
   """
   红色告警（awareness<=0）默认会“粘住”，需要 disengage 才能恢复。
-  国内化补丁：当检测到明显“已注意”（face+low_std+filter）时，最多 6 秒自动退出红色告警。
+  国内化补丁：当检测到明显“已注意”（face+low_std+filter）时，最多 10 秒自动退出红色告警。
   幂等：已有 sentinel 则跳过。
   """
   if _DM_SENTINEL_RED_EXIT in s:
     return s
 
-  # 1) 确保 __init__ 里有计数器（兼容空格/Tab 缩进与 CRLF）
+  # 1) 确保 __init__ 里有计数器（兼容空格/Tab 缩进）
+  #    以 terminal_time 初始化为锚点，捕获其缩进用于插入同级字段。
+  m_init = re.search(r"(?m)^(?P<ind>[ \t]+)self\.terminal_time\s*=\s*0\s*$", s)
+  if not m_init:
+    raise RuntimeError(f"{path_for_err}: 未找到 self.terminal_time = 0 初始化行，无法注入 red_exit 计数器")
   if "self.red_recover_cnt" not in s:
-    pat_init = re.compile(r"(?m)^(?P<ind>[ \t]+)self\.terminal_time\s*=\s*0[ \t]*(\r?\n)")
-    m_init = pat_init.search(s)
-    if not m_init:
-      raise RuntimeError(f"{path_for_err}: 未找到 self.terminal_time = 0 初始化行，无法注入 red_exit 计数器")
     ind = m_init.group("ind")
-    eol = m_init.group(2)
-    insert_line = f"{ind}self.red_recover_cnt = 0  # {_DM_SENTINEL_RED_EXIT}{eol}"
+    insert_line = f"{ind}self.red_recover_cnt = 0  # {_DM_SENTINEL_RED_EXIT}\n"
     # 插入在 terminal_time 行之后
-    s = pat_init.sub(lambda m: m.group(0) + insert_line, s, count=1)
+    s = s[: m_init.end()] + "\n" + insert_line + s[m_init.end() + 1 :]
 
-  # 2) 在 _update_events 中注入“红色自动退出”逻辑。
-  #    注入点选择 `if alert is not None:` 之前（分级逻辑之后），避免被嵌在某个 elif 分支里。
-  #    额外限制：仅在 DriverMonitoring._update_events 函数体内搜索，避免误命中其他函数。
-  m_fn = re.search(r"(?m)^(?P<ind>[ \t]+)def\s+_update_events\s*\(", s)
-  if not m_fn:
-    raise RuntimeError(f"{path_for_err}: 未找到 def _update_events，无法注入 red_exit 逻辑（上游可能重构）")
-  fn_start = m_fn.end()
-  # next function at same indent within class (or EOF)
-  m_next = re.search(r"(?m)^" + re.escape(m_fn.group("ind")) + r"def\s+\w+\s*\(", s[fn_start:])
-  fn_end = fn_start + (m_next.start() if m_next else len(s) - fn_start)
-  body = s[fn_start:fn_end]
+  # 2) 在 _update_events 中 alert 分级块后注入“红色自动退出”逻辑。
+  #    不绑定完整 if/elif 结构，只要求存在 distracted1/unresponsive1 那行（上游常年稳定）。
+  m_alert = re.search(
+    r"(?m)^(?P<ind>[ \t]+)alert\s*=\s*EventName\.driverDistracted1\s+if\s+self\.active_monitoring_mode\s+else\s+EventName\.driverUnresponsive1\s*$",
+    s,
+  )
+  if not m_alert:
+    raise RuntimeError(f"{path_for_err}: 未找到 driverDistracted1/driverUnresponsive1 alert 行，无法注入 red_exit 逻辑（上游可能重构）")
 
-  m_hook = re.search(r"(?m)^(?P<ind>[ \t]+)if\s+alert\s+is\s+not\s+None\s*:\s*$", body)
-  if not m_hook:
-    raise RuntimeError(f"{path_for_err}: _update_events 内未找到 'if alert is not None:'，无法注入 red_exit 逻辑（上游可能重构）")
-
-  ind = m_hook.group("ind")
+  ind = m_alert.group("ind")
   inject = (
+    f"\n"
     f"{ind}# {_DM_SENTINEL_RED_EXIT}\n"
     f"{ind}# allow recovery from red without disengage.\n"
     f"{ind}# If driver is clearly attentive again for <=6s, exit red state automatically.\n"
@@ -1590,11 +1592,11 @@ def _patch_dm_red_exit_flexible(s: str, path_for_err: Path) -> str:
     f"{ind}  else:\n"
     f"{ind}    self.red_recover_cnt = 0\n"
     f"{ind}else:\n"
-    f"{ind}  self.red_recover_cnt = 0\n\n"
+    f"{ind}  self.red_recover_cnt = 0\n"
   )
-  # splice back into full file
-  body = body[: m_hook.start()] + inject + body[m_hook.start() :]
-  s = s[:fn_start] + body + s[fn_end:]
+
+  # 幂等：如果已经有注入块（含 sentinel），前面已 return；这里直接插入到该行之后
+  s = s[: m_alert.end()] + inject + s[m_alert.end() :]
   return s
 
 
@@ -1603,10 +1605,8 @@ def patch_dm_relaxed_terminal(root: Path) -> PatchResult:
   国内化 DM：保留分级告警/鸣音，但削弱「第三次终端锁死」与 awareness<0 触发的纵向 forceDecel。
   - awareness 递减下限由 -0.1 改为 0，避免 driverMonitoringState.awarenessStatus<0
   - 红线阶段不再累计 terminal_time / terminal_alert_cnt，避免 DriverTooDistracted / tooDistracted 路径
-  - 红色告警若持续检测到“已注意”，允许在 6 秒内自动退出红色（不再要求手动 disengage）
-  幂等：已含三处 sentinel 则跳过。
-  匹配：先用宽松表达式替换 max(...,-0.1)；terminal 先尝试整段替换再尝试「剥掉累计行」；
-  red_exit 仅在 DriverMonitoring._update_events 函数体内寻找注入点，避免误命中其它函数。
+  幂等：已含两处 sentinel 则跳过。
+  匹配：先用宽松表达式替换 max(...,-0.1)；terminal 先尝试整段替换再尝试「剥掉累计行」（兼容上游注释/缩进微调）。
   """
   res = PatchResult("dm_relaxed_terminal")
   helpers = root / "selfdrive/monitoring/helpers.py"
@@ -1747,8 +1747,6 @@ def verify_patches(root: Path) -> None:
       errors.append("selfdrive/monitoring/helpers.py: 缺少 DM 补丁 sentinel（terminal 累计）")
     if _DM_SENTINEL_RED_EXIT not in hm:
       errors.append("selfdrive/monitoring/helpers.py: 缺少 DM 补丁 sentinel（red 自动退出）")
-    if "self.red_recover_cnt" not in hm:
-      errors.append("selfdrive/monitoring/helpers.py: 缺少 DM 补丁字段 self.red_recover_cnt（red 自动退出计数器）")
     if re.search(r"max\s*\(\s*self\.awareness\s*-\s*self\.step_change\s*,\s*-0\.1\s*\)", hm):
       errors.append("selfdrive/monitoring/helpers.py: 仍存在原版 -0.1 awareness 下限（空白不限），DM 补丁未生效")
     # 上游若换行/缩进与旧版不同，仍应能检出「红线 alert 下一行仍在 += terminal_time」
@@ -2184,9 +2182,10 @@ def main() -> None:
       else:
         ci_sync_state.setdefault("sync_reason_tags", []).append("upstream_delta")
 
-      rec_note = recorded_sha or "（提交信息中无 upstream-{branch} 行）"
+      rec_note = short_sha(recorded_canon) or short_sha(recorded_sha) or "（提交信息中无 upstream-{branch} 行）"
+      up_note = short_sha(upstream_sha) or upstream_sha[:7]
       ci_sync_state.setdefault("notify_branch_notes", []).append(
-        f"- {branch}: 上次 Gitee 记录 upstream-{branch}={rec_note} → 规范化后 vs 当前 upstream/{branch}={upstream_sha}"
+        f"- {branch}: 上次 Gitee 记录 upstream-{branch}={rec_note} → 当前 upstream/{branch}={up_note}"
       )
 
       reason_tag = "force_same" if (recorded_canon is not None and recorded_canon == upstream_sha) else "upstream_delta"
