@@ -26,10 +26,10 @@ on:
         required: false
         type: string
       sync_mapd_release:
-        description: "Also sync mapd release to Gitee (requires GITEE_TOKEN secret)"
+        description: "Also sync mapd release to Gitee (requires GITEE_TOKEN secret; off by default — GitHub→Gitee upload often flaky)"
         required: false
         type: boolean
-        default: true
+        default: false
       mapd_tag:
         description: "MAPD_TAG (latest or a specific tag)"
         required: false
@@ -90,14 +90,8 @@ jobs:
           DEP_MIRROR_SKIP: ${{ github.event.inputs.skip || '' }}
           DEP_MIRROR_CACHE_DIR: /tmp/sp_dep_mirrors_cache
           GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
-          # 默认同步 mapd 到 Gitee Release：定时跑始终开启；手动 Run 默认勾选，取消勾选则为 false
-          SYNC_MAPD_RELEASE: >-
-            ${{
-              (
-                github.event_name == 'schedule'
-                || (github.event_name == 'workflow_dispatch' && github.event.inputs.sync_mapd_release == 'true')
-              ) && '1' || ''
-            }}
+          # mapd：默认关闭；仅手动 Run 且勾选「sync_mapd_release」时上传（定时任务不同步 mapd，避免境外 Runner 上传失败）
+          SYNC_MAPD_RELEASE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.sync_mapd_release == 'true' && '1' || '' }}
           MAPD_TAG: ${{ github.event.inputs.mapd_tag || 'latest' }}
           # mapd 上传到 Gitee Release 附件：multipart 单次请求超时（秒），由 tools/sync_to_gitee.py 读取；可调大防慢网/写超时
           GITEE_UPLOAD_TIMEOUT_S: "900"
