@@ -29,7 +29,7 @@ on:
         description: "Also sync mapd release to Gitee (requires GITEE_TOKEN secret)"
         required: false
         type: boolean
-        default: false
+        default: true
       mapd_tag:
         description: "MAPD_TAG (latest or a specific tag)"
         required: false
@@ -90,7 +90,14 @@ jobs:
           DEP_MIRROR_SKIP: ${{ github.event.inputs.skip || '' }}
           DEP_MIRROR_CACHE_DIR: /tmp/sp_dep_mirrors_cache
           GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
-          SYNC_MAPD_RELEASE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.sync_mapd_release == 'true' && '1' || '' }}
+          # 默认同步 mapd 到 Gitee Release：定时跑始终开启；手动 Run 默认勾选，取消勾选则为 false
+          SYNC_MAPD_RELEASE: >-
+            ${{
+              (
+                github.event_name == 'schedule'
+                || (github.event_name == 'workflow_dispatch' && github.event.inputs.sync_mapd_release == 'true')
+              ) && '1' || ''
+            }}
           MAPD_TAG: ${{ github.event.inputs.mapd_tag || 'latest' }}
         run: |
           set -euo pipefail
