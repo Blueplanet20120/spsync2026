@@ -1,0 +1,94 @@
+name: sync-deps-mirrors
+
+run-name: >-
+  ${{
+    github.event_name == 'schedule' && format('sync-deps-mirrors (scheduled) @ {0}', github.ref_name)
+    || github.event_name == 'workflow_dispatch' && format('sync-deps-mirrors (manual) @ {0}', github.ref_name)
+    || format('sync-deps-mirrors ({0}) @ {1}', github.event_name, github.ref_name)
+  }}
+
+on:
+  schedule:
+    # 每 5 天跑一次（按“每月第 1/6/11/16/21/26/31 日”触发；接近“每 5 天一次”的需求）
+    - cron: "17 2 */5 * *"
+  workflow_dispatch:
+    inputs:
+      owner:
+        description: "Gitee owner/org (default: xc2026)"
+        required: false
+        type: string
+      only:
+        description: "Comma-separated repo labels to sync (optional)"
+        required: false
+        type: string
+      skip:
+        description: "Comma-separated repo labels to skip (optional)"
+        required: false
+        type: string
+      sync_mapd_release:
+        description: "Also sync mapd release to Gitee (requires GITEE_TOKEN secret)"
+        required: false
+        type: boolean
+        default: false
+      mapd_tag:
+        description: "MAPD_TAG (latest or a specific tag)"
+        required: false
+        type: string
+
+concurrency:
+  group: sync-deps-mirrors
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Setup SSH agent (Gitee deploy key)
+        uses: webfactory/ssh-agent@v0.10.0
+        with:
+          ssh-private-key: ${{ secrets.GITEE_SSH_PRIVATE_KEY }}
+
+      - name: Add gitee.com to known_hosts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          ssh-keyscan -t rsa,ecdsa,ed25519 gitee.com >> ~/.ssh/known_hosts
+
+      # 可选：缓存 mirror 仓库，后续增量 fetch/push 会更快
+      - name: Cache mirror repos
+        uses: actions/cache@v4
+        with:
+          path: /tmp/sp_dep_mirrors_cache
+          key: dep-mirrors-${{ runner.os }}-v1
+          restore-keys: |
+            dep-mirrors-${{ runner.os }}-
+
+      - name: Sync dependency mirrors (branches + tags)
+        shell: bash
+        env:
+          DEP_MIRROR_OWNER: ${{ github.event.inputs.owner || 'xc2026' }}
+          DEP_MIRROR_ONLY: ${{ github.event.inputs.only || '' }}
+          DEP_MIRROR_SKIP: ${{ github.event.inputs.skip || '' }}
+          DEP_MIRROR_CACHE_DIR: /tmp/sp_dep_mirrors_cache
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+          SYNC_MAPD_RELEASE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.sync_mapd_release == 'true' && '1' || '' }}
+          MAPD_TAG: ${{ github.event.inputs.mapd_tag || 'latest' }}
+        run: |
+          set -euo pipefail
+          python3 "$GITHUB_WORKSPACE/tools/sync_dep_mirrors.py"
+
