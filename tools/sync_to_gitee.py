@@ -454,7 +454,15 @@ def http_download(url: str, out_path: Path) -> None:
   return retry(f"http_download {url}", _do, tries=3, base_sleep_s=1.0)
 
 
-def http_multipart_post(url: str, fields: dict[str, str], file_field: str, filename: str, file_bytes: bytes) -> dict:
+def http_multipart_post(
+  url: str,
+  fields: dict[str, str],
+  file_field: str,
+  filename: str,
+  file_bytes: bytes,
+  *,
+  timeout_s: int | None = None,
+) -> dict:
   boundary = "----syncToGiteeBoundary7f3a1b"
   parts: list[bytes] = []
   for k, v in fields.items():
@@ -472,14 +480,23 @@ def http_multipart_post(url: str, fields: dict[str, str], file_field: str, filen
   parts.append(f"\r\n--{boundary}--\r\n".encode("utf-8"))
   body = b"".join(parts)
 
-  req = urllib.request.Request(url, data=body, method="POST")
-  req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
-  req.add_header("Content-Length", str(len(body)))
+  if timeout_s is None:
+    try:
+      timeout_s = int((os.environ.get("GITEE_UPLOAD_TIMEOUT_S") or "600").strip())
+    except ValueError:
+      timeout_s = 600
+  timeout_s = max(30, timeout_s)
+
   def _do() -> dict:
-    with urllib.request.urlopen(req, timeout=120) as resp:
+    # Fresh Request each attempt (safer for retries after partial send / timeout).
+    req = urllib.request.Request(url, data=body, method="POST")
+    req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
+    req.add_header("Content-Length", str(len(body)))
+    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
       data = resp.read().decode("utf-8")
       return json.loads(data) if data else {}
-  return retry(f"http_multipart_post {url}", _do, tries=3, base_sleep_s=1.0)
+
+  return retry(f"http_multipart_post {url}", _do, tries=5, base_sleep_s=2.0)
 
 
 def ensure_line_in_tuple_block(src: str, key: str) -> str:
@@ -2065,7 +2082,23 @@ def sync_mapd_release(token: str, tag_env: str) -> None:
       gitee_delete_release_attach_file(token, rid, aid)
 
     print(f"[mapd] upload to gitee release_id={rid} name=mapd size={bin_path.stat().st_size}")
-    gitee_upload_release_asset(token, rid, "mapd", bin_path)
+    try:
+      gitee_upload_release_asset(token, rid, "mapd", bin_path)
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+      # Client can time out while Gitee still accepts the body; re-check attachments before failing.
+      err_l = str(e).lower()
+      if not (isinstance(e, TimeoutError) or "timed out" in err_l or "timeout" in err_l):
+        raise
+      expect_sz = bin_path.stat().st_size
+      existing2 = gitee_list_release_attach_files(token, rid)
+      same2 = [a for a in existing2 if a.get("name") == "mapd" and int(a.get("size") or -1) == expect_sz]
+      if same2:
+        print(
+          f"[mapd] upload client error ({type(e).__name__}) but mapd already on Gitee "
+          f"(attach_id={same2[0].get('id')} size={expect_sz}), treating as success"
+        )
+        return
+      raise
   finally:
     try:
       for p in tmp_dir.glob("*"):
