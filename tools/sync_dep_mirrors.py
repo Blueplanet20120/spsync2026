@@ -131,8 +131,17 @@ def sync_one(cache_dir: Path, owner: str, use_https: bool, m: RepoMirror) -> Non
   except RuntimeError:
     _run(["git", "remote", "set-url", "gitee", dest], cwd=mirror_dir)
 
-  # branches + tags only (avoid refs/pull/* hidden refs)
-  _run(["git", "fetch", "--prune", "origin", "+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"], cwd=mirror_dir)
+  # branches + tags only (avoid refs/pull/* hidden refs).
+  # GitHub occasionally returns 5xx on fetch; retry fetch alone (avoid re-printing this whole block via outer retry).
+  fetch_cmd = ["git", "fetch", "--prune", "origin", "+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"]
+  fetch_tries = int((os.environ.get("DEP_MIRROR_FETCH_TRIES") or "6").strip() or "6")
+  fetch_base = float((os.environ.get("DEP_MIRROR_FETCH_BACKOFF_S") or "2").strip() or "2")
+  _retry(
+    f"{m.label} fetch from GitHub",
+    lambda: _run(fetch_cmd, cwd=mirror_dir),
+    tries=max(1, fetch_tries),
+    base_sleep_s=fetch_base,
+  )
 
   push_args = [
     "git",
@@ -230,7 +239,7 @@ def main() -> None:
   print(f"       owner={args.owner} use_https={args.use_https} cache_dir={cache_dir}")
 
   for r in selected:
-    _retry(f"sync {r.label}", lambda r=r: sync_one(cache_dir, args.owner, args.use_https, r), tries=3, base_sleep_s=3.0)
+    sync_one(cache_dir, args.owner, args.use_https, r)
 
   _maybe_sync_mapd_release()
 
