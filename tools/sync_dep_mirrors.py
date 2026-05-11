@@ -89,6 +89,28 @@ def _safe_name(label: str) -> str:
   return re.sub(r"[^A-Za-z0-9._-]+", "_", label).strip("_") or "repo"
 
 
+def _push_would_change(output: str) -> bool:
+  """
+  `git push --porcelain --dry-run` output is not super stable across git versions,
+  but it reliably prints ref update lines when something would change.
+  Treat "Everything up-to-date" (or an empty/no-update porcelain) as no-op.
+  """
+  s = (output or "").strip()
+  if not s:
+    return False
+  if "Everything up-to-date" in s:
+    return False
+  # Heuristic: porcelain update lines typically begin with "ok " or "ng ".
+  for ln in s.splitlines():
+    ln = ln.strip()
+    if ln.startswith(("ok ", "ng ")):
+      return True
+  # Fallback: if it contains "->" or "[new tag]" style lines, consider it change.
+  if "->" in s or "[new " in s:
+    return True
+  return False
+
+
 def sync_one(cache_dir: Path, owner: str, use_https: bool, m: RepoMirror) -> None:
   mirror_dir = cache_dir / f"{_safe_name(m.label)}.git"
   dest = _dest_url(owner, m.gitee_repo, use_https)
@@ -111,18 +133,24 @@ def sync_one(cache_dir: Path, owner: str, use_https: bool, m: RepoMirror) -> Non
 
   # branches + tags only (avoid refs/pull/* hidden refs)
   _run(["git", "fetch", "--prune", "origin", "+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"], cwd=mirror_dir)
-  _run(
-    [
-      "git",
-      "push",
-      "--prune",
-      "--force",
-      "gitee",
-      "+refs/heads/*:refs/heads/*",
-      "+refs/tags/*:refs/tags/*",
-    ],
-    cwd=mirror_dir,
-  )
+
+  push_args = [
+    "git",
+    "push",
+    "--prune",
+    "--force",
+    "gitee",
+    "+refs/heads/*:refs/heads/*",
+    "+refs/tags/*:refs/tags/*",
+  ]
+
+  # Print "skip" reason when everything is already up to date (like mapd does).
+  dry = _run(push_args[:2] + ["--porcelain", "--dry-run"] + push_args[2:], cwd=mirror_dir)
+  if not _push_would_change(dry):
+    print("[dep] already up-to-date, skip push")
+    return
+
+  _run(push_args, cwd=mirror_dir)
 
 
 def _load_sync_to_gitee_impl() -> object:
