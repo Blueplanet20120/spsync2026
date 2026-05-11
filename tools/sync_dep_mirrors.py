@@ -181,6 +181,7 @@ def _maybe_sync_mapd_release() -> None:
   """
   Optional: sync `openpilot-mapd` binary to Gitee release.
   Requires `GITEE_TOKEN` (same as sync_to_gitee.py).
+  Upload timeout: env `GITEE_UPLOAD_TIMEOUT_S` (seconds), consumed in `tools/sync_to_gitee.py` → `http_multipart_post`.
   """
   if not _truthy(os.environ.get("SYNC_MAPD_RELEASE")):
     return
@@ -188,7 +189,9 @@ def _maybe_sync_mapd_release() -> None:
   if not token:
     raise RuntimeError("SYNC_MAPD_RELEASE=1 but missing GITEE_TOKEN")
   tag = os.environ.get("MAPD_TAG", "latest")
+  tout = (os.environ.get("GITEE_UPLOAD_TIMEOUT_S") or "600").strip()
   print(f"\n[mapd] sync release (MAPD_TAG={tag})")
+  print(f"[mapd] GITEE_UPLOAD_TIMEOUT_S={tout}s (multipart → Gitee attach_files; unset 默认 600，见 sync_to_gitee.py)")
   impl = _load_sync_to_gitee_impl()
   fn = getattr(impl, "sync_mapd_release", None)
   if not callable(fn):

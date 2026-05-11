@@ -99,6 +99,8 @@ jobs:
               ) && '1' || ''
             }}
           MAPD_TAG: ${{ github.event.inputs.mapd_tag || 'latest' }}
+          # mapd 上传到 Gitee Release 附件：multipart 单次请求超时（秒），由 tools/sync_to_gitee.py 读取；可调大防慢网/写超时
+          GITEE_UPLOAD_TIMEOUT_S: "900"
         run: |
           set -euo pipefail
           python3 "$GITHUB_WORKSPACE/tools/sync_dep_mirrors.py"
