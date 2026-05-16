@@ -717,23 +717,40 @@ def canonical_commit_sha(sha: str | None, root: Path, env: dict[str, str]) -> st
     return None
 
 
+EMAIL_SHA_LEN = 7  # 邮件展示统一短哈希长度（与「分支核对」一致）
+
+
 def short_sha(sha: str | None) -> str | None:
   if not sha:
     return None
   s = sha.strip().lower()
   if not re.fullmatch(r"[0-9a-f]{7,40}", s):
     return None
-  return s[:7]
+  return s[:EMAIL_SHA_LEN]
 
 
 def shorten_hashes_in_text(text: str) -> str:
   """
-  邮件展示层：将任何 8～40 位十六进制串缩短为 7 位，避免邮件里出现完整 SHA。
+  邮件展示层：将任何 8～40 位十六进制串缩短为 EMAIL_SHA_LEN 位，避免邮件里长短不一。
   后台对比与逻辑仍使用完整 SHA（调用方应仅在展示前使用本函数）。
   """
   if not text:
     return text
-  return re.sub(r"(?i)\b([0-9a-f]{8})[0-9a-f]{0,32}\b", r"\1", text)
+
+  def _repl(m: re.Match[str]) -> str:
+    return m.group(1)[:EMAIL_SHA_LEN]
+
+  return re.sub(r"(?i)\b([0-9a-f]{8,40})\b", _repl, text)
+
+
+def format_email_commit_line(line: str) -> str:
+  """git log 行首哈希与正文内嵌哈希统一为 EMAIL_SHA_LEN 位。"""
+  line = line.strip()
+  m = re.match(r"^([0-9a-f]{7,40})(\s+)(.*)$", line, re.IGNORECASE)
+  if not m:
+    return shorten_hashes_in_text(line)
+  h = short_sha(m.group(1)) or m.group(1)[:EMAIL_SHA_LEN]
+  return f"{h}{m.group(2)}{shorten_hashes_in_text(m.group(3))}"
 
 
 def _git_is_shallow_repo(root: Path, env: dict[str, str]) -> bool:
@@ -833,10 +850,10 @@ def _staging_commit_display_block(root: Path, env: dict[str, str], staging_full_
   """
   staging_full_sha = staging_full_sha.strip().lower()
   try:
-    short = run(["git", "rev-parse", "--short", staging_full_sha], str(root), env=env).strip()
+    short = short_sha(staging_full_sha) or staging_full_sha[:EMAIL_SHA_LEN]
     subj = shorten_hashes_in_text(run(["git", "log", "-1", "--format=%s", staging_full_sha], str(root), env=env).strip())
   except Exception:
-    return f"{staging_full_sha[:7]} （无法读取 staging 提交）"
+    return f"{staging_full_sha[:EMAIL_SHA_LEN]} （无法读取 staging 提交）"
   line_a = f"{short} {subj}"
   body = ""
   try:
@@ -853,7 +870,7 @@ def _staging_commit_display_block(root: Path, env: dict[str, str], staging_full_
   if not master_full:
     return f"{line_a} （master commit 对象不可解析）"
   try:
-    ms = run(["git", "rev-parse", "--short", master_full], str(root), env=env).strip()
+    ms = short_sha(master_full) or master_full[:EMAIL_SHA_LEN]
     msub = shorten_hashes_in_text(run(["git", "log", "-1", "--format=%s", master_full], str(root), env=env).strip())
   except Exception:
     return f"{line_a} （无法读取 master 提交）"
@@ -970,7 +987,7 @@ def collect_upstream_commits_for_email(
       ensure_upstream_master_for_staging_email(root, env)
       entries = [_staging_commit_display_block(root, env, ln.strip()) for ln in raw_lines]
     else:
-      entries = raw_lines
+      entries = [format_email_commit_line(ln) for ln in raw_lines]
     return entries, total_today, total_all
 
   def _upstream_branch_today_entries() -> list[str]:
@@ -991,7 +1008,7 @@ def collect_upstream_commits_for_email(
     if branch == "staging":
       ensure_upstream_master_for_staging_email(root, env)
       return [_staging_commit_display_block(root, env, ln.strip()) for ln in raw_lines]
-    return raw_lines
+    return [format_email_commit_line(ln) for ln in raw_lines]
 
   if base_sha:
     base_sha = base_sha.strip().lower()
