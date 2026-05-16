@@ -1572,37 +1572,49 @@ def _patch_dm_terminal_flexible(s: str, path_for_err: Path) -> str:
   )
 
 
-def _patch_dm_red_exit_flexible(s: str, path_for_err: Path) -> str:
+_RE_DM_RED_EXIT_HEADER = re.compile(
+  r"(?m)^(?P<ind>[ \t]*)# cn_dm_relaxed: auto exit red after 6s attention\s*$",
+)
+
+
+def _dm_red_exit_is_misplaced(s: str) -> bool:
   """
-  红色告警（awareness<=0）默认会“粘住”，需要 disengage 才能恢复。
-  国内化补丁：当检测到明显“已注意”（face+low_std+filter）时，最多 10 秒自动退出红色告警。
-  幂等：已有 sentinel 则跳过。
+  旧版补丁锚在 driverDistracted1 行之后，会落入 elif threshold_pre 分支（更深缩进）；
+  红线（awareness<=0）时该分支不执行，6 秒自动恢复形同虚设。
+  正确位置：与 `if alert is not None` 同级，在整段 if/elif 分级之后。
   """
-  if _DM_SENTINEL_RED_EXIT in s:
-    return s
+  m_sent = _RE_DM_RED_EXIT_HEADER.search(s)
+  m_if_alert = re.search(r"(?m)^(?P<ind>[ \t]+)if\s+alert\s+is\s+not\s+None\s*:\s*$", s)
+  if not m_sent:
+    return False
+  if not m_if_alert:
+    return True
+  return len(m_sent.group("ind")) != len(m_if_alert.group("ind"))
 
-  # 1) 确保 __init__ 里有计数器（兼容空格/Tab 缩进）
-  #    以 terminal_time 初始化为锚点，捕获其缩进用于插入同级字段。
-  m_init = re.search(r"(?m)^(?P<ind>[ \t]+)self\.terminal_time\s*=\s*0\s*$", s)
-  if not m_init:
-    raise RuntimeError(f"{path_for_err}: 未找到 self.terminal_time = 0 初始化行，无法注入 red_exit 计数器")
-  if "self.red_recover_cnt" not in s:
-    ind = m_init.group("ind")
-    insert_line = f"{ind}self.red_recover_cnt = 0  # {_DM_SENTINEL_RED_EXIT}\n"
-    # 插入在 terminal_time 行之后
-    s = s[: m_init.end()] + "\n" + insert_line + s[m_init.end() + 1 :]
 
-  # 2) 在 _update_events 中 alert 分级块后注入“红色自动退出”逻辑。
-  #    不绑定完整 if/elif 结构，只要求存在 distracted1/unresponsive1 那行（上游常年稳定）。
-  m_alert = re.search(
-    r"(?m)^(?P<ind>[ \t]+)alert\s*=\s*EventName\.driverDistracted1\s+if\s+self\.active_monitoring_mode\s+else\s+EventName\.driverUnresponsive1\s*$",
-    s,
-  )
-  if not m_alert:
-    raise RuntimeError(f"{path_for_err}: 未找到 driverDistracted1/driverUnresponsive1 alert 行，无法注入 red_exit 逻辑（上游可能重构）")
+_RE_DM_RED_EXIT_BLOCK = re.compile(
+  r"\n(?P<ind>[ \t]+)# cn_dm_relaxed: auto exit red after 6s attention\n"
+  r"(?P=ind)# allow recovery from red without disengage\.\n"
+  r"(?P=ind)# If driver is clearly attentive again for <=6s, exit red state automatically\.\n"
+  r"(?P=ind)if self\.awareness <= 0\.:\n"
+  r"(?P=ind)  attentive = \(self\.driver_distraction_filter\.x < 0\.37 and self\.face_detected and self\.pose\.low_std\)\n"
+  r"(?P=ind)  if attentive:\n"
+  r"(?P=ind)    self\.red_recover_cnt \+= 1\n"
+  r"(?P=ind)    if self\.red_recover_cnt \* self\.settings\._DT_DMON >= 6\.0:\n"
+  r"(?P=ind)      # Move just above prompt threshold so banner clears immediately\.\n"
+  r"(?P=ind)      self\.awareness = min\(1\.0, self\.threshold_prompt \+ 1e-3\)\n"
+  r"(?P=ind)      self\.red_recover_cnt = 0\n"
+  r"(?P=ind)      alert = None\n"
+  r"(?P=ind)  else:\n"
+  r"(?P=ind)    self\.red_recover_cnt = 0\n"
+  r"(?P=ind)else:\n"
+  r"(?P=ind)  self\.red_recover_cnt = 0\n",
+  re.MULTILINE,
+)
 
-  ind = m_alert.group("ind")
-  inject = (
+
+def _dm_red_exit_inject_block(ind: str) -> str:
+  return (
     f"\n"
     f"{ind}# {_DM_SENTINEL_RED_EXIT}\n"
     f"{ind}# allow recovery from red without disengage.\n"
@@ -1622,8 +1634,45 @@ def _patch_dm_red_exit_flexible(s: str, path_for_err: Path) -> str:
     f"{ind}  self.red_recover_cnt = 0\n"
   )
 
-  # 幂等：如果已经有注入块（含 sentinel），前面已 return；这里直接插入到该行之后
-  s = s[: m_alert.end()] + inject + s[m_alert.end() :]
+
+def _strip_dm_red_exit_block(s: str) -> str:
+  return _RE_DM_RED_EXIT_BLOCK.sub("", s, count=1)
+
+
+def _patch_dm_red_exit_flexible(s: str, path_for_err: Path) -> str:
+  """
+  红色告警（awareness<=0）默认会“粘住”，需要 disengage 才能恢复。
+  国内化补丁：当检测到明显“已注意”（face+low_std+filter）累计满 6 秒，自动退出红色告警。
+  幂等：sentinel 已在正确位置则跳过；旧版误嵌 elif 分支则先剥离再重插。
+  """
+  if _DM_SENTINEL_RED_EXIT in s and not _dm_red_exit_is_misplaced(s):
+    return s
+
+  if _RE_DM_RED_EXIT_HEADER.search(s):
+    s = _strip_dm_red_exit_block(s)
+    if _RE_DM_RED_EXIT_HEADER.search(s):
+      raise RuntimeError(
+        f"{path_for_err}: red_exit 补丁块无法剥离（上游可能改写注释/缩进），请人工合并。"
+      )
+
+  # 1) 确保 __init__ 里有计数器（兼容空格/Tab 缩进）
+  m_init = re.search(r"(?m)^(?P<ind>[ \t]+)self\.terminal_time\s*=\s*0\s*$", s)
+  if not m_init:
+    raise RuntimeError(f"{path_for_err}: 未找到 self.terminal_time = 0 初始化行，无法注入 red_exit 计数器")
+  if "self.red_recover_cnt" not in s:
+    ind = m_init.group("ind")
+    insert_line = f"{ind}self.red_recover_cnt = 0  # {_DM_SENTINEL_RED_EXIT}\n"
+    s = s[: m_init.end()] + "\n" + insert_line + s[m_init.end() + 1 :]
+
+  # 2) 锚定 alert 分级 if/elif 整段之后、「if alert is not None」之前（与 alert = None 同级缩进）。
+  m_events_add = re.search(r"(?m)^(?P<ind>[ \t]+)if\s+alert\s+is\s+not\s+None\s*:\s*$", s)
+  if not m_events_add:
+    raise RuntimeError(
+      f"{path_for_err}: 未找到 `if alert is not None:`，无法注入 red_exit 逻辑（上游可能重构）"
+    )
+  ind = m_events_add.group("ind")
+  inject = _dm_red_exit_inject_block(ind)
+  s = s[: m_events_add.start()] + inject + s[m_events_add.start() :]
   return s
 
 
@@ -1641,7 +1690,12 @@ def patch_dm_relaxed_terminal(root: Path) -> PatchResult:
     return res
 
   s = helpers.read_text(encoding="utf-8")
-  if _DM_SENTINEL_AWARENESS in s and _DM_SENTINEL_TERMINAL in s and _DM_SENTINEL_RED_EXIT in s:
+  if (
+    _DM_SENTINEL_AWARENESS in s
+    and _DM_SENTINEL_TERMINAL in s
+    and _RE_DM_RED_EXIT_HEADER.search(s)
+    and not _dm_red_exit_is_misplaced(s)
+  ):
     return res
 
   s = _patch_dm_awareness_flexible(s, helpers)
@@ -1772,8 +1826,15 @@ def verify_patches(root: Path) -> None:
       errors.append("selfdrive/monitoring/helpers.py: 缺少 DM 补丁 sentinel（awareness 下限）")
     if _DM_SENTINEL_TERMINAL not in hm:
       errors.append("selfdrive/monitoring/helpers.py: 缺少 DM 补丁 sentinel（terminal 累计）")
-    if _DM_SENTINEL_RED_EXIT not in hm:
+    if not _RE_DM_RED_EXIT_HEADER.search(hm):
       errors.append("selfdrive/monitoring/helpers.py: 缺少 DM 补丁 sentinel（red 自动退出）")
+    elif "self.red_recover_cnt" not in hm:
+      errors.append("selfdrive/monitoring/helpers.py: 缺少 red_recover_cnt 计数器（red 自动退出）")
+    elif _dm_red_exit_is_misplaced(hm):
+      errors.append(
+        "selfdrive/monitoring/helpers.py: red_exit 补丁误嵌在 elif threshold_pre 分支内，"
+        "红线（awareness<=0）时不会执行 6 秒专注自动恢复"
+      )
     if re.search(r"max\s*\(\s*self\.awareness\s*-\s*self\.step_change\s*,\s*-0\.1\s*\)", hm):
       errors.append("selfdrive/monitoring/helpers.py: 仍存在原版 -0.1 awareness 下限（空白不限），DM 补丁未生效")
     # 上游若换行/缩进与旧版不同，仍应能检出「红线 alert 下一行仍在 += terminal_time」
