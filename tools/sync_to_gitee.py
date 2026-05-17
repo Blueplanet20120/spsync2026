@@ -1948,17 +1948,42 @@ def write_ci_github_output(state: dict[str, object]) -> None:
     f.write(f"{delim}\n")
 
 
+def _gitee_git_ssh_env(port: int = 22) -> dict[str, str]:
+  """Gitee SSH：短超时 + 非交互，避免 CI 上 port 22 挂死数分钟。"""
+  env = os.environ.copy()
+  env["GIT_SSH_COMMAND"] = (
+    f"ssh -p {port} -o ConnectTimeout=25 -o ConnectionAttempts=1 "
+    "-o ServerAliveInterval=10 -o ServerAliveCountMax=2 -o BatchMode=yes"
+  )
+  return env
+
+
 def ensure_tinygrad_submodule_commit_reachable() -> None:
+  """
+  确保 Gitee tinygrad 镜像含 superproject 固定的 submodule SHA。
+  子模块 update 阶段仍走 GitHub upstream；此处仅为 Gitee 克隆者兜底。
+  """
   sha = "3501a714785ff370cffb966a45d5f9cdf6c9ea7a"
   url = "git@gitee.com:xc2026/tinygrad.git"
-  with tempfile.TemporaryDirectory() as td:
-    run(["git", "init"], td)
-    run(["git", "remote", "add", "origin", url], td)
-    try:
-      run(["git", "fetch", "--depth=1", "origin", sha], td)
+
+  def _gitee_has_commit(port: int) -> bool:
+    with tempfile.TemporaryDirectory() as td:
+      try:
+        run(["git", "init"], td)
+        run(["git", "remote", "add", "origin", url], td)
+        run(
+          ["git", "fetch", "--depth=1", "origin", sha],
+          td,
+          env=_gitee_git_ssh_env(port),
+        )
+        return True
+      except Exception:
+        return False
+
+  for port in (22, 443):
+    if _gitee_has_commit(port):
+      log("tinygrad", f"Gitee mirror already has {sha[:7]} (ssh port {port})")
       return
-    except Exception:
-      pass
 
   branch = "submodule-pin-3501a714"
   with tempfile.TemporaryDirectory() as td:
@@ -1967,7 +1992,31 @@ def ensure_tinygrad_submodule_commit_reachable() -> None:
     run(["git", "fetch", "--depth=1", "upstream", sha], td)
     run(["git", "update-ref", f"refs/heads/{branch}", sha], td)
     run(["git", "remote", "add", "origin", url], td)
-    run(["git", "push", "origin", f"+refs/heads/{branch}:refs/heads/{branch}"], td)
+    last_err: Exception | None = None
+    for port in (22, 443):
+      try:
+        run(
+          ["git", "push", "origin", f"+refs/heads/{branch}:refs/heads/{branch}"],
+          td,
+          env=_gitee_git_ssh_env(port),
+        )
+        log("tinygrad", f"mirrored {sha[:7]} to Gitee (ssh port {port})")
+        return
+      except Exception as e:
+        last_err = e
+        log("warn", f"tinygrad mirror push via port {port} failed: {e}")
+
+  soft_ok = os.environ.get("GITHUB_ACTIONS") == "true" and (
+    os.environ.get("SYNC_TINYGRAD_MIRROR_REQUIRED", "").strip().lower() not in ("1", "true", "yes", "on")
+  )
+  if soft_ok:
+    log(
+      "warn",
+      "skip tinygrad Gitee mirror (SSH unreachable); CI 子模块 update 仍用 GitHub upstream，"
+      "同步可继续。若 Gitee 克隆缺 commit 可稍后重试或设 SYNC_TINYGRAD_MIRROR_REQUIRED=1 强制失败。",
+    )
+    return
+  raise RuntimeError(f"tinygrad mirror push failed: {last_err}")
 
 
 def current_arch(root: Path) -> str:
@@ -2216,10 +2265,17 @@ def main() -> None:
   if not (root / ".git").exists():
     raise SystemExit(f"未找到 git 仓库: {root}")
 
-  env, shim_dir = prepare_git_env(root)
-  ci_sync_state: dict[str, object] | None = None
-  try:
-    ci_sync_state = {"attempted": False, "pushed": False, "branches": [], "sync_reason_tags": []}
+    env, shim_dir = prepare_git_env(root)
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+      # CI 只需源码打补丁，不 smudge LFS；显著缩短 clone/checkout。
+      env.setdefault("GIT_LFS_SKIP_SMUDGE", "1")
+      env.setdefault(
+        "GIT_SSH_COMMAND",
+        "ssh -o ConnectTimeout=25 -o ConnectionAttempts=1 -o BatchMode=yes",
+      )
+    ci_sync_state: dict[str, object] | None = None
+    try:
+      ci_sync_state = {"attempted": False, "pushed": False, "branches": [], "sync_reason_tags": []}
     # load optional .env next to this repo (never committed)
     sp_dotenv = load_dotenv(REPO_ROOT / ".env")
     for k, v in sp_dotenv.items():

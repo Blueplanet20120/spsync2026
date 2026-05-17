@@ -127,6 +127,9 @@ jobs:
           GITEE_REPO_SSH: ${{ secrets.GITEE_REPO_SSH }}
           # 避免 CI 因 LFS 推送耗时/不稳定而失败（脚本内部也会 setdefault）
           GIT_LFS_SKIP_PUSH: "1"
+          # 克隆/检出时不下载 LFS 实体（仅指针），避免 Filtering content 卡十几分钟
+          GIT_LFS_SKIP_SMUDGE: "1"
+          GIT_SSH_COMMAND: "ssh -o ConnectTimeout=25 -o ConnectionAttempts=1 -o BatchMode=yes"
           # 仅当上游子模块指针发生变化时才更新子模块（提速且更接近本地行为）
           SKIP_SUBMODULES: "auto"
           FORCE_SYNC: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.force_sync == 'true' && '1' || '' }}
@@ -139,7 +142,7 @@ jobs:
           WORKDIR="$GITHUB_WORKSPACE/sunnypilot"
           if [ ! -d "$WORKDIR/.git" ]; then
             rm -rf "$WORKDIR"
-            git clone --depth=1 "https://github.com/sunnypilot/sunnypilot.git" "$WORKDIR"
+            GIT_LFS_SKIP_SMUDGE=1 git clone --depth=1 "https://github.com/sunnypilot/sunnypilot.git" "$WORKDIR"
           fi
 
           # 有限重试：应对偶发网络/服务抖动（push、fetch、API 临时失败等）
