@@ -2265,17 +2265,17 @@ def main() -> None:
   if not (root / ".git").exists():
     raise SystemExit(f"未找到 git 仓库: {root}")
 
-    env, shim_dir = prepare_git_env(root)
-    if os.environ.get("GITHUB_ACTIONS") == "true":
-      # CI 只需源码打补丁，不 smudge LFS；显著缩短 clone/checkout。
-      env.setdefault("GIT_LFS_SKIP_SMUDGE", "1")
-      env.setdefault(
-        "GIT_SSH_COMMAND",
-        "ssh -o ConnectTimeout=25 -o ConnectionAttempts=1 -o BatchMode=yes",
-      )
-    ci_sync_state: dict[str, object] | None = None
-    try:
-      ci_sync_state = {"attempted": False, "pushed": False, "branches": [], "sync_reason_tags": []}
+  env, shim_dir = prepare_git_env(root)
+  if os.environ.get("GITHUB_ACTIONS") == "true":
+    # CI 只需源码打补丁，不 smudge LFS；显著缩短 clone/checkout。
+    env.setdefault("GIT_LFS_SKIP_SMUDGE", "1")
+    env.setdefault(
+      "GIT_SSH_COMMAND",
+      "ssh -o ConnectTimeout=25 -o ConnectionAttempts=1 -o BatchMode=yes",
+    )
+  ci_sync_state: dict[str, object] | None = None
+  try:
+    ci_sync_state = {"attempted": False, "pushed": False, "branches": [], "sync_reason_tags": []}
     # load optional .env next to this repo (never committed)
     sp_dotenv = load_dotenv(REPO_ROOT / ".env")
     for k, v in sp_dotenv.items():
