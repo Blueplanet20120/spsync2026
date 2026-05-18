@@ -54,7 +54,7 @@ jobs:
 
       - name: Restore Gitee known_hosts cache
         id: gitee_known_hosts_cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: .ci-cache/gitee-known_hosts
           key: gitee-known-hosts-v1
@@ -132,7 +132,7 @@ jobs:
         if: >-
           steps.gitee_known_hosts.outputs.refreshed == 'true' ||
           steps.gitee_known_hosts_cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         with:
           path: .ci-cache/gitee-known_hosts
           key: gitee-known-hosts-v1
