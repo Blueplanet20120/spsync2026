@@ -28,10 +28,32 @@ def _truthy(s: str | None) -> bool:
   return bool((s or "").strip().lower() in ("1", "true", "yes", "y", "on"))
 
 
-def _run(cmd: list[str], cwd: Path | None = None) -> str:
+def _git_env(extra: dict[str, str] | None = None) -> dict[str, str]:
+  """CI 下为 git→Gitee 的 SSH 设短超时，避免 push 挂死。"""
+  env = dict(os.environ)
+  if extra:
+    env.update(extra)
+  if os.environ.get("GITHUB_ACTIONS") == "true" and not (env.get("GIT_SSH_COMMAND") or "").strip():
+    env["GIT_SSH_COMMAND"] = (
+      "ssh -o ConnectTimeout=25 -o ConnectionAttempts=1 "
+      "-o ServerAliveInterval=10 -o ServerAliveCountMax=2 -o BatchMode=yes"
+    )
+  return env
+
+
+def _apply_ci_git_env() -> None:
+  if os.environ.get("GITHUB_ACTIONS") == "true" and not (os.environ.get("GIT_SSH_COMMAND") or "").strip():
+    os.environ["GIT_SSH_COMMAND"] = (
+      "ssh -o ConnectTimeout=25 -o ConnectionAttempts=1 "
+      "-o ServerAliveInterval=10 -o ServerAliveCountMax=2 -o BatchMode=yes"
+    )
+
+
+def _run(cmd: list[str], cwd: Path | None = None, env: dict[str, str] | None = None) -> str:
   p = subprocess.run(
     cmd,
     cwd=str(cwd) if cwd else None,
+    env=_git_env(env),
     stdout=subprocess.PIPE,
     stderr=subprocess.STDOUT,
     text=True,
@@ -159,7 +181,14 @@ def sync_one(cache_dir: Path, owner: str, use_https: bool, m: RepoMirror) -> Non
     print("[dep] already up-to-date, skip push")
     return
 
-  _run(push_args, cwd=mirror_dir)
+  push_tries = int((os.environ.get("DEP_MIRROR_PUSH_TRIES") or "4").strip() or "4")
+  push_base = float((os.environ.get("DEP_MIRROR_PUSH_BACKOFF_S") or "3").strip() or "3")
+  _retry(
+    f"{m.label} push to Gitee",
+    lambda: _run(push_args, cwd=mirror_dir),
+    tries=max(1, push_tries),
+    base_sleep_s=push_base,
+  )
 
 
 def _load_sync_to_gitee_impl() -> object:
@@ -200,6 +229,7 @@ def _maybe_sync_mapd_release() -> None:
 
 
 def main() -> None:
+  _apply_ci_git_env()
   ap = argparse.ArgumentParser(description="Sync dependency repos to Gitee mirrors (branches+tags).")
   ap.add_argument("--owner", default=os.environ.get("DEP_MIRROR_OWNER", "xc2026"), help="Gitee owner/org (default: xc2026)")
   ap.add_argument("--use-https", action="store_true", default=_truthy(os.environ.get("DEP_MIRROR_USE_HTTPS")), help="Use HTTPS remote instead of SSH")

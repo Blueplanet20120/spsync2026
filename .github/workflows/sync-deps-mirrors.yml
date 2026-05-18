@@ -66,12 +66,90 @@ jobs:
         with:
           ssh-private-key: ${{ secrets.GITEE_SSH_PRIVATE_KEY }}
 
+      # 与 sync-to-gitee.yml 共用同一 known_hosts 缓存（key/path 一致）
+      - name: Restore Gitee known_hosts cache
+        id: gitee_known_hosts_cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .ci-cache/gitee-known_hosts
+          key: gitee-known-hosts-v1
+          restore-keys: |
+            gitee-known-hosts-
+
       - name: Add gitee.com to known_hosts
+        id: gitee_known_hosts
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p ~/.ssh
-          ssh-keyscan -t rsa,ecdsa,ed25519 gitee.com >> ~/.ssh/known_hosts
+          mkdir -p ~/.ssh .ci-cache
+          chmod 700 ~/.ssh
+          CACHE_FILE=".ci-cache/gitee-known_hosts"
+          REFRESHED=false
+
+          install_known_hosts() {
+            cp "$CACHE_FILE" ~/.ssh/known_hosts
+            chmod 600 ~/.ssh/known_hosts
+          }
+
+          keyscan_to_cache() {
+            local scan_tmp attempt port
+            scan_tmp="$(mktemp)"
+            for attempt in 1 2 3 4 5; do
+              : > "$scan_tmp"
+              for port in 22 443; do
+                if ssh-keyscan -T 15 -p "$port" -t rsa,ecdsa,ed25519 gitee.com >"$scan_tmp" 2>/dev/null \
+                  && grep -q '^gitee.com ' "$scan_tmp"; then
+                  grep '^gitee.com ' "$scan_tmp" | sort -u > "$CACHE_FILE"
+                  install_known_hosts
+                  echo "[known_hosts] ssh-keyscan ok (attempt ${attempt}, port ${port})"
+                  rm -f "$scan_tmp"
+                  return 0
+                fi
+              done
+              echo "[known_hosts] ssh-keyscan attempt ${attempt}/5 failed, retry in $((attempt * 5))s..."
+              sleep $((attempt * 5))
+            done
+            rm -f "$scan_tmp"
+            return 1
+          }
+
+          host_key_usable() {
+            local out
+            out="$(ssh -o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=yes \
+              -o NumberOfPasswordPrompts=0 -T git@gitee.com 2>&1)" || true
+            if echo "$out" | grep -qiE 'Host key verification failed|REMOTE HOST IDENTIFICATION HAS CHANGED'; then
+              return 1
+            fi
+            return 0
+          }
+
+          if [ -f "$CACHE_FILE" ] && grep -q '^gitee.com ' "$CACHE_FILE"; then
+            install_known_hosts
+            echo "[known_hosts] loaded from Actions cache (restore hit=${{ steps.gitee_known_hosts_cache.outputs.cache-hit }})"
+            if host_key_usable; then
+              echo "[known_hosts] cache keys accepted by SSH"
+            else
+              echo "[known_hosts] cache keys rejected, refreshing via ssh-keyscan..."
+              keyscan_to_cache || { echo "::error::known_hosts: cache invalid and ssh-keyscan failed"; exit 1; }
+              REFRESHED=true
+            fi
+          else
+            echo "[known_hosts] cache miss or empty, scanning gitee.com..."
+            keyscan_to_cache || { echo "::error::known_hosts: ssh-keyscan failed"; exit 1; }
+            REFRESHED=true
+          fi
+
+          grep -q '^gitee.com ' ~/.ssh/known_hosts
+          echo "refreshed=${REFRESHED}" >> "$GITHUB_OUTPUT"
+
+      - name: Save Gitee known_hosts cache
+        if: >-
+          steps.gitee_known_hosts.outputs.refreshed == 'true' ||
+          steps.gitee_known_hosts_cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .ci-cache/gitee-known_hosts
+          key: gitee-known-hosts-v1
 
       # 可选：缓存 mirror 仓库，后续增量 fetch/push 会更快
       - name: Cache mirror repos
@@ -89,6 +167,8 @@ jobs:
           DEP_MIRROR_ONLY: ${{ github.event.inputs.only || '' }}
           DEP_MIRROR_SKIP: ${{ github.event.inputs.skip || '' }}
           DEP_MIRROR_CACHE_DIR: /tmp/sp_dep_mirrors_cache
+          GIT_SSH_COMMAND: "ssh -o ConnectTimeout=25 -o ConnectionAttempts=1 -o BatchMode=yes"
+          DEP_MIRROR_PUSH_TRIES: "4"
           GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
           # mapd：默认关闭；仅手动 Run 且勾选「sync_mapd_release」时上传（定时任务不同步 mapd，避免境外 Runner 上传失败）
           SYNC_MAPD_RELEASE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.sync_mapd_release == 'true' && '1' || '' }}
