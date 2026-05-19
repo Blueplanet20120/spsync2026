@@ -83,8 +83,8 @@ def default_workdir(repo_root: Path) -> Path:
 
 WORKDIR_DEFAULT = str(default_workdir(REPO_ROOT))
 REPO_DEFAULT = "git@gitee.com:xc2026/sunnypilot_cn.git"
-ALIYUN_REPO_DEFAULT = "git@codeup.aliyun.com:6a0b0c8d706afd34aa607161/Codeup-Demo.git"
-ALIYUN_REPO_HTTPS = "https://codeup.aliyun.com/6a0b0c8d706afd34aa607161/Codeup-Demo.git"
+ALIYUN_REPO_DEFAULT = "git@codeup.aliyun.com:6a0b0c8d706afd34aa607161/sunnypilot_cn.git"
+ALIYUN_REPO_HTTPS = "https://codeup.aliyun.com/6a0b0c8d706afd34aa607161/sunnypilot_cn.git"
 ALIYUN_SSH_KEY_DEFAULT = "~/.ssh/sp-cn"
 SP_CN_TOKEN_ENV = "sp-cn-token"
 UPSTREAM_DEFAULT = "https://github.com/sunnypilot/sunnypilot.git"
