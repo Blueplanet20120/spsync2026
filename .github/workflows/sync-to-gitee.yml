@@ -155,7 +155,7 @@ jobs:
           ssh-keyscan -T 15 -t rsa,ecdsa,ed25519 codeup.aliyun.com >> ~/.ssh/known_hosts 2>/dev/null || true
           echo "[codeup] wrote ~/.ssh/sp-cn for sync_to_gitee aliyun remote"
 
-      - name: Sync upstream -> patch -> push to Gitee
+      - name: Sync upstream -> patch -> push to Gitee + Codeup
         id: sync
         shell: bash
         env:
@@ -211,7 +211,7 @@ jobs:
       # 成功通知条件（三者同时满足，AND）：作业成功 + 至少跑过一轮完整同步(attempted_sync) + 已推送(pushed)。
       # attempted_sync 含：上游相对 Gitee 记录有变化；或手动勾选 Force（FORCE_SYNC）即使上游 SHA 未变。
       # 未配置 SMTP 时本步骤可能报错，已 continue-on-error。
-      - name: Notify mail — sync OK (ran sync + pushed to Gitee)
+      - name: Notify mail — sync OK (pushed to Gitee + Codeup)
         if: >-
           success() &&
           steps.sync.outputs.attempted_sync == 'true' &&
@@ -246,7 +246,7 @@ jobs:
           to: ${{ secrets.MAIL_TO }}
           from: ${{ secrets.MAIL_FROM }}
           body: |
-            sunnypilot_cn → Gitee 同步失败（已进入完整同步流程：含上游有更新或手动 Force；可能是 verify_patches、git 或推送错误）。
+            sunnypilot_cn → Gitee / 云效 Codeup 同步失败（已进入完整同步流程：含上游有更新或手动 Force；可能是 verify_patches、git 或推送错误）。
 
             branches: ${{ steps.sync.outputs.sync_branches }}
             attempted_sync=${{ steps.sync.outputs.attempted_sync }} pushed=${{ steps.sync.outputs.pushed }}
