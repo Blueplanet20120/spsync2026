@@ -155,67 +155,124 @@ jobs:
           ssh-keyscan -T 15 -t rsa,ecdsa,ed25519 codeup.aliyun.com >> ~/.ssh/known_hosts 2>/dev/null || true
           echo "[codeup] wrote ~/.ssh/sp-cn for sync_to_gitee aliyun remote"
 
-      - name: Sync upstream -> patch -> push to Gitee + Codeup
-        id: sync
+      - name: Sync upstream -> patch (no push)
+        id: sync_pull
         shell: bash
         env:
           GITEE_REPO_SSH: ${{ secrets.GITEE_REPO_SSH }}
-          # 避免 CI 因 LFS 推送耗时/不稳定而失败（脚本内部也会 setdefault）
-          GIT_LFS_SKIP_PUSH: "1"
-          # Gitee 免费版约 1GB：推送前压成单提交，避免累积完整 upstream 历史（车端仍 fetch 分支 tip）
-          # 若仍报 size exceeds limit，请先在 Gitee 仓库设置执行一次 Git GC 回收旧对象。
-          SYNC_GITEE_SINGLE_COMMIT: "1"
-          # 仅当上游子模块指针发生变化时才更新子模块（提速且更接近本地行为）
           SKIP_SUBMODULES: "auto"
           FORCE_SYNC: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.force_sync == 'true' && '1' || '' }}
-          # 成功邮件里上游 git log：仅「当日」自然日（默认 UTC；需要可改 Asia/Shanghai 等）
           SYNC_EMAIL_LOG_TZ: "UTC"
           SYNC_EMAIL_LOG_MAX: "6"
-          # 与本地 .env 的 sp-cn-token 同值；仅 --build-installer 时需要（常规同步可省略）
           SP_CN_TOKEN: ${{ secrets.SP_CN_TOKEN }}
         run: |
           set -euo pipefail
-
           WORKDIR="$GITHUB_WORKSPACE/sunnypilot"
           if [ ! -d "$WORKDIR/.git" ]; then
             rm -rf "$WORKDIR"
             git clone --depth=1 "https://github.com/sunnypilot/sunnypilot.git" "$WORKDIR"
           fi
-
-          # 有限重试：应对偶发网络/服务抖动（push、fetch、API 临时失败等）
           max_attempts=3
           attempt=1
           while true; do
-            echo "[sync] attempt ${attempt}/${max_attempts}"
+            echo "[sync-pull] attempt ${attempt}/${max_attempts}"
             set +e
             python3 "$GITHUB_WORKSPACE/tools/sync_to_gitee.py" \
-              --action all \
+              --action pull \
               --workdir "$WORKDIR" \
               --origin "$GITEE_REPO_SSH" \
               --upstream "https://github.com/sunnypilot/sunnypilot.git"
             ec=$?
             set -e
-            if [ "$ec" -eq 0 ]; then
-              break
-            fi
+            if [ "$ec" -eq 0 ]; then break; fi
             if [ "$attempt" -ge "$max_attempts" ]; then
-              echo "[sync] failed after ${max_attempts} attempts (exit_code=${ec})"
+              echo "[sync-pull] failed after ${max_attempts} attempts (exit_code=${ec})"
               exit "$ec"
             fi
-            sleep_s=$((attempt * 20))
-            echo "[sync] retrying in ${sleep_s}s (exit_code=${ec})"
-            sleep "$sleep_s"
+            sleep $((attempt * 20))
             attempt=$((attempt + 1))
           done
 
-      # 成功通知条件（三者同时满足，AND）：作业成功 + 至少跑过一轮完整同步(attempted_sync) + 已推送(pushed)。
-      # attempted_sync 含：上游相对 Gitee 记录有变化；或手动勾选 Force（FORCE_SYNC）即使上游 SHA 未变。
-      # 未配置 SMTP 时本步骤可能报错，已 continue-on-error。
-      - name: Notify mail — sync OK (pushed to Gitee + Codeup)
+      - name: Push to Gitee
+        id: sync_push_gitee
+        if: steps.sync_pull.outcome == 'success'
+        shell: bash
+        env:
+          GITEE_REPO_SSH: ${{ secrets.GITEE_REPO_SSH }}
+          GIT_LFS_SKIP_PUSH: "1"
+          SYNC_GITEE_SINGLE_COMMIT: "1"
+          SP_CN_TOKEN: ${{ secrets.SP_CN_TOKEN }}
+        run: |
+          set -euo pipefail
+          WORKDIR="$GITHUB_WORKSPACE/sunnypilot"
+          max_attempts=3
+          attempt=1
+          while true; do
+            echo "[push-gitee] attempt ${attempt}/${max_attempts}"
+            set +e
+            python3 "$GITHUB_WORKSPACE/tools/sync_to_gitee.py" \
+              --action push-gitee \
+              --workdir "$WORKDIR" \
+              --origin "$GITEE_REPO_SSH" \
+              --upstream "https://github.com/sunnypilot/sunnypilot.git"
+            ec=$?
+            set -e
+            if [ "$ec" -eq 0 ]; then break; fi
+            if [ "$attempt" -ge "$max_attempts" ]; then
+              echo "[push-gitee] failed after ${max_attempts} attempts (exit_code=${ec})"
+              exit "$ec"
+            fi
+            sleep $((attempt * 20))
+            attempt=$((attempt + 1))
+          done
+
+      - name: Push to Codeup (Aliyun)
+        id: sync_push_codeup
+        if: steps.sync_pull.outcome == 'success'
+        shell: bash
+        env:
+          GITEE_REPO_SSH: ${{ secrets.GITEE_REPO_SSH }}
+          SP_CN_TOKEN: ${{ secrets.SP_CN_TOKEN }}
+        run: |
+          set -euo pipefail
+          WORKDIR="$GITHUB_WORKSPACE/sunnypilot"
+          max_attempts=3
+          attempt=1
+          while true; do
+            echo "[push-codeup] attempt ${attempt}/${max_attempts}"
+            set +e
+            python3 "$GITHUB_WORKSPACE/tools/sync_to_gitee.py" \
+              --action push-codeup \
+              --workdir "$WORKDIR" \
+              --origin "$GITEE_REPO_SSH" \
+              --upstream "https://github.com/sunnypilot/sunnypilot.git"
+            ec=$?
+            set -e
+            if [ "$ec" -eq 0 ]; then break; fi
+            if [ "$attempt" -ge "$max_attempts" ]; then
+              echo "[push-codeup] failed after ${max_attempts} attempts (exit_code=${ec})"
+              exit "$ec"
+            fi
+            sleep $((attempt * 20))
+            attempt=$((attempt + 1))
+          done
+
+      - name: Finalize sync outputs (mail)
+        id: sync_outputs
+        if: always() && steps.sync_pull.outcome == 'success'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 "$GITHUB_WORKSPACE/tools/sync_to_gitee.py" \
+            --action emit-outputs \
+            --workdir "$GITHUB_WORKSPACE/sunnypilot"
+
+      # 成功：pull 已尝试且至少一端推送成功（见 pushed_gitee / pushed_codeup）
+      - name: Notify mail — sync OK
         if: >-
           success() &&
-          steps.sync.outputs.attempted_sync == 'true' &&
-          steps.sync.outputs.pushed == 'true'
+          steps.sync_outputs.outputs.attempted_sync == 'true' &&
+          steps.sync_outputs.outputs.pushed == 'true'
         continue-on-error: true
         uses: dawidd6/action-send-mail@v17
         with:
@@ -227,12 +284,13 @@ jobs:
           subject: "[OK] sp_cn_sync-bot"
           to: ${{ secrets.MAIL_TO }}
           from: ${{ secrets.MAIL_FROM }}
-          body: ${{ steps.sync.outputs.notify_success_body }}
+          body: ${{ steps.sync_outputs.outputs.notify_success_body }}
 
-      - name: Notify mail — sync FAILED (after sync attempt)
+      - name: Notify mail — sync FAILED
         if: >-
           failure() &&
-          steps.sync.outputs.attempted_sync == 'true'
+          steps.sync_pull.outcome == 'success' &&
+          steps.sync_outputs.outputs.attempted_sync == 'true'
         continue-on-error: true
         uses: dawidd6/action-send-mail@v17
         with:
@@ -246,10 +304,16 @@ jobs:
           to: ${{ secrets.MAIL_TO }}
           from: ${{ secrets.MAIL_FROM }}
           body: |
-            sunnypilot_cn → Gitee / 云效 Codeup 同步失败（已进入完整同步流程：含上游有更新或手动 Force；可能是 verify_patches、git 或推送错误）。
+            sunnypilot_cn 同步失败（补丁/推送分步执行，请看 Actions 里哪一步变红）。
 
-            branches: ${{ steps.sync.outputs.sync_branches }}
-            attempted_sync=${{ steps.sync.outputs.attempted_sync }} pushed=${{ steps.sync.outputs.pushed }}
+            pull: ${{ steps.sync_pull.outcome }}
+            push Gitee: ${{ steps.sync_push_gitee.outcome }}
+            push Codeup: ${{ steps.sync_push_codeup.outcome }}
+
+            branches: ${{ steps.sync_outputs.outputs.sync_branches }}
+            attempted_sync=${{ steps.sync_outputs.outputs.attempted_sync }}
+            pushed_gitee=${{ steps.sync_outputs.outputs.pushed_gitee }}
+            pushed_codeup=${{ steps.sync_outputs.outputs.pushed_codeup }}
 
             Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 

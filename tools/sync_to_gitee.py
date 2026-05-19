@@ -2119,6 +2119,26 @@ def verify_patches(root: Path) -> None:
     raise RuntimeError("verify_patches 失败（不会提交/推送）：\n  - " + "\n  - ".join(errors))
 
 
+def ci_sync_state_path() -> Path:
+  return REPO_ROOT / ".ci-cache" / "sync_ci_state.json"
+
+
+def save_ci_sync_state(state: dict[str, object]) -> None:
+  p = ci_sync_state_path()
+  p.parent.mkdir(parents=True, exist_ok=True)
+  p.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def load_ci_sync_state() -> dict[str, object]:
+  p = ci_sync_state_path()
+  if not p.exists():
+    return {}
+  try:
+    return json.loads(p.read_text(encoding="utf-8"))
+  except json.JSONDecodeError:
+    return {}
+
+
 def write_ci_github_output(state: dict[str, object]) -> None:
   """供 GitHub Actions 读取 steps.sync.outputs.*（双场景邮件条件）。"""
   if os.environ.get("GITHUB_ACTIONS") != "true":
@@ -2127,7 +2147,9 @@ def write_ci_github_output(state: dict[str, object]) -> None:
   if not path:
     return
   attempted = bool(state.get("attempted"))
-  pushed = bool(state.get("pushed"))
+  pushed_gitee = bool(state.get("pushed_gitee"))
+  pushed_codeup = bool(state.get("pushed_codeup"))
+  pushed = bool(state.get("pushed")) or pushed_gitee or pushed_codeup
   branches = state.get("branches") or []
   br_line = ",".join(str(b) for b in branches) if branches else ""
   reason_tags: list[str] = list(state.get("sync_reason_tags") or [])
@@ -2143,7 +2165,13 @@ def write_ci_github_output(state: dict[str, object]) -> None:
     else:
       variant = "mixed"
 
-  line_ok = "sunnypilot_cn → Gitee 同步成功（本轮已执行补丁校验并完成推送）。"
+  push_bits: list[str] = []
+  if pushed_gitee:
+    push_bits.append("Gitee")
+  if pushed_codeup:
+    push_bits.append("Codeup")
+  dest = "、".join(push_bits) if push_bits else "远端"
+  line_ok = f"sunnypilot_cn → {dest} 同步成功（本轮已执行补丁校验并完成推送）。"
   if variant == "force_only":
     line_note = "说明：本次为手动 Force 强制重同步（上游 superproject 提交相对上次写入 Gitee 的记录一致，仍重跑补丁并推送）。"
   elif variant == "upstream_only":
@@ -2173,6 +2201,8 @@ def write_ci_github_output(state: dict[str, object]) -> None:
   with open(path, "a", encoding="utf-8") as f:
     f.write(f"attempted_sync={'true' if attempted else 'false'}\n")
     f.write(f"pushed={'true' if pushed else 'false'}\n")
+    f.write(f"pushed_gitee={'true' if pushed_gitee else 'false'}\n")
+    f.write(f"pushed_codeup={'true' if pushed_codeup else 'false'}\n")
     f.write(f"sync_branches={br_line}\n")
     f.write(f"notify_variant={variant}\n")
     f.write(f"notify_success_body<<{delim}\n")
@@ -2481,9 +2511,12 @@ def main() -> None:
       help="已废弃：此前将本地 master 强推到远端 staging。当前仅同步 staging，此选项无操作。",
   )
   ap.add_argument("--action",
-                  choices=["menu", "pull", "push", "all"],
+                  choices=["menu", "pull", "push", "push-gitee", "push-codeup", "emit-outputs", "all"],
                   default="menu",
-                  help="执行模式：menu=交互菜单（默认）；pull=仅拉取+打补丁；push=仅推送；all=pull+push")
+                  help=(
+                    "执行模式：menu=交互菜单；pull=拉取+补丁；push=推全部启用源；"
+                    "push-gitee/push-codeup=仅推一端（CI 分步）；emit-outputs=写 GITHUB_OUTPUT；all=pull+push"
+                  ))
   ap.add_argument("--build-installer", action="store_true", default=False, help="在 larch64 设备上构建 installer（需要 extras=on）")
   ap.add_argument("--sync-mapd-release", action="store_true", default=False, help="同步 mapd 二进制到 Gitee Release（需要 GITEE_TOKEN）")
   ap.add_argument("--comma-host", default=COMMA_HOST_DEFAULT, help="comma 设备 IP/域名（用于远程编译 installer）")
@@ -2509,7 +2542,15 @@ def main() -> None:
     )
   ci_sync_state: dict[str, object] | None = None
   try:
-    ci_sync_state = {"attempted": False, "pushed": False, "branches": [], "sync_reason_tags": []}
+    ci_sync_state: dict[str, object] = {
+      "attempted": False,
+      "pushed": False,
+      "pushed_gitee": False,
+      "pushed_codeup": False,
+      "to_push": False,
+      "branches": [],
+      "sync_reason_tags": [],
+    }
     # load optional .env next to this repo (never committed)
     sp_dotenv = load_dotenv(REPO_ROOT / ".env")
     for k, v in sp_dotenv.items():
@@ -2704,11 +2745,22 @@ def main() -> None:
              "commit", "--allow-empty", "-m", msg], str(root), env=env)
       return True
 
-    def push_branch(branch: str) -> None:
+    def push_branch(
+      branch: str,
+      *,
+      targets: set[str] | None = None,
+      squash_first: bool = False,
+    ) -> bool:
+      """推送单个分支；targets 为 {"gitee","codeup"} 子集。返回是否执行过至少一次 push。"""
       codeup_ssh_url = (env.get("ALIYUN_REPO_SSH") or main_repo_source_codeup().ssh_url).strip()
-      push_sources = enabled_main_repo_push_sources()
-      if _env_truthy("SYNC_GITEE_SINGLE_COMMIT"):
+      want = targets or {s.id for s in enabled_main_repo_push_sources()}
+      push_sources = [s for s in enabled_main_repo_push_sources() if s.id in want]
+      if not push_sources:
+        log("push", f"{branch}: 无匹配的推送目标（targets={want}）")
+        return False
+      if squash_first and _env_truthy("SYNC_GITEE_SINGLE_COMMIT"):
         squash_branch_single_commit(root, branch, env)
+      did_push = False
 
       def _push_gitee() -> None:
         origin_env = dict(env)
@@ -2759,8 +2811,11 @@ def main() -> None:
       for src in push_sources:
         if src.id == "gitee":
           retry(f"git push origin {branch}", _push_gitee, tries=4, base_sleep_s=2.0)
+          did_push = True
         elif src.id == "codeup":
           retry(f"git push aliyun {branch}", _push_codeup, tries=4, base_sleep_s=2.0)
+          did_push = True
+      return did_push
 
     def pull_all() -> list[str]:
       to_push: list[str] = []
@@ -2769,16 +2824,30 @@ def main() -> None:
           to_push.append(b)
       return to_push
 
-    def push_all(branches: list[str] | None = None) -> None:
+    def push_all(
+      branches: list[str] | None = None,
+      *,
+      targets: set[str] | None = None,
+      squash_first: bool = False,
+    ) -> bool:
       branches = branches or list(SYNC_BRANCHES)
+      any_pushed = False
       for b in branches:
-        # 只 push 本地存在的分支，避免 src refspec 不存在
         try:
           run(["git", "show-ref", "--verify", "--quiet", f"refs/heads/{b}"], str(root), env=env)
         except Exception:
           print(f"[skip] push {b}: local branch missing")
           continue
-        push_branch(b)
+        if push_branch(b, targets=targets, squash_first=squash_first and not any_pushed):
+          any_pushed = True
+      return any_pushed
+
+    def _branches_to_push_from_state() -> list[str]:
+      st = load_ci_sync_state()
+      if not st.get("to_push"):
+        return []
+      br = st.get("branches") or []
+      return [str(b) for b in br] if br else list(SYNC_BRANCHES)
 
     def maybe_sync_mapd_release() -> None:
       if not args.sync_mapd_release:
@@ -2790,17 +2859,29 @@ def main() -> None:
 
     def do_all() -> None:
       to_push = pull_all()
-      # 注意：Gitee LFS 可能导致 SSH 连接不稳定；默认跳过 LFS 上传（可自行取消环境变量）
+      _finalize_pull_state(to_push)
       env.setdefault("GIT_LFS_SKIP_PUSH", "1")
       if not to_push:
         print("[skip] no branches changed; nothing to push")
       else:
-        push_all(to_push)
-        assert ci_sync_state is not None
-        ci_sync_state["pushed"] = True
+        if push_all(to_push, squash_first=True):
+          assert ci_sync_state is not None
+          enabled_ids = {s.id for s in enabled_main_repo_push_sources()}
+          ci_sync_state["pushed"] = True
+          if "gitee" in enabled_ids:
+            ci_sync_state["pushed_gitee"] = True
+          if "codeup" in enabled_ids:
+            ci_sync_state["pushed_codeup"] = True
       if args.force_staging:
         log("warn", "--force-staging 已废弃：当前仅同步 staging，不再执行 master→staging 强推。")
       maybe_sync_mapd_release()
+
+    def _finalize_pull_state(to_push: list[str]) -> None:
+      assert ci_sync_state is not None
+      ci_sync_state["to_push"] = bool(to_push)
+      if to_push:
+        ci_sync_state["branches"] = list(to_push)
+      save_ci_sync_state(ci_sync_state)
 
     def interactive_menu() -> None:
       if not sys.stdin.isatty():
@@ -2839,14 +2920,42 @@ def main() -> None:
     if args.action == "menu":
       interactive_menu()
     elif args.action == "pull":
-      pull_all()
+      to_push = pull_all()
+      _finalize_pull_state(to_push)
       maybe_sync_mapd_release()
     elif args.action == "push":
       env.setdefault("GIT_LFS_SKIP_PUSH", "1")
-      push_all()
+      branches = _branches_to_push_from_state() or list(SYNC_BRANCHES)
+      if push_all(branches, squash_first=True):
+        assert ci_sync_state is not None
+        ci_sync_state["pushed"] = True
+        ci_sync_state["pushed_gitee"] = True
+        ci_sync_state["pushed_codeup"] = True
+        save_ci_sync_state(ci_sync_state)
       if args.force_staging:
         log("warn", "--force-staging 已废弃：当前仅同步 staging，不再执行 master→staging 强推。")
       maybe_sync_mapd_release()
+    elif args.action == "push-gitee":
+      env.setdefault("GIT_LFS_SKIP_PUSH", "1")
+      branches = _branches_to_push_from_state()
+      if not branches:
+        print("[skip] push-gitee: pull 阶段未产生待推送分支（upstream 未变？）")
+      elif push_all(branches, targets={"gitee"}, squash_first=True):
+        st = load_ci_sync_state()
+        st["pushed_gitee"] = True
+        st["pushed"] = True
+        save_ci_sync_state(st)
+    elif args.action == "push-codeup":
+      branches = _branches_to_push_from_state()
+      if not branches:
+        print("[skip] push-codeup: pull 阶段未产生待推送分支（upstream 未变？）")
+      elif push_all(branches, targets={"codeup"}, squash_first=False):
+        st = load_ci_sync_state()
+        st["pushed_codeup"] = True
+        st["pushed"] = bool(st.get("pushed")) or True
+        save_ci_sync_state(st)
+    elif args.action == "emit-outputs":
+      write_ci_github_output(load_ci_sync_state())
     elif args.action == "all":
       do_all()
     else:
@@ -2862,6 +2971,7 @@ def main() -> None:
         pass
     try:
       if ci_sync_state is not None and args.action == "all":
+        save_ci_sync_state(ci_sync_state)
         write_ci_github_output(ci_sync_state)
     except Exception:
       pass
