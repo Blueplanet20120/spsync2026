@@ -171,8 +171,8 @@ jobs:
           # 成功邮件里上游 git log：仅「当日」自然日（默认 UTC；需要可改 Asia/Shanghai 等）
           SYNC_EMAIL_LOG_TZ: "UTC"
           SYNC_EMAIL_LOG_MAX: "6"
-          # 与 .env 中 sp-cn-token 同名；若已添加 GitHub Secret 则供 TICI installer HTTPS 克隆 Codeup
-          sp-cn-token: ${{ secrets.SP_CN_TOKEN }}
+          # 与本地 .env 的 sp-cn-token 同值；仅 --build-installer 时需要（常规同步可省略）
+          SP_CN_TOKEN: ${{ secrets.SP_CN_TOKEN }}
         run: |
           set -euo pipefail
 

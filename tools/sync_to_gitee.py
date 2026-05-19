@@ -211,26 +211,30 @@ def squash_branch_single_commit(root: Path, branch: str, env: dict[str, str]) ->
 def sp_cn_token_from_env(env: dict[str, str] | None = None) -> str:
   """个人访问令牌（PAT），用于 Codeup HTTPS 克隆（如 TICI 远程编译）。"""
   e = env if env is not None else os.environ
-  t = (e.get(SP_CN_TOKEN_ENV) or "").strip().strip('"')
+  # 本地 .env 用 sp-cn-token；GitHub Actions 建议 Secret 名 SP_CN_TOKEN（env 不宜含连字符）
+  t = (e.get(SP_CN_TOKEN_ENV) or e.get("SP_CN_TOKEN") or "").strip().strip('"')
   if t:
     return t
   dotenv_path = REPO_ROOT / ".env"
   if dotenv_path.exists():
-    t = (load_dotenv(dotenv_path).get(SP_CN_TOKEN_ENV) or "").strip().strip('"')
+    dot = load_dotenv(dotenv_path)
+    t = (dot.get(SP_CN_TOKEN_ENV) or dot.get("SP_CN_TOKEN") or "").strip().strip('"')
     if t:
       return t
   return ""
 
 
-def ensure_sp_cn_token(env: dict[str, str]) -> None:
+def ensure_sp_cn_token(env: dict[str, str], *, required: bool = False) -> None:
   t = sp_cn_token_from_env(env)
   if t:
     env.setdefault(SP_CN_TOKEN_ENV, t)
+    env.setdefault("SP_CN_TOKEN", t)
     return
-  log(
-    "warn",
-    f"未设置 {SP_CN_TOKEN_ENV}（可在 {REPO_ROOT / '.env'} 配置；TICI 远程 Codeup 克隆需要）",
-  )
+  if required:
+    log(
+      "warn",
+      f"未设置 {SP_CN_TOKEN_ENV} / SP_CN_TOKEN（可在 {REPO_ROOT / '.env'} 或 GitHub Secret 配置；TICI 远程 Codeup 克隆需要）",
+    )
 
 
 def aliyun_ssh_key_path() -> Path:
@@ -2368,7 +2372,7 @@ def main() -> None:
     sp_dotenv = load_dotenv(REPO_ROOT / ".env")
     for k, v in sp_dotenv.items():
       env.setdefault(k, v)
-    ensure_sp_cn_token(env)
+    ensure_sp_cn_token(env, required=args.build_installer)
 
     if (
       os.environ.get("SP_SYNC_SOURCE", "").strip().lower() == "local"
