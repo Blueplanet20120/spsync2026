@@ -31,6 +31,7 @@ import time
 import urllib.error
 import urllib.request
 import traceback
+from urllib.parse import quote
 from pathlib import Path
 from dataclasses import dataclass, field
 from zoneinfo import ZoneInfo
@@ -263,12 +264,26 @@ def aliyun_git_https_push_env(base_env: dict[str, str]) -> dict[str, str]:
 
 
 def aliyun_push_via_https(env: dict[str, str]) -> bool:
-  """有 SP_CN_TOKEN 时默认走 HTTPS；ALIYUN_PUSH_SSH=1 强制 SSH。"""
+  """
+  ALIYUN_PUSH_SSH=1 → 仅 SSH；ALIYUN_PUSH_HTTPS=1 → 有令牌则 HTTPS。
+  默认 auto：CI/本机已有 ~/.ssh/sp-cn 时优先 SSH；仅无 SSH 私钥时用 HTTPS 令牌。
+  """
   if _env_truthy("ALIYUN_PUSH_SSH"):
     return False
   if _env_truthy("ALIYUN_PUSH_HTTPS"):
     return bool(sp_cn_token_from_env(env))
+  if aliyun_ssh_key_path().exists():
+    return False
   return bool(sp_cn_token_from_env(env))
+
+
+def _is_codeup_https_auth_error(exc: BaseException) -> bool:
+  msg = str(exc)
+  return (
+    "Authentication failed" in msg
+    or "克隆账号或密码错误" in msg
+    or "Https克隆" in msg
+  )
 
 
 def aliyun_push_available(env: dict[str, str]) -> bool:
@@ -286,10 +301,17 @@ def aliyun_push_available(env: dict[str, str]) -> bool:
   return False
 
 
-def codeup_https_url_with_token(token: str) -> str:
-  """Codeup HTTPS 克隆/推送：用户名 oauth2，密码为个人 HTTPS 密码或令牌。"""
+def codeup_https_url_with_token(token: str, env: dict[str, str] | None = None) -> str:
+  """
+  Codeup HTTPS 克隆/推送。密码须 URL 编码（如 ! → %21）。
+  用户名默认 oauth2；若云效页面给出专用克隆账号，可设环境变量 ALIYUN_CODEUP_USER。
+  """
+  e = env or {}
+  user = (e.get("ALIYUN_CODEUP_USER") or "oauth2").strip() or "oauth2"
+  pw = quote(token.strip().strip('"'), safe="")
+  user_q = quote(user, safe="")
   host_path = ALIYUN_REPO_HTTPS.removeprefix("https://")
-  return f"https://oauth2:{token}@{host_path}"
+  return f"https://{user_q}:{pw}@{host_path}"
 
 
 def run_ssh(host: str, user: str, key_path: str, remote_cmd: str, timeout_s: int = 3600) -> str:
@@ -2584,27 +2606,42 @@ def main() -> None:
         origin_env["GIT_LFS_SKIP_PUSH"] = "1"
         run(["git", "push", "-f", "-u", "origin", branch], str(root), env=origin_env)
 
-      def _push_aliyun() -> None:
-        if aliyun_push_via_https(env):
-          token = sp_cn_token_from_env(env)
-          push_url = codeup_https_url_with_token(token)
-          run(["git", "remote", "set-url", "aliyun", push_url], str(root), env=env)
-          try:
-            run(
-              ["git", "push", "-f", "-u", "aliyun", branch],
-              str(root),
-              env=aliyun_git_https_push_env(env),
-            )
-          finally:
-            run(["git", "remote", "set-url", "aliyun", aliyun_ssh_url], str(root), env=env)
-          log("push", f"{branch}: aliyun pushed via HTTPS (Codeup 官方方式)")
-        else:
+      def _push_aliyun_ssh() -> None:
+        run(
+          ["git", "push", "-f", "-u", "aliyun", branch],
+          str(root),
+          env=aliyun_git_push_env(env),
+        )
+        log("push", f"{branch}: aliyun pushed via SSH")
+
+      def _push_aliyun_https() -> None:
+        token = sp_cn_token_from_env(env)
+        if not token:
+          raise RuntimeError(f"缺少 {SP_CN_TOKEN_ENV}/SP_CN_TOKEN，无法 HTTPS 推送到 Codeup")
+        push_url = codeup_https_url_with_token(token, env)
+        run(["git", "remote", "set-url", "aliyun", push_url], str(root), env=env)
+        try:
           run(
             ["git", "push", "-f", "-u", "aliyun", branch],
             str(root),
-            env=aliyun_git_push_env(env),
+            env=aliyun_git_https_push_env(env),
           )
-          log("push", f"{branch}: aliyun pushed via SSH")
+        finally:
+          run(["git", "remote", "set-url", "aliyun", aliyun_ssh_url], str(root), env=env)
+        log("push", f"{branch}: aliyun pushed via HTTPS (Codeup)")
+
+      def _push_aliyun() -> None:
+        if aliyun_push_via_https(env):
+          try:
+            _push_aliyun_https()
+          except RuntimeError as e:
+            if _is_codeup_https_auth_error(e) and aliyun_ssh_key_path().exists():
+              log("warn", "Codeup HTTPS 认证失败，回退 SSH push（请核对 SP_CN_TOKEN 或改用 SSH）")
+              _push_aliyun_ssh()
+            else:
+              raise
+        else:
+          _push_aliyun_ssh()
 
       retry(f"git push origin {branch}", _push_origin, tries=4, base_sleep_s=2.0)
       if aliyun_push_available(env):
