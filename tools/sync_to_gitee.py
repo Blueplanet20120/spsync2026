@@ -83,11 +83,6 @@ def default_workdir(repo_root: Path) -> Path:
 
 
 WORKDIR_DEFAULT = str(default_workdir(REPO_ROOT))
-REPO_DEFAULT = "git@gitee.com:xc2026/sunnypilot_cn.git"
-ALIYUN_REPO_DEFAULT = "git@codeup.aliyun.com:6a0b0c8d706afd34aa607161/sunnypilot_cn.git"
-ALIYUN_REPO_HTTPS = "https://codeup.aliyun.com/6a0b0c8d706afd34aa607161/sunnypilot_cn.git"
-ALIYUN_SSH_KEY_DEFAULT = "~/.ssh/sp-cn"
-SP_CN_TOKEN_ENV = "sp-cn-token"
 UPSTREAM_DEFAULT = "https://github.com/sunnypilot/sunnypilot.git"
 
 COMMA_HOST_DEFAULT = "10.90.1.231"
@@ -98,6 +93,93 @@ INSTALLER_REPO_DEFAULT = "https://gitee.com/xc2026/sp-cn_install.git"
 GITEE_OWNER = "xc2026"
 MAPD_REPO = "openpilot-mapd"
 MAPD_UPSTREAM = "pfeiferj/openpilot-mapd"
+
+ALIYUN_SSH_KEY_DEFAULT = "~/.ssh/sp-cn"
+SP_CN_TOKEN_ENV = "sp-cn-token"
+
+# 设备/安装器主仓拉取源（子模块与 Catch2/models/mapd 等仍固定 Gitee xc2026）
+MAIN_REPO_DEVICE_DEFAULT = "codeup"  # "gitee" | "codeup"，也可用环境变量 MAIN_REPO_DEVICE 覆盖
+
+
+@dataclass(frozen=True)
+class MainRepoSource:
+  """主仓库 sunnypilot_cn 的一个发布端（Gitee 或 Codeup）。"""
+  id: str
+  label: str
+  ssh_url: str
+  https_url: str
+  installer_ssh_define: str
+  version_remote_key: str
+  git_remote_name: str
+  push_lfs_skip: bool
+
+
+def main_repo_source_gitee() -> MainRepoSource:
+  """主仓 · Gitee（xc2026/sunnypilot_cn）。"""
+  return MainRepoSource(
+    id="gitee",
+    label="Gitee",
+    ssh_url="git@gitee.com:xc2026/sunnypilot_cn.git",
+    https_url="https://gitee.com/xc2026/sunnypilot_cn.git",
+    installer_ssh_define='#define GIT_SSH_URL "git@gitee.com:xc2026/sunnypilot_cn.git"',
+    version_remote_key="gitee.com/xc2026/sunnypilot_cn",
+    git_remote_name="origin",
+    push_lfs_skip=True,
+  )
+
+
+def main_repo_source_codeup() -> MainRepoSource:
+  """主仓 · 阿里云效 Codeup。"""
+  return MainRepoSource(
+    id="codeup",
+    label="Codeup",
+    ssh_url="git@codeup.aliyun.com:6a0b0c8d706afd34aa607161/sunnypilot_cn.git",
+    https_url="https://codeup.aliyun.com/6a0b0c8d706afd34aa607161/sunnypilot_cn.git",
+    installer_ssh_define=(
+      '#define GIT_SSH_URL "git@codeup.aliyun.com:6a0b0c8d706afd34aa607161/sunnypilot_cn.git"'
+    ),
+    version_remote_key="codeup.aliyun.com/6a0b0c8d706afd34aa607161/sunnypilot_cn",
+    git_remote_name="aliyun",
+    push_lfs_skip=False,
+  )
+
+
+def enabled_main_repo_push_sources() -> list[MainRepoSource]:
+  """
+  同步时推送到哪些主仓远端。注释掉下面某一行即关闭该端推送。
+  设备从哪拉主仓由 MAIN_REPO_DEVICE_DEFAULT / MAIN_REPO_DEVICE 决定（与推送可不同）。
+  """
+  sources: list[MainRepoSource] = []
+  sources.append(main_repo_source_gitee())   # 推 Gitee（git remote origin）
+  sources.append(main_repo_source_codeup())  # 推 Codeup（git remote aliyun）
+  return sources
+
+
+def main_repo_device_source() -> MainRepoSource:
+  """设备/安装器/ setup.sh 写入的主仓拉取源。"""
+  want = (os.environ.get("MAIN_REPO_DEVICE") or MAIN_REPO_DEVICE_DEFAULT).strip().lower()
+  by_id = {
+    main_repo_source_gitee().id: main_repo_source_gitee(),
+    main_repo_source_codeup().id: main_repo_source_codeup(),
+  }
+  if want not in by_id:
+    raise SystemExit(f"MAIN_REPO_DEVICE 无效: {want!r}（可用: {', '.join(by_id)})")
+  return by_id[want]
+
+
+def main_repo_source_by_id(source_id: str) -> MainRepoSource:
+  for s in (main_repo_source_gitee(), main_repo_source_codeup()):
+    if s.id == source_id:
+      return s
+  raise KeyError(source_id)
+
+
+# 兼容旧常量 / workflow 参数
+_gitee = main_repo_source_gitee()
+_codeup = main_repo_source_codeup()
+REPO_DEFAULT = _gitee.ssh_url
+ALIYUN_REPO_DEFAULT = _codeup.ssh_url
+ALIYUN_REPO_HTTPS = _codeup.https_url
 
 
 def _maybe_git_fetch_progress(cmd: list[str]) -> list[str]:
@@ -310,7 +392,7 @@ def codeup_https_url_with_token(token: str, env: dict[str, str] | None = None) -
   user = (e.get("ALIYUN_CODEUP_USER") or "oauth2").strip() or "oauth2"
   pw = quote(token.strip().strip('"'), safe="")
   user_q = quote(user, safe="")
-  host_path = ALIYUN_REPO_HTTPS.removeprefix("https://")
+  host_path = main_repo_source_codeup().https_url.removeprefix("https://")
   return f"https://{user_q}:{pw}@{host_path}"
 
 
@@ -419,8 +501,12 @@ def build_comma_installer_staging(host: str, user: str, key_path: str, out_dir: 
   run_ssh(host, user, key_path, "echo connected && uname -m && test -f /TICI && echo HAS_/TICI || echo NO_/TICI", timeout_s=30)
 
   remote_root = "/data/tmp/sp_build/sunnypilot_cn"
+  device = main_repo_device_source()
   token = sp_cn_token_from_env()
-  repo_url_https = codeup_https_url_with_token(token) if token else ALIYUN_REPO_HTTPS
+  if device.id == "codeup" and token:
+    repo_url_https = codeup_https_url_with_token(token)
+  else:
+    repo_url_https = device.https_url
   if not token:
     log("warn", f"TICI 远程克隆未嵌入 PAT（缺少 {SP_CN_TOKEN_ENV}），将使用无鉴权 HTTPS")
   target = "selfdrive/ui/installer/installers/installer_openpilot_staging"
@@ -1237,6 +1323,7 @@ def _track_change(res: PatchResult, path: Path, changed: bool) -> None:
 
 def patch_installer_urls(root: Path) -> PatchResult:
   res = PatchResult("installer_urls")
+  device = main_repo_device_source()
   installer = root / "selfdrive/ui/installer/installer.cc"
   s = installer.read_text(encoding="utf-8")
   s2 = apply_text_replacement_rows(
@@ -1244,7 +1331,7 @@ def patch_installer_urls(root: Path) -> PatchResult:
     [
       (
         _with_git_url_variants("https://github.com/commaai/openpilot.git"),
-        "https://gitee.com/xc2026/sunnypilot_cn.git",
+        device.https_url,
       ),
       (
         [
@@ -1252,7 +1339,7 @@ def patch_installer_urls(root: Path) -> PatchResult:
           "#define GIT_SSH_URL 'git@github.com:commaai/openpilot.git'",
           '#define GIT_SSH_URL "git@github.com:commaai/openpilot"',
         ],
-        '#define GIT_SSH_URL "git@gitee.com:xc2026/sunnypilot_cn.git"',
+        device.installer_ssh_define,
       ),
     ],
     path=installer,
@@ -1264,9 +1351,10 @@ def patch_installer_urls(root: Path) -> PatchResult:
 
 def patch_version_py(root: Path) -> PatchResult:
   res = PatchResult("system_version_py")
+  device = main_repo_device_source()
   version_py = root / "system/version.py"
   s = version_py.read_text(encoding="utf-8")
-  key = "gitee.com/xc2026/sunnypilot_cn"
+  key = device.version_remote_key
   if key in s:
     return res
   try:
@@ -1480,6 +1568,9 @@ def patch_mici_setup(root: Path) -> PatchResult:
 
 def patch_setup_sh(root: Path) -> PatchResult:
   res = PatchResult("tools_setup_sh")
+  device = main_repo_device_source()
+  repo_base = device.https_url.removesuffix(".git")
+  contrib = f"{repo_base}/blob/staging/docs/CONTRIBUTING.md"
   setup_sh = root / "tools/setup.sh"
   s = setup_sh.read_text(encoding="utf-8")
   s2 = apply_text_replacement_rows(
@@ -1487,24 +1578,26 @@ def patch_setup_sh(root: Path) -> PatchResult:
     [
       (
         _with_git_url_variants("https://github.com/commaai/openpilot.git"),
-        "https://gitee.com/xc2026/sunnypilot_cn.git",
+        device.https_url,
       ),
       (
         [
           "https://github.com/commaai/openpilot/blob/master/docs/CONTRIBUTING.md",
           "https://github.com/commaai/openpilot/blob/staging/docs/CONTRIBUTING.md",
         ],
-        "https://gitee.com/xc2026/sunnypilot_cn/blob/staging/docs/CONTRIBUTING.md",
+        contrib,
       ),
     ],
     path=setup_sh,
     require_all=True,
   )
   # 此前补丁写入 blob/master；远端已无 master 时需迁移为 staging
-  s2 = s2.replace(
-    "https://gitee.com/xc2026/sunnypilot_cn/blob/master/docs/CONTRIBUTING.md",
-    "https://gitee.com/xc2026/sunnypilot_cn/blob/staging/docs/CONTRIBUTING.md",
-  )
+  for old_base in (main_repo_source_gitee().https_url.removesuffix(".git"),
+                   main_repo_source_codeup().https_url.removesuffix(".git")):
+    s2 = s2.replace(
+      f"{old_base}/blob/master/docs/CONTRIBUTING.md",
+      contrib,
+    )
   _track_change(res, setup_sh, write_if_changed(setup_sh, s2))
   return res
 
@@ -1926,20 +2019,23 @@ def verify_patches(root: Path) -> None:
       return ""
     return p.read_text(encoding="utf-8", errors="replace")
 
+  device = main_repo_device_source()
   inst = rt("selfdrive/ui/installer/installer.cc")
   if not inst.strip():
     errors.append("selfdrive/ui/installer/installer.cc: 文件缺失或为空")
-  elif "gitee.com/xc2026/sunnypilot_cn" not in inst and "git@gitee.com:xc2026/sunnypilot_cn" not in inst:
-    errors.append("installer.cc: 未包含 Gitee sunnypilot_cn 安装源")
+  elif device.version_remote_key not in inst and device.installer_ssh_define not in inst:
+    errors.append(
+      f"installer.cc: 未包含主仓安装源（{device.label} / {device.version_remote_key}）",
+    )
 
-  if "gitee.com/xc2026/sunnypilot_cn" not in rt("system/version.py"):
-    errors.append("system/version.py: sunnypilot_remote 元组中缺少 Gitee URL")
+  if device.version_remote_key not in rt("system/version.py"):
+    errors.append(f"system/version.py: sunnypilot_remote 元组中缺少主仓 URL（{device.label}）")
 
   if "ensure_url_insteadof" not in rt("system/updated/updated.py"):
     errors.append("system/updated/updated.py: 缺少 ensure_url_insteadof 注入")
 
-  if "gitee.com/xc2026/sunnypilot_cn" not in rt("tools/setup.sh"):
-    errors.append("tools/setup.sh: 缺少 Gitee sunnypilot_cn URL")
+  if device.version_remote_key not in rt("tools/setup.sh"):
+    errors.append(f"tools/setup.sh: 缺少主仓 URL（{device.label}）")
 
   if (root / "msgq_repo/setup.sh").exists() and "gitee.com/xc2026/Catch2" not in rt("msgq_repo/setup.sh"):
     errors.append("msgq_repo/setup.sh: 缺少 Gitee Catch2 URL")
@@ -2419,6 +2515,13 @@ def main() -> None:
     for k, v in sp_dotenv.items():
       env.setdefault(k, v)
     ensure_sp_cn_token(env, required=args.build_installer)
+    _push_sources = enabled_main_repo_push_sources()
+    _device_src = main_repo_device_source()
+    log(
+      "config",
+      f"主仓设备拉取={_device_src.label}({_device_src.id})；"
+      f"推送={', '.join(s.label for s in _push_sources) or '（无，请检查 enabled_main_repo_push_sources）'}",
+    )
 
     if (
       os.environ.get("SP_SYNC_SOURCE", "").strip().lower() == "local"
@@ -2439,13 +2542,18 @@ def main() -> None:
     if "upstream" not in remotes:
       run(["git", "remote", "add", "upstream", args.upstream], str(root), env=env)
     run(["git", "remote", "set-url", "upstream", args.upstream], str(root), env=env)
+    gitee_src = main_repo_source_gitee()
+    origin_url = (args.origin or gitee_src.ssh_url).strip()
     if "origin" not in remotes:
-      run(["git", "remote", "add", "origin", args.origin], str(root), env=env)
-    run(["git", "remote", "set-url", "origin", args.origin], str(root), env=env)
-    aliyun_url = (env.get("ALIYUN_REPO_SSH") or ALIYUN_REPO_DEFAULT).strip()
-    if "aliyun" not in remotes:
-      run(["git", "remote", "add", "aliyun", aliyun_url], str(root), env=env)
-    run(["git", "remote", "set-url", "aliyun", aliyun_url], str(root), env=env)
+      run(["git", "remote", "add", "origin", origin_url], str(root), env=env)
+    run(["git", "remote", "set-url", "origin", origin_url], str(root), env=env)
+    codeup_src = main_repo_source_codeup()
+    codeup_url = (env.get("ALIYUN_REPO_SSH") or codeup_src.ssh_url).strip()
+    need_codeup_remote = any(s.id == "codeup" for s in _push_sources) or _device_src.id == "codeup"
+    if need_codeup_remote:
+      if "aliyun" not in remotes:
+        run(["git", "remote", "add", "aliyun", codeup_url], str(root), env=env)
+      run(["git", "remote", "set-url", "aliyun", codeup_url], str(root), env=env)
 
     fu_cmd, fu_log = upstream_fetch_argv()
     log("git", fu_log)
@@ -2597,24 +2705,26 @@ def main() -> None:
       return True
 
     def push_branch(branch: str) -> None:
-      aliyun_ssh_url = (env.get("ALIYUN_REPO_SSH") or ALIYUN_REPO_DEFAULT).strip()
+      codeup_ssh_url = (env.get("ALIYUN_REPO_SSH") or main_repo_source_codeup().ssh_url).strip()
+      push_sources = enabled_main_repo_push_sources()
       if _env_truthy("SYNC_GITEE_SINGLE_COMMIT"):
         squash_branch_single_commit(root, branch, env)
 
-      def _push_origin() -> None:
+      def _push_gitee() -> None:
         origin_env = dict(env)
         origin_env["GIT_LFS_SKIP_PUSH"] = "1"
         run(["git", "push", "-f", "-u", "origin", branch], str(root), env=origin_env)
+        log("push", f"{branch}: {main_repo_source_gitee().label} pushed (origin)")
 
-      def _push_aliyun_ssh() -> None:
+      def _push_codeup_ssh() -> None:
         run(
           ["git", "push", "-f", "-u", "aliyun", branch],
           str(root),
           env=aliyun_git_push_env(env),
         )
-        log("push", f"{branch}: aliyun pushed via SSH")
+        log("push", f"{branch}: {main_repo_source_codeup().label} pushed via SSH (aliyun)")
 
-      def _push_aliyun_https() -> None:
+      def _push_codeup_https() -> None:
         token = sp_cn_token_from_env(env)
         if not token:
           raise RuntimeError(f"缺少 {SP_CN_TOKEN_ENV}/SP_CN_TOKEN，无法 HTTPS 推送到 Codeup")
@@ -2627,27 +2737,30 @@ def main() -> None:
             env=aliyun_git_https_push_env(env),
           )
         finally:
-          run(["git", "remote", "set-url", "aliyun", aliyun_ssh_url], str(root), env=env)
-        log("push", f"{branch}: aliyun pushed via HTTPS (Codeup)")
+          run(["git", "remote", "set-url", "aliyun", codeup_ssh_url], str(root), env=env)
+        log("push", f"{branch}: {main_repo_source_codeup().label} pushed via HTTPS (aliyun)")
 
-      def _push_aliyun() -> None:
+      def _push_codeup() -> None:
+        if not aliyun_push_available(env):
+          log("push", f"{branch}: {main_repo_source_codeup().label} push skipped（无 SSH 密钥且无 HTTPS 令牌）")
+          return
         if aliyun_push_via_https(env):
           try:
-            _push_aliyun_https()
+            _push_codeup_https()
           except RuntimeError as e:
             if _is_codeup_https_auth_error(e) and aliyun_ssh_key_path().exists():
-              log("warn", "Codeup HTTPS 认证失败，回退 SSH push（请核对 SP_CN_TOKEN 或改用 SSH）")
-              _push_aliyun_ssh()
+              log("warn", "Codeup HTTPS 认证失败，回退 SSH push")
+              _push_codeup_ssh()
             else:
               raise
         else:
-          _push_aliyun_ssh()
+          _push_codeup_ssh()
 
-      retry(f"git push origin {branch}", _push_origin, tries=4, base_sleep_s=2.0)
-      if aliyun_push_available(env):
-        retry(f"git push aliyun {branch}", _push_aliyun, tries=4, base_sleep_s=2.0)
-      else:
-        log("push", f"{branch}: aliyun push skipped")
+      for src in push_sources:
+        if src.id == "gitee":
+          retry(f"git push origin {branch}", _push_gitee, tries=4, base_sleep_s=2.0)
+        elif src.id == "codeup":
+          retry(f"git push aliyun {branch}", _push_codeup, tries=4, base_sleep_s=2.0)
 
     def pull_all() -> list[str]:
       to_push: list[str] = []
