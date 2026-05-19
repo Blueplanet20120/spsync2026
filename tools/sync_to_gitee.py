@@ -2940,7 +2940,7 @@ def main() -> None:
       branches = _branches_to_push_from_state()
       if not branches:
         print("[skip] push-gitee: pull 阶段未产生待推送分支（upstream 未变？）")
-      elif push_all(branches, targets={"gitee"}, squash_first=True):
+      elif push_all(branches, targets={"gitee"}, squash_first=False):
         st = load_ci_sync_state()
         st["pushed_gitee"] = True
         st["pushed"] = True
@@ -2949,7 +2949,7 @@ def main() -> None:
       branches = _branches_to_push_from_state()
       if not branches:
         print("[skip] push-codeup: pull 阶段未产生待推送分支（upstream 未变？）")
-      elif push_all(branches, targets={"codeup"}, squash_first=False):
+      elif push_all(branches, targets={"codeup"}, squash_first=True):
         st = load_ci_sync_state()
         st["pushed_codeup"] = True
         st["pushed"] = bool(st.get("pushed")) or True
