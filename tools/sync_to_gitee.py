@@ -98,7 +98,7 @@ ALIYUN_SSH_KEY_DEFAULT = "~/.ssh/sp-cn"
 SP_CN_TOKEN_ENV = "sp-cn-token"
 
 # 设备/安装器主仓拉取源（子模块与 Catch2/models/mapd 等仍固定 Gitee xc2026）
-MAIN_REPO_DEVICE_DEFAULT = "codeup"  # "gitee" | "codeup"，也可用环境变量 MAIN_REPO_DEVICE 覆盖
+MAIN_REPO_DEVICE_DEFAULT = "gitee"  # "gitee" | "codeup"，也可用环境变量 MAIN_REPO_DEVICE 覆盖
 
 
 @dataclass(frozen=True)
