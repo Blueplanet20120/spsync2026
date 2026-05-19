@@ -137,6 +137,24 @@ jobs:
           path: .ci-cache/gitee-known_hosts
           key: gitee-known-hosts-v1
 
+      - name: Setup Codeup SSH key (Aliyun)
+        shell: bash
+        env:
+          ALIYUN_SSH_PRIVATE_KEY: ${{ secrets.ALIYUN_SSH_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          if [ -z "${ALIYUN_SSH_PRIVATE_KEY:-}" ]; then
+            echo "::warning::ALIYUN_SSH_PRIVATE_KEY 未配置，将跳过云效 push"
+            exit 0
+          fi
+          printf '%s\n' "$ALIYUN_SSH_PRIVATE_KEY" > ~/.ssh/sp-cn
+          chmod 600 ~/.ssh/sp-cn
+          grep -q 'BEGIN.*PRIVATE KEY' ~/.ssh/sp-cn
+          ssh-keyscan -T 15 -t rsa,ecdsa,ed25519 codeup.aliyun.com >> ~/.ssh/known_hosts 2>/dev/null || true
+          echo "[codeup] wrote ~/.ssh/sp-cn for sync_to_gitee aliyun remote"
+
       - name: Sync upstream -> patch -> push to Gitee
         id: sync
         shell: bash
@@ -153,6 +171,8 @@ jobs:
           # 成功邮件里上游 git log：仅「当日」自然日（默认 UTC；需要可改 Asia/Shanghai 等）
           SYNC_EMAIL_LOG_TZ: "UTC"
           SYNC_EMAIL_LOG_MAX: "6"
+          # 与 .env 中 sp-cn-token 同名；若已添加 GitHub Secret 则供 TICI installer HTTPS 克隆 Codeup
+          sp-cn-token: ${{ secrets.SP_CN_TOKEN }}
         run: |
           set -euo pipefail
 

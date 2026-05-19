@@ -83,6 +83,10 @@ def default_workdir(repo_root: Path) -> Path:
 
 WORKDIR_DEFAULT = str(default_workdir(REPO_ROOT))
 REPO_DEFAULT = "git@gitee.com:xc2026/sunnypilot_cn.git"
+ALIYUN_REPO_DEFAULT = "git@codeup.aliyun.com:6a0b0c8d706afd34aa607161/Codeup-Demo.git"
+ALIYUN_REPO_HTTPS = "https://codeup.aliyun.com/6a0b0c8d706afd34aa607161/Codeup-Demo.git"
+ALIYUN_SSH_KEY_DEFAULT = "~/.ssh/sp-cn"
+SP_CN_TOKEN_ENV = "sp-cn-token"
 UPSTREAM_DEFAULT = "https://github.com/sunnypilot/sunnypilot.git"
 
 COMMA_HOST_DEFAULT = "10.90.1.231"
@@ -204,6 +208,62 @@ def squash_branch_single_commit(root: Path, branch: str, env: dict[str, str]) ->
   log("push", f"{branch}: squashed to single commit (Gitee quota); run Gitee Git GC if push still rejected")
 
 
+def sp_cn_token_from_env(env: dict[str, str] | None = None) -> str:
+  """个人访问令牌（PAT），用于 Codeup HTTPS 克隆（如 TICI 远程编译）。"""
+  e = env if env is not None else os.environ
+  t = (e.get(SP_CN_TOKEN_ENV) or "").strip().strip('"')
+  if t:
+    return t
+  dotenv_path = REPO_ROOT / ".env"
+  if dotenv_path.exists():
+    t = (load_dotenv(dotenv_path).get(SP_CN_TOKEN_ENV) or "").strip().strip('"')
+    if t:
+      return t
+  return ""
+
+
+def ensure_sp_cn_token(env: dict[str, str]) -> None:
+  t = sp_cn_token_from_env(env)
+  if t:
+    env.setdefault(SP_CN_TOKEN_ENV, t)
+    return
+  log(
+    "warn",
+    f"未设置 {SP_CN_TOKEN_ENV}（可在 {REPO_ROOT / '.env'} 配置；TICI 远程 Codeup 克隆需要）",
+  )
+
+
+def aliyun_ssh_key_path() -> Path:
+  raw = (os.environ.get("ALIYUN_SSH_KEY") or ALIYUN_SSH_KEY_DEFAULT).strip()
+  return Path(raw).expanduser()
+
+
+def aliyun_git_push_env(base_env: dict[str, str]) -> dict[str, str]:
+  """推送到云效：专用 SSH 密钥，并启用 LFS 上传。"""
+  out = dict(base_env)
+  key = aliyun_ssh_key_path()
+  out["GIT_SSH_COMMAND"] = (
+    f"ssh -i {key} -o StrictHostKeyChecking=no -o BatchMode=yes"
+  )
+  out["GIT_LFS_SKIP_PUSH"] = "0"
+  return out
+
+
+def can_push_aliyun() -> bool:
+  if _env_truthy("SYNC_SKIP_ALIYUN_PUSH"):
+    return False
+  key = aliyun_ssh_key_path()
+  if not key.exists():
+    log("warn", f"跳过 aliyun push：SSH 私钥不存在 ({key})")
+    return False
+  return True
+
+
+def codeup_https_url_with_token(token: str) -> str:
+  host_path = ALIYUN_REPO_HTTPS.removeprefix("https://")
+  return f"https://oauth2:{token}@{host_path}"
+
+
 def run_ssh(host: str, user: str, key_path: str, remote_cmd: str, timeout_s: int = 3600) -> str:
   key = Path(key_path)
   if not key.exists():
@@ -309,7 +369,10 @@ def build_comma_installer_staging(host: str, user: str, key_path: str, out_dir: 
   run_ssh(host, user, key_path, "echo connected && uname -m && test -f /TICI && echo HAS_/TICI || echo NO_/TICI", timeout_s=30)
 
   remote_root = "/data/tmp/sp_build/sunnypilot_cn"
-  repo_url_https = "https://gitee.com/xc2026/sunnypilot_cn.git"
+  token = sp_cn_token_from_env()
+  repo_url_https = codeup_https_url_with_token(token) if token else ALIYUN_REPO_HTTPS
+  if not token:
+    log("warn", f"TICI 远程克隆未嵌入 PAT（缺少 {SP_CN_TOKEN_ENV}），将使用无鉴权 HTTPS")
   target = "selfdrive/ui/installer/installers/installer_openpilot_staging"
 
   remote_cmd = r"""
@@ -2305,6 +2368,7 @@ def main() -> None:
     sp_dotenv = load_dotenv(REPO_ROOT / ".env")
     for k, v in sp_dotenv.items():
       env.setdefault(k, v)
+    ensure_sp_cn_token(env)
 
     if (
       os.environ.get("SP_SYNC_SOURCE", "").strip().lower() == "local"
@@ -2328,6 +2392,10 @@ def main() -> None:
     if "origin" not in remotes:
       run(["git", "remote", "add", "origin", args.origin], str(root), env=env)
     run(["git", "remote", "set-url", "origin", args.origin], str(root), env=env)
+    aliyun_url = (env.get("ALIYUN_REPO_SSH") or ALIYUN_REPO_DEFAULT).strip()
+    if "aliyun" not in remotes:
+      run(["git", "remote", "add", "aliyun", aliyun_url], str(root), env=env)
+    run(["git", "remote", "set-url", "aliyun", aliyun_url], str(root), env=env)
 
     fu_cmd, fu_log = upstream_fetch_argv()
     log("git", fu_log)
@@ -2479,12 +2547,26 @@ def main() -> None:
       return True
 
     def push_branch(branch: str) -> None:
-      def _do_push() -> None:
-        if _env_truthy("SYNC_GITEE_SINGLE_COMMIT"):
-          squash_branch_single_commit(root, branch, env)
-        run(["git", "push", "-f", "-u", "origin", branch], str(root), env=env)
+      if _env_truthy("SYNC_GITEE_SINGLE_COMMIT"):
+        squash_branch_single_commit(root, branch, env)
 
-      retry(f"git push origin {branch}", _do_push, tries=4, base_sleep_s=2.0)
+      def _push_origin() -> None:
+        origin_env = dict(env)
+        origin_env["GIT_LFS_SKIP_PUSH"] = "1"
+        run(["git", "push", "-f", "-u", "origin", branch], str(root), env=origin_env)
+
+      def _push_aliyun() -> None:
+        run(
+          ["git", "push", "-f", "-u", "aliyun", branch],
+          str(root),
+          env=aliyun_git_push_env(env),
+        )
+
+      retry(f"git push origin {branch}", _push_origin, tries=4, base_sleep_s=2.0)
+      if can_push_aliyun():
+        retry(f"git push aliyun {branch}", _push_aliyun, tries=4, base_sleep_s=2.0)
+      else:
+        log("push", f"{branch}: aliyun push skipped")
 
     def pull_all() -> list[str]:
       to_push: list[str] = []
@@ -2535,7 +2617,7 @@ def main() -> None:
       while True:
         print("\n=== sync_to_gitee 菜单（CI 路径请用 --action all；mapd/installer 请用 sync_to_gitee_local.py）===")
         print("1) 拉取 upstream + 仅对 staging 应用补丁 + 更新子模块（不推送）")
-        print("2) 推送本地 staging 到 Gitee（强推）")
+        print("2) 推送本地 staging 到 Gitee + 云效 Codeup（强推）")
         print("3) 一键执行（1 + 2）")
         print("0) 退出\n")
         choice = input("请选择操作 [0-3]: ").strip()
