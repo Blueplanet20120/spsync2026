@@ -11,8 +11,8 @@ run-name: >-
 
 on:
   schedule:
-    # 每 5 小时第 23 分钟（UTC）：0/5/10/15/20 点；避开整点扎堆，仍可能有数分钟抖动。
-    - cron: "23 */5 * * *"
+    # 每 2 小时第 23 分钟（UTC）：0/2/4/…/22 点；避开整点扎堆，仍可能有数分钟抖动。
+    - cron: "23 */2 * * *"
   workflow_dispatch:
     inputs:
       force_sync:
