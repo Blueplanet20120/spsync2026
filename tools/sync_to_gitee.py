@@ -179,6 +179,31 @@ def retry(op_name: str, fn, tries: int = 3, base_sleep_s: float = 1.0) -> any:
   raise last
 
 
+def _env_truthy(name: str, *, default: str = "") -> bool:
+  raw = (os.environ.get(name) or default).strip().lower()
+  return raw in ("1", "true", "yes", "on", "y")
+
+
+def squash_branch_single_commit(root: Path, branch: str, env: dict[str, str]) -> None:
+  """
+  Gitee 免费版单仓库约 1GB；长期推送完整 upstream 历史会超限。
+  推送前将分支压成单提交（orphan），仅保留当前树与提交说明（含 upstream-{branch} SHA）。
+  车端 git fetch + reset 仍可用；跳过同步仍靠提交正文里的 upstream SHA。
+  注意：远端体积需偶尔在 Gitee 仓库设置执行「Git GC」回收旧对象。
+  """
+  run(["git", "checkout", branch], str(root), env=env)
+  msg = run(["git", "log", "-1", "--format=%B"], str(root), env=env).rstrip() + "\n"
+  tmp = f"__sp_squash_{branch}"
+  run(["git", "checkout", "--orphan", tmp], str(root), env=env)
+  run(["git", "add", "-A"], str(root), env=env)
+  run(["git",
+       "-c", "user.name=sunnypilot-cn-bot",
+       "-c", "user.email=sunnypilot-cn-bot@local",
+       "commit", "-m", msg], str(root), env=env)
+  run(["git", "branch", "-M", branch], str(root), env=env)
+  log("push", f"{branch}: squashed to single commit (Gitee quota); run Gitee Git GC if push still rejected")
+
+
 def run_ssh(host: str, user: str, key_path: str, remote_cmd: str, timeout_s: int = 3600) -> str:
   key = Path(key_path)
   if not key.exists():
@@ -2455,6 +2480,8 @@ def main() -> None:
 
     def push_branch(branch: str) -> None:
       def _do_push() -> None:
+        if _env_truthy("SYNC_GITEE_SINGLE_COMMIT"):
+          squash_branch_single_commit(root, branch, env)
         run(["git", "push", "-f", "-u", "origin", branch], str(root), env=env)
 
       retry(f"git push origin {branch}", _do_push, tries=4, base_sleep_s=2.0)

@@ -144,6 +144,9 @@ jobs:
           GITEE_REPO_SSH: ${{ secrets.GITEE_REPO_SSH }}
           # 避免 CI 因 LFS 推送耗时/不稳定而失败（脚本内部也会 setdefault）
           GIT_LFS_SKIP_PUSH: "1"
+          # Gitee 免费版约 1GB：推送前压成单提交，避免累积完整 upstream 历史（车端仍 fetch 分支 tip）
+          # 若仍报 size exceeds limit，请先在 Gitee 仓库设置执行一次 Git GC 回收旧对象。
+          SYNC_GITEE_SINGLE_COMMIT: "1"
           # 仅当上游子模块指针发生变化时才更新子模块（提速且更接近本地行为）
           SKIP_SUBMODULES: "auto"
           FORCE_SYNC: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.force_sync == 'true' && '1' || '' }}
