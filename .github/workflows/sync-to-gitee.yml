@@ -11,8 +11,8 @@ run-name: >-
 
 on:
   schedule:
-    # 每小时第 23 分钟（UTC），避开大量仓库扎堆整点触发；仍可能有数分钟抖动。
-    - cron: "23 * * * *"
+    # 每 5 小时第 23 分钟（UTC）：0/5/10/15/20 点；避开整点扎堆，仍可能有数分钟抖动。
+    - cron: "23 */5 * * *"
   workflow_dispatch:
     inputs:
       force_sync:
