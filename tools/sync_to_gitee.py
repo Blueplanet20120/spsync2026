@@ -885,12 +885,10 @@ def _render_cn_main_repo_route_py(gitee: MainRepoSource, codeup: MainRepoSource)
   return f'''#!/usr/bin/env python3
 # {_CN_MAIN_REPO_ROUTE_SENTINEL} — sunnypilot_cn dynamic main-repo routing (private key = author flag)
 import os
-import shutil
 import subprocess
 from pathlib import Path
 
 DATA_CODEUP_KEY = "/data/ssh/id_ed25519_codeup"
-ROOT_CODEUP_KEY = "/root/.ssh/id_ed25519_codeup"
 CODEUP_HOST = "codeup.aliyun.com"
 
 GITEE_HTTPS_URL = "{gitee.https_url}"
@@ -917,24 +915,6 @@ def ensure_codeup_ssh_key() -> None:
   try:
     data.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(data, 0o600)
-  except OSError:
-    pass
-  # /root 可写时（少数环境）再复制一份，兼容旧文档；车机常态跳过
-  root_ssh = Path(ROOT_CODEUP_KEY)
-  root_dir = root_ssh.parent
-  try:
-    if not os.access(str(root_dir), os.W_OK):
-      return
-    root_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    if root_ssh.exists():
-      try:
-        if root_ssh.read_bytes() == data.read_bytes():
-          os.chmod(root_ssh, 0o600)
-          return
-      except OSError:
-        pass
-    shutil.copy2(data, root_ssh)
-    os.chmod(root_ssh, 0o600)
   except OSError:
     pass
 
@@ -2350,6 +2330,8 @@ def verify_patches(root: Path) -> None:
         errors.append(f"system/cn_main_repo_route.py: 缺少 {fn}")
     if codeup.ssh_url not in route_tx or gitee.https_url not in route_tx:
       errors.append("system/cn_main_repo_route.py: 缺少 Gitee/Codeup 双地址常量")
+    if "/root/.ssh" in route_tx or "ROOT_CODEUP_KEY" in route_tx:
+      errors.append("system/cn_main_repo_route.py: 仍引用 /root/.ssh（C4 只读会导致 OTA Permission denied）")
 
   inst = rt("selfdrive/ui/installer/installer.cc")
   if not inst.strip():
