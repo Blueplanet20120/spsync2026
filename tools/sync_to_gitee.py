@@ -18,6 +18,8 @@
 """
 
 import argparse
+import ast
+import compileall
 import json
 import os
 import py_compile
@@ -97,8 +99,8 @@ MAPD_UPSTREAM = "pfeiferj/openpilot-mapd"
 ALIYUN_SSH_KEY_DEFAULT = "~/.ssh/sp-cn"
 SP_CN_TOKEN_ENV = "sp-cn-token"
 
-# 设备/安装器主仓拉取源（子模块与 Catch2/models/mapd 等仍固定 Gitee xc2026）
-MAIN_REPO_DEVICE_DEFAULT = "gitee"  # "gitee" | "codeup"，也可用环境变量 MAIN_REPO_DEVICE 覆盖
+# 设备/安装器静态补丁默认 Gitee；车端 OTA 实际主仓由 cn_main_repo_route 按私钥运行时选择。
+MAIN_REPO_DEVICE_DEFAULT = "gitee"  # "gitee" | "codeup"，也可用 MAIN_REPO_DEVICE 覆盖（仅静态补丁如 setup.sh）
 
 
 @dataclass(frozen=True)
@@ -874,6 +876,118 @@ def ensure_gitee_in_sunnypilot_remote_tuple_flex(s: str, gitee_key: str) -> str:
   raise RuntimeError("version.py: 未找到 sunnypilot_remote 元组块，无法注入 Gitee URL")
 
 
+_CN_MAIN_REPO_ROUTE_SENTINEL = "CN_MAIN_REPO_ROUTE_V1"
+_CN_MICI_HOME_SUFFIX_SENTINEL = "cn_mici_home_repo_suffix"
+_CN_INSTALLER_ROUTE_SENTINEL = "cn_main_repo_route_installer"
+
+
+def _render_cn_main_repo_route_py(gitee: MainRepoSource, codeup: MainRepoSource) -> str:
+  return f'''#!/usr/bin/env python3
+# {_CN_MAIN_REPO_ROUTE_SENTINEL} — sunnypilot_cn dynamic main-repo routing (private key = author flag)
+import os
+import shutil
+import subprocess
+from pathlib import Path
+
+DATA_CODEUP_KEY = "/data/ssh/id_ed25519_codeup"
+ROOT_CODEUP_KEY = "/root/.ssh/id_ed25519_codeup"
+CODEUP_HOST = "codeup.aliyun.com"
+
+GITEE_HTTPS_URL = "{gitee.https_url}"
+GITEE_SSH_URL = "{gitee.ssh_url}"
+CODEUP_HTTPS_URL = "{codeup.https_url}"
+CODEUP_SSH_URL = "{codeup.ssh_url}"
+GITEE_VERSION_REMOTE_KEY = "{gitee.version_remote_key}"
+CODEUP_VERSION_REMOTE_KEY = "{codeup.version_remote_key}"
+
+
+def is_author_device() -> bool:
+  return Path(DATA_CODEUP_KEY).is_file()
+
+
+def ensure_codeup_ssh_key() -> None:
+  data = Path(DATA_CODEUP_KEY)
+  if not data.is_file():
+    return
+  root_ssh = Path(ROOT_CODEUP_KEY)
+  root_dir = root_ssh.parent
+  root_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+  if root_ssh.exists():
+    try:
+      if root_ssh.read_bytes() == data.read_bytes():
+        os.chmod(root_ssh, 0o600)
+        return
+    except OSError:
+      pass
+  shutil.copy2(data, root_ssh)
+  os.chmod(root_ssh, 0o600)
+
+
+def git_ssh_command_codeup() -> str | None:
+  if not is_author_device():
+    return None
+  ensure_codeup_ssh_key()
+  return (
+    f"ssh -i {{ROOT_CODEUP_KEY}} -o IdentitiesOnly=yes "
+    "-o StrictHostKeyChecking=accept-new -o BatchMode=yes"
+  )
+
+
+def main_repo_ui_suffix() -> str:
+  return " (codeup)" if is_author_device() else " (Gitee)"
+
+
+def resolve_main_repo_urls() -> tuple[str, str]:
+  if is_author_device():
+    return CODEUP_HTTPS_URL, CODEUP_SSH_URL
+  return GITEE_HTTPS_URL, GITEE_SSH_URL
+
+
+def _git_remote_get_url(cwd: str) -> str:
+  try:
+    return subprocess.check_output(
+      ["git", "remote", "get-url", "origin"],
+      cwd=cwd,
+      stderr=subprocess.DEVNULL,
+      encoding="utf-8",
+    ).strip()
+  except subprocess.CalledProcessError:
+    return ""
+
+
+def prepare_main_repo_git(cwd: str) -> None:
+  https_url, ssh_url = resolve_main_repo_urls()
+  cmd = git_ssh_command_codeup()
+  if cmd:
+    os.environ["GIT_SSH_COMMAND"] = cmd
+  else:
+    os.environ.pop("GIT_SSH_COMMAND", None)
+
+  want = ssh_url if is_author_device() else https_url
+  origin = _git_remote_get_url(cwd)
+  if origin != want:
+    subprocess.check_call(["git", "remote", "set-url", "origin", want], cwd=cwd)
+'''
+
+
+def inject_updated_cn_route_hook(s: str) -> str:
+  """在 setup_git_options 开头注入主仓动态路由（Update sunnypilot 检查/下载前）。"""
+  if "prepare_main_repo_git(cwd)" in s:
+    return s
+  hook = (
+    "  from openpilot.system.cn_main_repo_route import prepare_main_repo_git\n"
+    "  prepare_main_repo_git(cwd)\n\n"
+  )
+  anchors = [
+    "def setup_git_options(cwd: str) -> None:\n",
+    "def setup_git_options(cwd: str):\n",
+  ]
+  for a in anchors:
+    if a in s:
+      return s.replace(a, a + hook, 1)
+  raise RuntimeError("updated.py: 未找到 setup_git_options，无法注入 prepare_main_repo_git")
+
+
 def inject_updated_insteadof_block_flex(s: str) -> str:
   """在 updated.py 中注入 ensure_url_insteadof；兼容上游微调 for option 循环。"""
   if "ensure_url_insteadof(" in s:
@@ -1321,46 +1435,148 @@ def _track_change(res: PatchResult, path: Path, changed: bool) -> None:
     res.changed_files.append(str(path))
 
 
-def patch_installer_urls(root: Path) -> PatchResult:
-  res = PatchResult("installer_urls")
-  device = main_repo_device_source()
-  installer = root / "selfdrive/ui/installer/installer.cc"
-  s = installer.read_text(encoding="utf-8")
+_INSTALLER_CN_ROUTE_BLOCK = '''
+#include <unistd.h>
+
+// cn_main_repo_route_installer — author: /data/ssh/id_ed25519_codeup → Codeup, else Gitee public
+static const char *CN_DATA_CODEUP_KEY = "/data/ssh/id_ed25519_codeup";
+static const char *CN_GITEE_HTTPS = "https://gitee.com/xc2026/sunnypilot_cn.git";
+static const char *CN_GITEE_SSH = "git@gitee.com:xc2026/sunnypilot_cn.git";
+static const char *CN_CODEUP_HTTPS = "https://codeup.aliyun.com/6a0b0c8d706afd34aa607161/sunnypilot_cn.git";
+static const char *CN_CODEUP_SSH = "git@codeup.aliyun.com:6a0b0c8d706afd34aa607161/sunnypilot_cn.git";
+
+static bool cn_is_author_device() {
+  return access(CN_DATA_CODEUP_KEY, F_OK) == 0;
+}
+
+static std::string cn_main_repo_https_url() {
+  return cn_is_author_device() ? CN_CODEUP_HTTPS : CN_GITEE_HTTPS;
+}
+
+static std::string cn_main_repo_ssh_url() {
+  return cn_is_author_device() ? CN_CODEUP_SSH : CN_GITEE_SSH;
+}
+
+static void cn_prepare_installer_git_env() {
+  if (!cn_is_author_device()) {
+    unsetenv("GIT_SSH_COMMAND");
+    return;
+  }
+  setenv("GIT_SSH_COMMAND",
+         "ssh -i /root/.ssh/id_ed25519_codeup -o IdentitiesOnly=yes "
+         "-o StrictHostKeyChecking=accept-new -o BatchMode=yes",
+         1);
+}
+
+'''
+
+
+def _inject_installer_cn_route(s: str, gitee: MainRepoSource) -> str:
+  """刷机安装器：有私钥走 Codeup，无钥走 Gitee 公开。"""
   s2 = apply_text_replacement_rows(
     s,
     [
       (
         _with_git_url_variants("https://github.com/commaai/openpilot.git"),
-        device.https_url,
-      ),
-      (
-        [
-          '#define GIT_SSH_URL "git@github.com:commaai/openpilot.git"',
-          "#define GIT_SSH_URL 'git@github.com:commaai/openpilot.git'",
-          '#define GIT_SSH_URL "git@github.com:commaai/openpilot"',
-        ],
-        device.installer_ssh_define,
+        gitee.https_url,
       ),
     ],
-    path=installer,
-    require_all=True,
+    path=Path("installer.cc"),
+    require_all=False,
   )
+  if _CN_INSTALLER_ROUTE_SENTINEL not in s2:
+    anchor = '#include "third_party/raylib/include/raylib.h"\n'
+    if anchor not in s2:
+      raise RuntimeError("installer.cc: 未找到 raylib include，无法注入 cn_main_repo_route_installer")
+    s2 = s2.replace(anchor, anchor + _INSTALLER_CN_ROUTE_BLOCK, 1)
+
+  git_url_line = re.compile(
+    r'const std::string GIT_URL = get_str\("[^"]+"\s*\?[^;]+;\s*\n',
+    re.MULTILINE,
+  )
+  if git_url_line.search(s2):
+    s2 = git_url_line.sub("", s2, count=1)
+
+  if "#define GIT_SSH_URL" in s2:
+    s2 = re.sub(r'#define GIT_SSH_URL[^\n]+\n', "", s2, count=1)
+
+  if "std::string git_url = cn_main_repo_https_url()" not in s2:
+    s2 = s2.replace(
+      "int freshClone() {\n",
+      "int freshClone() {\n  cn_prepare_installer_git_env();\n",
+      1,
+    )
+    s2 = s2.replace(
+      '  std::string cmd = util::string_format("git clone --progress %s -b %s --depth=1 --recurse-submodules %s 2>&1",\n'
+      "                                        GIT_URL.c_str(), migrated_branch.c_str(), TMP_INSTALL_PATH);",
+      '  std::string git_url = cn_main_repo_https_url();\n'
+      '  std::string cmd = util::string_format("git clone --progress %s -b %s --depth=1 --recurse-submodules %s 2>&1",\n'
+      "                                        git_url.c_str(), migrated_branch.c_str(), TMP_INSTALL_PATH);",
+      1,
+    )
+    s2 = s2.replace(
+      "int cachedFetch(const std::string &cache) {\n",
+      "int cachedFetch(const std::string &cache) {\n  cn_prepare_installer_git_env();\n",
+      1,
+    )
+    s2 = s2.replace(
+      'run(util::string_format("cd %s && git remote set-url origin %s", TMP_INSTALL_PATH, GIT_URL.c_str()).c_str());',
+      'run(util::string_format("cd %s && git remote set-url origin %s", TMP_INSTALL_PATH, cn_main_repo_https_url().c_str()).c_str());',
+      1,
+    )
+    old_push = (
+      '  run(("cd " + INSTALL_PATH + " && "\n'
+      '      "git remote set-url origin --push " GIT_SSH_URL " && "\n'
+      '      "git config --replace-all remote.origin.fetch \\"+refs/heads/*:refs/remotes/origin/*\\"").c_str());'
+    )
+    new_push = (
+      '  run(("cd " + INSTALL_PATH + " && "\n'
+      '      "git remote set-url origin --push " + cn_main_repo_ssh_url() + " && "\n'
+      '      "git config --replace-all remote.origin.fetch \\"+refs/heads/*:refs/remotes/origin/*\\"").c_str());'
+    )
+    if old_push in s2:
+      s2 = s2.replace(old_push, new_push, 1)
+    elif "GIT_SSH_URL" in s2:
+      s2 = re.sub(
+        r'"git remote set-url origin --push " GIT_SSH_URL " && "',
+        '"git remote set-url origin --push " + cn_main_repo_ssh_url() + " && "',
+        s2,
+        count=1,
+      )
+  return s2
+
+
+def patch_cn_main_repo_route_py(root: Path) -> PatchResult:
+  res = PatchResult("cn_main_repo_route_py")
+  route_py = root / "system/cn_main_repo_route.py"
+  body = _render_cn_main_repo_route_py(main_repo_source_gitee(), main_repo_source_codeup())
+  _track_change(res, route_py, write_if_changed(route_py, body))
+  return res
+
+
+def patch_installer_urls(root: Path) -> PatchResult:
+  res = PatchResult("installer_urls")
+  gitee = main_repo_source_gitee()
+  installer = root / "selfdrive/ui/installer/installer.cc"
+  s = installer.read_text(encoding="utf-8")
+  s2 = _inject_installer_cn_route(s, gitee)
   _track_change(res, installer, write_if_changed(installer, s2))
   return res
 
 
 def patch_version_py(root: Path) -> PatchResult:
   res = PatchResult("system_version_py")
-  device = main_repo_device_source()
+  gitee = main_repo_source_gitee()
+  codeup = main_repo_source_codeup()
   version_py = root / "system/version.py"
   s = version_py.read_text(encoding="utf-8")
-  key = device.version_remote_key
-  if key in s:
-    return res
-  try:
-    s2 = ensure_gitee_in_sunnypilot_remote_tuple_flex(s, key)
-  except RuntimeError:
-    s2 = ensure_line_in_tuple_block(s, key)
+  s2 = s
+  for key in (gitee.version_remote_key, codeup.version_remote_key):
+    if key not in s2:
+      try:
+        s2 = ensure_gitee_in_sunnypilot_remote_tuple_flex(s2, key)
+      except RuntimeError:
+        s2 = ensure_line_in_tuple_block(s2, key)
   _track_change(res, version_py, write_if_changed(version_py, s2))
   return res
 
@@ -1370,7 +1586,28 @@ def patch_updated_insteadof(root: Path) -> PatchResult:
   updated_py = root / "system/updated/updated.py"
   s = updated_py.read_text(encoding="utf-8")
   s2 = inject_updated_insteadof_block_flex(s)
+  s2 = inject_updated_cn_route_hook(s2)
   _track_change(res, updated_py, write_if_changed(updated_py, s2))
+  return res
+
+
+def patch_mici_home_repo_suffix(root: Path) -> PatchResult:
+  res = PatchResult("mici_home_repo_suffix")
+  home_py = root / "selfdrive/ui/mici/layouts/home.py"
+  if not home_py.exists():
+    return res
+  s = home_py.read_text(encoding="utf-8")
+  if "main_repo_ui_suffix" in s:
+    return res
+  old = "    return version, branch, commit[:7], date_str"
+  new = (
+    "    from openpilot.system.cn_main_repo_route import main_repo_ui_suffix\n"
+    "    return version, branch, commit[:7] + main_repo_ui_suffix(), date_str"
+  )
+  if old not in s:
+    raise RuntimeError(f"{home_py}: 未找到 _get_version_text return，无法注入 {_CN_MICI_HOME_SUFFIX_SENTINEL}")
+  s2 = s.replace(old, new, 1)
+  _track_change(res, home_py, write_if_changed(home_py, s2))
   return res
 
 
@@ -1985,9 +2222,11 @@ def patch_gitmodules(root: Path) -> PatchResult:
 
 def patch_all(root: Path) -> list[PatchResult]:
   patches = [
+    patch_cn_main_repo_route_py,
     patch_installer_urls,
     patch_version_py,
     patch_updated_insteadof,
+    patch_mici_home_repo_suffix,
     patch_tici_setup,
     patch_mici_setup,
     patch_setup_sh,
@@ -2006,6 +2245,34 @@ def patch_all(root: Path) -> list[PatchResult]:
   return results
 
 
+def _verify_python_syntax(root: Path, rel_paths: list[str]) -> list[str]:
+  out: list[str] = []
+  for rel in rel_paths:
+    p = root / rel
+    if not p.exists():
+      continue
+    src = p.read_text(encoding="utf-8", errors="replace")
+    try:
+      ast.parse(src, filename=str(p))
+    except SyntaxError as e:
+      out.append(f"{rel}: ast.parse 失败: {e}")
+  return out
+
+
+def _verify_no_debug_markers(root: Path, rel_paths: list[str]) -> list[str]:
+  needles = ("breakpoint()", "pdb.set_trace()", "# SYNC_DEBUG")
+  out: list[str] = []
+  for rel in rel_paths:
+    p = root / rel
+    if not p.exists():
+      continue
+    tx = p.read_text(encoding="utf-8", errors="replace")
+    for n in needles:
+      if n in tx:
+        out.append(f"{rel}: 含调试标记 {n!r}，禁止推送半成品")
+  return out
+
+
 def verify_patches(root: Path) -> None:
   """
   补丁后的门禁校验：失败则阻止提交/推送，避免半成品国内化进入 Gitee。
@@ -2019,23 +2286,49 @@ def verify_patches(root: Path) -> None:
       return ""
     return p.read_text(encoding="utf-8", errors="replace")
 
-  device = main_repo_device_source()
+  gitee = main_repo_source_gitee()
+  codeup = main_repo_source_codeup()
+
+  route_tx = rt("system/cn_main_repo_route.py")
+  if _CN_MAIN_REPO_ROUTE_SENTINEL not in route_tx:
+    errors.append("system/cn_main_repo_route.py: 缺少路由模块或 sentinel")
+  else:
+    for fn in ("ensure_codeup_ssh_key", "prepare_main_repo_git", "main_repo_ui_suffix"):
+      if f"def {fn}" not in route_tx:
+        errors.append(f"system/cn_main_repo_route.py: 缺少 {fn}")
+    if codeup.ssh_url not in route_tx or gitee.https_url not in route_tx:
+      errors.append("system/cn_main_repo_route.py: 缺少 Gitee/Codeup 双地址常量")
+
   inst = rt("selfdrive/ui/installer/installer.cc")
   if not inst.strip():
     errors.append("selfdrive/ui/installer/installer.cc: 文件缺失或为空")
-  elif device.version_remote_key not in inst and device.installer_ssh_define not in inst:
-    errors.append(
-      f"installer.cc: 未包含主仓安装源（{device.label} / {device.version_remote_key}）",
-    )
+  elif _CN_INSTALLER_ROUTE_SENTINEL not in inst:
+    errors.append("installer.cc: 缺少 cn_main_repo_route_installer 运行时路由")
+  elif gitee.https_url not in inst or codeup.ssh_url not in inst:
+    errors.append("installer.cc: 缺少 Gitee/Codeup 双地址常量")
+  elif "std::string git_url = cn_main_repo_https_url()" not in inst:
+    errors.append("installer.cc: freshClone/cachedFetch 未使用 cn_main_repo_https_url 运行时选 URL")
+  elif "GIT_URL.c_str()" in inst:
+    errors.append("installer.cc: 仍使用编译期 GIT_URL，未切到运行时路由")
 
-  if device.version_remote_key not in rt("system/version.py"):
-    errors.append(f"system/version.py: sunnypilot_remote 元组中缺少主仓 URL（{device.label}）")
+  ver = rt("system/version.py")
+  if gitee.version_remote_key not in ver:
+    errors.append(f"system/version.py: sunnypilot_remote 元组中缺少 {gitee.label} URL")
+  if codeup.version_remote_key not in ver:
+    errors.append(f"system/version.py: sunnypilot_remote 元组中缺少 {codeup.label} URL")
 
-  if "ensure_url_insteadof" not in rt("system/updated/updated.py"):
+  upd = rt("system/updated/updated.py")
+  if "ensure_url_insteadof" not in upd:
     errors.append("system/updated/updated.py: 缺少 ensure_url_insteadof 注入")
+  if "prepare_main_repo_git(cwd)" not in upd:
+    errors.append("system/updated/updated.py: 缺少 prepare_main_repo_git 注入")
 
-  if device.version_remote_key not in rt("tools/setup.sh"):
-    errors.append(f"tools/setup.sh: 缺少主仓 URL（{device.label}）")
+  if gitee.version_remote_key not in rt("tools/setup.sh"):
+    errors.append(f"tools/setup.sh: 缺少主仓 URL（{gitee.label} 公开默认）")
+
+  home_py = root / "selfdrive/ui/mici/layouts/home.py"
+  if home_py.exists() and "main_repo_ui_suffix" not in rt("selfdrive/ui/mici/layouts/home.py"):
+    errors.append("selfdrive/ui/mici/layouts/home.py: 缺少 main_repo_ui_suffix（主页 commit 后缀）")
 
   if (root / "msgq_repo/setup.sh").exists() and "gitee.com/xc2026/Catch2" not in rt("msgq_repo/setup.sh"):
     errors.append("msgq_repo/setup.sh: 缺少 Gitee Catch2 URL")
@@ -2098,15 +2391,19 @@ def verify_patches(root: Path) -> None:
 
   # 语法兜底（不验证逻辑正确性）
   py_verify = [
+    "system/cn_main_repo_route.py",
     "system/version.py",
     "system/updated/updated.py",
     "system/ui/tici_setup.py",
     "system/ui/mici_setup.py",
+    "selfdrive/ui/mici/layouts/home.py",
     "sunnypilot/models/fetcher.py",
     "selfdrive/ui/sunnypilot/layouts/settings/osm.py",
     "sunnypilot/mapd/mapd_installer.py",
     "selfdrive/monitoring/helpers.py",
   ]
+  errors.extend(_verify_python_syntax(root, py_verify))
+  errors.extend(_verify_no_debug_markers(root, py_verify))
   for rel in py_verify:
     p = root / rel
     if p.exists():
@@ -2114,6 +2411,12 @@ def verify_patches(root: Path) -> None:
         py_compile.compile(str(p), doraise=True)
       except py_compile.PyCompileError as e:
         errors.append(f"{rel}: py_compile 失败: {e}")
+
+  for sub in ("system",):
+    d = root / sub
+    if d.is_dir():
+      if not compileall.compile_dir(str(d), quiet=1):
+        errors.append(f"{sub}/: compileall 失败")
 
   if errors:
     raise RuntimeError("verify_patches 失败（不会提交/推送）：\n  - " + "\n  - ".join(errors))
@@ -2752,6 +3055,8 @@ def main() -> None:
       squash_first: bool = False,
     ) -> bool:
       """推送单个分支；targets 为 {"gitee","codeup"} 子集。返回是否执行过至少一次 push。"""
+      log(branch, "verify patches (gate before push)")
+      verify_patches(root)
       codeup_ssh_url = (env.get("ALIYUN_REPO_SSH") or main_repo_source_codeup().ssh_url).strip()
       want = targets or {s.id for s in enabled_main_repo_push_sources()}
       push_sources = [s for s in enabled_main_repo_push_sources() if s.id in want]
