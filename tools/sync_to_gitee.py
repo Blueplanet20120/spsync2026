@@ -905,30 +905,47 @@ def is_author_device() -> bool:
   return Path(DATA_CODEUP_KEY).is_file()
 
 
+def codeup_ssh_identity_file() -> str:
+  # C4 等设备 /root 常为只读；SSH 始终用 /data 下持久私钥
+  return DATA_CODEUP_KEY
+
+
 def ensure_codeup_ssh_key() -> None:
   data = Path(DATA_CODEUP_KEY)
   if not data.is_file():
     return
+  try:
+    data.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(data, 0o600)
+  except OSError:
+    pass
+  # /root 可写时（少数环境）再复制一份，兼容旧文档；车机常态跳过
   root_ssh = Path(ROOT_CODEUP_KEY)
   root_dir = root_ssh.parent
-  root_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-  if root_ssh.exists():
-    try:
-      if root_ssh.read_bytes() == data.read_bytes():
-        os.chmod(root_ssh, 0o600)
-        return
-    except OSError:
-      pass
-  shutil.copy2(data, root_ssh)
-  os.chmod(root_ssh, 0o600)
+  try:
+    if not os.access(str(root_dir), os.W_OK):
+      return
+    root_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if root_ssh.exists():
+      try:
+        if root_ssh.read_bytes() == data.read_bytes():
+          os.chmod(root_ssh, 0o600)
+          return
+      except OSError:
+        pass
+    shutil.copy2(data, root_ssh)
+    os.chmod(root_ssh, 0o600)
+  except OSError:
+    pass
 
 
 def git_ssh_command_codeup() -> str | None:
   if not is_author_device():
     return None
   ensure_codeup_ssh_key()
+  key = codeup_ssh_identity_file()
   return (
-    f"ssh -i {{ROOT_CODEUP_KEY}} -o IdentitiesOnly=yes "
+    f"ssh -i {{key}} -o IdentitiesOnly=yes "
     "-o StrictHostKeyChecking=accept-new -o BatchMode=yes"
   )
 
@@ -968,6 +985,40 @@ def prepare_main_repo_git(cwd: str) -> None:
   if origin != want:
     subprocess.check_call(["git", "remote", "set-url", "origin", want], cwd=cwd)
 '''
+
+
+def inject_updated_check_for_update_order(s: str) -> str:
+  """check_for_update：在 ls-remote 之前先 setup_git_options（含 Codeup origin/SSH）。"""
+  if "inject_cn_check_for_update_order" in s:
+    return s
+  old = (
+    "  def check_for_update(self) -> None:\n"
+    "    cloudlog.info(\"checking for updates\")\n\n"
+    "    excluded_branches = ('release2', 'release2-staging')\n\n"
+    "    try:\n"
+    "      run([\"git\", \"ls-remote\", \"origin\", \"HEAD\"], OVERLAY_MERGED)\n"
+  )
+  new = (
+    "  def check_for_update(self) -> None:\n"
+    "    cloudlog.info(\"checking for updates\")\n\n"
+    "    excluded_branches = ('release2', 'release2-staging')\n\n"
+    "    setup_git_options(OVERLAY_MERGED)  # inject_cn_check_for_update_order\n"
+    "    try:\n"
+    "      run([\"git\", \"ls-remote\", \"origin\", \"HEAD\"], OVERLAY_MERGED)\n"
+  )
+  if old not in s:
+    if "inject_cn_check_for_update_order" in s:
+      return s
+    raise RuntimeError("updated.py: 未找到 check_for_update 块，无法调整 setup_git_options 顺序")
+  s = s.replace(old, new, 1)
+  # 去掉后面重复的 setup_git_options（已在上面调用）
+  dup = (
+    "    setup_git_options(OVERLAY_MERGED)\n"
+    "    output = run([\"git\", \"ls-remote\", \"--heads\"], OVERLAY_MERGED)\n"
+  )
+  if dup in s:
+    s = s.replace(dup, '    output = run(["git", "ls-remote", "--heads"], OVERLAY_MERGED)\n', 1)
+  return s
 
 
 def inject_updated_cn_route_hook(s: str) -> str:
@@ -1463,7 +1514,7 @@ static void cn_prepare_installer_git_env() {
     return;
   }
   setenv("GIT_SSH_COMMAND",
-         "ssh -i /root/.ssh/id_ed25519_codeup -o IdentitiesOnly=yes "
+         "ssh -i /data/ssh/id_ed25519_codeup -o IdentitiesOnly=yes "
          "-o StrictHostKeyChecking=accept-new -o BatchMode=yes",
          1);
 }
@@ -1587,6 +1638,7 @@ def patch_updated_insteadof(root: Path) -> PatchResult:
   s = updated_py.read_text(encoding="utf-8")
   s2 = inject_updated_insteadof_block_flex(s)
   s2 = inject_updated_cn_route_hook(s2)
+  s2 = inject_updated_check_for_update_order(s2)
   _track_change(res, updated_py, write_if_changed(updated_py, s2))
   return res
 
@@ -2293,7 +2345,7 @@ def verify_patches(root: Path) -> None:
   if _CN_MAIN_REPO_ROUTE_SENTINEL not in route_tx:
     errors.append("system/cn_main_repo_route.py: 缺少路由模块或 sentinel")
   else:
-    for fn in ("ensure_codeup_ssh_key", "prepare_main_repo_git", "main_repo_ui_suffix"):
+    for fn in ("ensure_codeup_ssh_key", "codeup_ssh_identity_file", "prepare_main_repo_git", "main_repo_ui_suffix"):
       if f"def {fn}" not in route_tx:
         errors.append(f"system/cn_main_repo_route.py: 缺少 {fn}")
     if codeup.ssh_url not in route_tx or gitee.https_url not in route_tx:
@@ -2322,6 +2374,8 @@ def verify_patches(root: Path) -> None:
     errors.append("system/updated/updated.py: 缺少 ensure_url_insteadof 注入")
   if "prepare_main_repo_git(cwd)" not in upd:
     errors.append("system/updated/updated.py: 缺少 prepare_main_repo_git 注入")
+  if "inject_cn_check_for_update_order" not in upd:
+    errors.append("system/updated/updated.py: check_for_update 未在 ls-remote 前调用 setup_git_options")
 
   if gitee.version_remote_key not in rt("tools/setup.sh"):
     errors.append(f"tools/setup.sh: 缺少主仓 URL（{gitee.label} 公开默认）")
