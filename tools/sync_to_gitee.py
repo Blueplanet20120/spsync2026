@@ -934,7 +934,7 @@ def git_ssh_command_codeup() -> str | None:
 
 
 def main_repo_ui_suffix() -> str:
-  return " (codeup)" if is_author_device() else " (Gitee)"
+  return " (Codeup)" if is_author_device() else " (Gitee)"
 
 
 def resolve_main_repo_urls() -> tuple[str, str]:
