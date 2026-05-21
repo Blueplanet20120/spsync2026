@@ -300,10 +300,14 @@ def apply_ci_step_outcome_fallback(
     if not isinstance(branches_map, dict):
       continue
     st = "timeout" if outcome in ("cancelled", "timed_out") else "fail"
-    detail = f"GitHub Actions step outcome={outcome}"
+    detail = f"CI step {tid} outcome={outcome}（脚本内未写入详细 git 输出，请查 Actions 日志）"
     for b in branches:
       if b not in branches_map:
         record_push_branch(state, tid, b, st, detail)
+      else:
+        rec = branches_map.get(b)
+        if isinstance(rec, dict) and rec.get("status") in ("fail", "timeout") and not rec.get("detail"):
+          rec["detail"] = detail
     finalize_push_target(state, tid)
 
 
@@ -441,9 +445,14 @@ def build_ci_notify(
     summary = "sunnypilot_cn 推送失败（所有已启用目标均未成功，详见下方推送结果）。"
 
   body_parts = [summary, _build_push_results_section(state)]
-  if mail_kind in ("full_ok", "partial_ok") and (state.get("sync_reason_tags") or state.get("upstream_commit_blocks")):
+  # partial/full 邮件始终附带说明块（与旧版成功邮件一致）；Force 依赖 sync_reason_tags 中的 force_same
+  if mail_kind in ("full_ok", "partial_ok") and (
+    state.get("sync_reason_tags") or state.get("upstream_commit_blocks") or state.get("notify_branch_notes")
+  ):
     body_parts.append(_build_sync_context_section(state))
-  elif mail_kind == "fail" and state.get("sync_reason_tags"):
+  elif mail_kind == "fail" and (
+    state.get("sync_reason_tags") or state.get("notify_branch_notes")
+  ):
     body_parts.append(_build_sync_context_section(state))
 
   subject_map = {
@@ -3302,20 +3311,35 @@ def main() -> None:
 
       assert ci_sync_state is not None
       ci_sync_state["attempted"] = True
+      if force_sync:
+        ci_sync_state["force_sync"] = True
       ci_sync_state.setdefault("branches", []).append(branch)
-      # 与 Gitee 上次提交里记录的 upstream-{branch} SHA 对比，用于邮件区分「有新版本」vs「仅 Force」
-      if recorded_canon is not None and recorded_canon == upstream_sha:
+      # 邮件区分「上游有新提交」vs「仅手动 Force」：Force 且无 Gitee 记录 / SHA 未变 → force_same
+      if force_sync and (recorded_canon is None or recorded_canon == upstream_sha):
         ci_sync_state.setdefault("sync_reason_tags", []).append("force_same")
       else:
         ci_sync_state.setdefault("sync_reason_tags", []).append("upstream_delta")
+        if force_sync:
+          ci_sync_state.setdefault("sync_reason_tags", []).append("force_same")
 
-      rec_note = short_sha(recorded_canon) or short_sha(recorded_sha) or "（提交信息中无 upstream-{branch} 行）"
-      up_note = short_sha(upstream_sha) or upstream_sha[:7]
+      if recorded_canon is not None:
+        rec_note = short_sha(recorded_canon) or recorded_canon[:EMAIL_SHA_LEN]
+      elif recorded_sha:
+        rec_note = short_sha(recorded_sha) or recorded_sha[:EMAIL_SHA_LEN]
+      elif force_sync:
+        rec_note = f"（Gitee 提交信息中无 upstream-{branch} 行；本次为手动 Force 重同步）"
+      else:
+        rec_note = f"（Gitee 提交信息中无 upstream-{branch} 行）"
+      up_note = short_sha(upstream_sha) or upstream_sha[:EMAIL_SHA_LEN]
       ci_sync_state.setdefault("notify_branch_notes", []).append(
         f"- {branch}: 上次 Gitee 记录 upstream-{branch}={rec_note} → 当前 upstream/{branch}={up_note}"
       )
 
-      reason_tag = "force_same" if (recorded_canon is not None and recorded_canon == upstream_sha) else "upstream_delta"
+      reason_tag = (
+        "force_same"
+        if force_sync and (recorded_canon is None or recorded_canon == upstream_sha)
+        else "upstream_delta"
+      )
       try:
         commit_block = collect_upstream_commits_for_email(
           root,
