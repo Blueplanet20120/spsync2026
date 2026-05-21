@@ -3171,11 +3171,6 @@ def main() -> None:
                     "push-gitee/push-codeup=仅推一端（CI 分步）；emit-outputs=写 GITHUB_OUTPUT；"
                     "print-ci-push-targets=输出 workflow 条件变量；all=pull+push"
                   ))
-  args = ap.parse_args()
-
-  if args.action == "print-ci-push-targets":
-    write_push_targets_github_output()
-    return
   ap.add_argument("--build-installer", action="store_true", default=False, help="在 larch64 设备上构建 installer（需要 extras=on）")
   ap.add_argument("--sync-mapd-release", action="store_true", default=False, help="同步 mapd 二进制到 Gitee Release（需要 GITEE_TOKEN）")
   ap.add_argument("--comma-host", default=COMMA_HOST_DEFAULT, help="comma 设备 IP/域名（用于远程编译 installer）")
@@ -3185,6 +3180,11 @@ def main() -> None:
   ap.add_argument("--installer-repo", default=INSTALLER_REPO_DEFAULT, help="用于发布 installer 的仓库（默认 sp-cn_install）")
   ap.add_argument("--installer-repo-branch", default="master", help="发布 installer 的分支")
   ap.add_argument("--publish-installer-release", action="store_true", default=True, help="发布 installer 后自动创建 Gitee Release（tag=YYYYMMDDHHMM）")
+  args = ap.parse_args()
+
+  if args.action == "print-ci-push-targets":
+    write_push_targets_github_output()
+    return
 
   root = Path(args.workdir).resolve()
   if not (root / ".git").exists():
