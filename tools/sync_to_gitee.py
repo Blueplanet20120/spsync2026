@@ -157,6 +157,319 @@ def enabled_main_repo_push_sources() -> list[MainRepoSource]:
   return sources
 
 
+# CI 分步推送顺序（与 workflow 一致：先 Codeup 后 Gitee）
+CI_PUSH_TARGET_ORDER: tuple[str, ...] = ("codeup", "gitee")
+
+
+def enabled_push_target_ids() -> set[str]:
+  return {s.id for s in enabled_main_repo_push_sources()}
+
+
+def push_target_timeout_s(target_id: str) -> int | None:
+  if target_id == "gitee":
+    raw = (os.environ.get("GITEE_PUSH_TIMEOUT_S") or "600").strip()
+    try:
+      return max(30, int(raw))
+    except ValueError:
+      return 600
+  return None
+
+
+def ci_push_targets_report() -> list[dict[str, object]]:
+  """每项: id, label, enabled, timeout_s。"""
+  enabled = enabled_push_target_ids()
+  out: list[dict[str, object]] = []
+  for tid in CI_PUSH_TARGET_ORDER:
+    src = main_repo_source_by_id(tid)
+    out.append({
+      "id": tid,
+      "label": src.label,
+      "enabled": tid in enabled,
+      "timeout_s": push_target_timeout_s(tid),
+    })
+  return out
+
+
+def ensure_push_results(state: dict[str, object]) -> dict[str, object]:
+  pr = state.get("push_results")
+  if not isinstance(pr, dict):
+    pr = {}
+    state["push_results"] = pr
+  for row in ci_push_targets_report():
+    tid = str(row["id"])
+    if tid not in pr or not isinstance(pr.get(tid), dict):
+      pr[tid] = {
+        "enabled": bool(row["enabled"]),
+        "label": str(row["label"]),
+        "overall": "pending",
+        "branches": {},
+      }
+    else:
+      entry = pr[tid]
+      if isinstance(entry, dict):
+        entry["enabled"] = bool(row["enabled"])
+        entry["label"] = str(row["label"])
+        entry.setdefault("branches", {})
+  return pr
+
+
+def record_push_branch(
+  state: dict[str, object],
+  target_id: str,
+  branch: str,
+  status: str,
+  detail: str = "",
+) -> None:
+  pr = ensure_push_results(state)
+  entry = pr.setdefault(target_id, {"enabled": True, "branches": {}, "overall": "pending"})
+  if not isinstance(entry, dict):
+    return
+  branches = entry.setdefault("branches", {})
+  if not isinstance(branches, dict):
+    branches = {}
+    entry["branches"] = branches
+  rec: dict[str, str] = {"status": status}
+  if detail:
+    rec["detail"] = detail[:800]
+  branches[branch] = rec
+
+
+def finalize_push_target(state: dict[str, object], target_id: str) -> None:
+  pr = ensure_push_results(state)
+  entry = pr.get(target_id)
+  if not isinstance(entry, dict):
+    return
+  if not entry.get("enabled", True):
+    entry["overall"] = "disabled"
+    return
+  branches = entry.get("branches") or {}
+  if not isinstance(branches, dict) or not branches:
+    entry["overall"] = entry.get("overall") or "skip"
+    return
+  statuses = [str((b or {}).get("status", "")) for b in branches.values() if isinstance(b, dict)]
+  if all(s == "ok" for s in statuses):
+    entry["overall"] = "ok"
+  elif any(s == "ok" for s in statuses):
+    entry["overall"] = "partial"
+  elif any(s == "timeout" for s in statuses):
+    entry["overall"] = "timeout"
+  else:
+    entry["overall"] = "fail"
+
+
+def _exception_push_status(exc: BaseException) -> tuple[str, str]:
+  if isinstance(exc, subprocess.TimeoutExpired):
+    t = exc.timeout
+    return "timeout", f"命令超时（{t}s）"
+  msg = str(exc)
+  if "超时" in msg or "timed out" in msg.lower() or "timeout" in msg.lower():
+    return "timeout", msg[:800]
+  return "fail", msg[:800]
+
+
+def _push_status_label(status: str) -> str:
+  return {
+    "ok": "成功",
+    "fail": "失败",
+    "timeout": "超时（已放弃）",
+    "skip": "跳过",
+    "disabled": "未启用推送",
+    "pending": "未执行",
+  }.get(status, status)
+
+
+def apply_ci_step_outcome_fallback(
+  state: dict[str, object],
+  *,
+  codeup_step: str | None = None,
+  gitee_step: str | None = None,
+) -> None:
+  """Actions 强杀进程时 state 可能缺记录，用 step outcome 补全。"""
+  if not state.get("to_push"):
+    return
+  branches = [str(b) for b in (state.get("branches") or list(SYNC_BRANCHES))]
+  outcomes = {"codeup": codeup_step, "gitee": gitee_step}
+  for tid, outcome in outcomes.items():
+    if not outcome or outcome in ("success", "skipped"):
+      continue
+    pr = ensure_push_results(state)
+    entry = pr.get(tid)
+    if not isinstance(entry, dict) or not entry.get("enabled"):
+      continue
+    branches_map = entry.setdefault("branches", {})
+    if not isinstance(branches_map, dict):
+      continue
+    st = "timeout" if outcome in ("cancelled", "timed_out") else "fail"
+    detail = f"GitHub Actions step outcome={outcome}"
+    for b in branches:
+      if b not in branches_map:
+        record_push_branch(state, tid, b, st, detail)
+    finalize_push_target(state, tid)
+
+
+def update_pushed_flags_from_push_results(state: dict[str, object]) -> None:
+  pr = ensure_push_results(state)
+  state["pushed_gitee"] = pr.get("gitee", {}).get("overall") == "ok" if isinstance(pr.get("gitee"), dict) else False
+  state["pushed_codeup"] = pr.get("codeup", {}).get("overall") == "ok" if isinstance(pr.get("codeup"), dict) else False
+  state["pushed"] = bool(state.get("pushed_gitee")) or bool(state.get("pushed_codeup"))
+
+
+def _sync_reason_variant(state: dict[str, object]) -> str:
+  reason_tags: list[str] = list(state.get("sync_reason_tags") or [])
+  if not reason_tags:
+    return "upstream_only"
+  uniq = set(reason_tags)
+  if uniq == {"force_same"}:
+    return "force_only"
+  if uniq == {"upstream_delta"}:
+    return "upstream_only"
+  return "mixed"
+
+
+def _build_sync_context_section(state: dict[str, object]) -> str:
+  """upstream/force 说明、分支核对、上游提交摘要（full_ok 与 partial_ok 共用）。"""
+  variant = _sync_reason_variant(state)
+  if variant == "force_only":
+    line_note = "说明：本次为手动 Force 强制重同步（上游 superproject 提交相对上次写入 Gitee 的记录一致，仍重跑补丁并推送）。"
+  elif variant == "upstream_only":
+    line_note = (
+      "说明：本次检测到上游 sunnypilot 主仓库（superproject）提交与上次写入 Gitee 提交信息里的 upstream-* 行不一致，因而同步推送；"
+      "比较的是完整 Git 对象 ID（短哈希与全哈希视为同一提交）。"
+      "子模块指针变化会体现在主仓库树或 .gitmodules 的差异里；若你只看网页上的「某个依赖版本」而主仓库 commit 未变，脚本仍会认为无同步必要。"
+    )
+  else:
+    line_note = "说明：本次同步中兼有「上游 superproject 有变化」与「强制重同步」情况，详见 Actions 日志。"
+  parts = [line_note]
+  notes = state.get("notify_branch_notes") or []
+  if notes:
+    parts.append("分支核对：\n" + "\n".join(str(x) for x in notes))
+  commit_blocks = state.get("upstream_commit_blocks") or []
+  if commit_blocks:
+    if variant == "force_only":
+      sec_title = "上游提交说明（本次为 Force 重同步，下列为各分支情况）"
+    elif variant == "mixed":
+      sec_title = "上游提交摘要（主仓库 subject，与 GitHub 一致；可能含 Force 分支的说明行）"
+    else:
+      sec_title = "上游新提交摘要（sunnypilot 主仓库，与 GitHub 提交列表 subject 一致）"
+    parts.append(f"---\n{sec_title}：\n\n" + "\n\n".join(str(b) for b in commit_blocks))
+  return "\n\n".join(parts)
+
+
+def _build_push_results_section(state: dict[str, object]) -> str:
+  lines = ["推送结果："]
+  for row in ci_push_targets_report():
+    tid = str(row["id"])
+    label = str(row["label"])
+    enabled = bool(row["enabled"])
+    pr = ensure_push_results(state)
+    entry = pr.get(tid) if isinstance(pr.get(tid), dict) else {}
+    if not enabled:
+      lines.append(f"· {label} [未启用] — enabled_main_repo_push_sources 已注释，本轮不推送。")
+      continue
+    lines.append(f"· {label} [已启用] — 汇总：{_push_status_label(str(entry.get('overall', 'pending')))}")
+    branches = entry.get("branches") or {}
+    if isinstance(branches, dict) and branches:
+      for br, rec in sorted(branches.items()):
+        if not isinstance(rec, dict):
+          continue
+        st = str(rec.get("status", "pending"))
+        extra = str(rec.get("detail", "")).strip()
+        line = f"  - {br}: {_push_status_label(st)}"
+        if extra and st != "ok":
+          line += f"（{extra}）"
+        lines.append(line)
+    elif entry.get("overall") in ("skip", "pending"):
+      lines.append("  - （本轮无待推送分支或未执行 push step）")
+  return "\n".join(lines)
+
+
+@dataclass(frozen=True)
+class CiNotifyPlan:
+  mail_kind: str  # full_ok | partial_ok | fail | none
+  notify_send: bool
+  subject: str
+  body: str
+
+
+def build_ci_notify(
+  state: dict[str, object],
+  *,
+  codeup_step_outcome: str | None = None,
+  gitee_step_outcome: str | None = None,
+) -> CiNotifyPlan:
+  apply_ci_step_outcome_fallback(state, codeup_step=codeup_step_outcome, gitee_step=gitee_step_outcome)
+  update_pushed_flags_from_push_results(state)
+
+  attempted = bool(state.get("attempted"))
+  to_push = bool(state.get("to_push"))
+  if not attempted and not to_push:
+    return CiNotifyPlan("none", False, "", "")
+
+  ensure_push_results(state)
+  enabled_rows = [r for r in ci_push_targets_report() if r["enabled"]]
+  enabled_ids = [str(r["id"]) for r in enabled_rows]
+
+  def _overall(tid: str) -> str:
+    pr = state.get("push_results") or {}
+    e = pr.get(tid) if isinstance(pr, dict) else None
+    return str(e.get("overall", "pending")) if isinstance(e, dict) else "pending"
+
+  ok_ids = [tid for tid in enabled_ids if _overall(tid) == "ok"]
+  bad_ids = [tid for tid in enabled_ids if _overall(tid) in ("fail", "timeout", "partial")]
+
+  if not enabled_ids:
+    mail_kind = "none"
+    notify_send = attempted and to_push
+    summary = "sunnypilot_cn：未配置任何推送目标（请检查 enabled_main_repo_push_sources）。"
+  elif ok_ids and not bad_ids:
+    mail_kind = "full_ok"
+    notify_send = True
+    bits = [main_repo_source_by_id(t).label for t in ok_ids]
+    summary = f"sunnypilot_cn → {'、'.join(bits)} 同步成功（本轮已执行补丁校验并完成推送）。"
+  elif ok_ids and bad_ids:
+    mail_kind = "partial_ok"
+    notify_send = True
+    ok_l = "、".join(main_repo_source_by_id(t).label for t in ok_ids)
+    bad_parts = []
+    for tid in bad_ids:
+      ov = _overall(tid)
+      bad_parts.append(f"{main_repo_source_by_id(tid).label}（{_push_status_label(ov)}）")
+    summary = f"sunnypilot_cn 部分成功：{ok_l} 已推送；{'；'.join(bad_parts)}。"
+  else:
+    mail_kind = "fail"
+    notify_send = bool(to_push) or attempted
+    summary = "sunnypilot_cn 推送失败（所有已启用目标均未成功，详见下方推送结果）。"
+
+  body_parts = [summary, _build_push_results_section(state)]
+  if mail_kind in ("full_ok", "partial_ok") and (state.get("sync_reason_tags") or state.get("upstream_commit_blocks")):
+    body_parts.append(_build_sync_context_section(state))
+  elif mail_kind == "fail" and state.get("sync_reason_tags"):
+    body_parts.append(_build_sync_context_section(state))
+
+  subject_map = {
+    "full_ok": "[OK] sp_cn_sync-bot",
+    "partial_ok": "[部分成功] sp_cn_sync-bot",
+    "fail": "[FAIL] sp_cn_sync-bot",
+  }
+  subject = subject_map.get(mail_kind, "")
+  body = "\n\n".join(p for p in body_parts if p)
+  return CiNotifyPlan(mail_kind, notify_send, subject, body)
+
+
+def write_push_targets_github_output() -> None:
+  if os.environ.get("GITHUB_ACTIONS") != "true":
+    for row in ci_push_targets_report():
+      print(f"{row['id']}_enabled={row['enabled']}")
+    return
+  path = os.environ.get("GITHUB_OUTPUT")
+  if not path:
+    return
+  with open(path, "a", encoding="utf-8") as f:
+    for row in ci_push_targets_report():
+      tid = str(row["id"])
+      f.write(f"{tid}_enabled={'true' if row['enabled'] else 'false'}\n")
+
+
 def main_repo_device_source() -> MainRepoSource:
   """设备/安装器/ setup.sh 写入的主仓拉取源。"""
   want = (os.environ.get("MAIN_REPO_DEVICE") or MAIN_REPO_DEVICE_DEFAULT).strip().lower()
@@ -209,26 +522,51 @@ def _should_inherit_stdio_for_long_git(cmd: list[str]) -> bool:
   return False
 
 
-def run(cmd: list[str], cwd: str | None = None, env: dict[str, str] | None = None, *, stream: bool | None = None) -> str:
+def run(
+  cmd: list[str],
+  cwd: str | None = None,
+  env: dict[str, str] | None = None,
+  *,
+  stream: bool | None = None,
+  timeout_s: int | None = None,
+) -> str:
   """
   默认行为：
   - 交互终端（TTY）下：实时输出（避免 git fetch 等长任务“看起来没反应”）
   - CI/非交互：保持 capture（便于错误时把完整输出带回日志）
   - TTY + 长耗时 git：子进程继承当前终端 stdio（否则 PIPE 吞掉 \\r 进度）
+  - timeout_s：仅非 stream 模式生效（Gitee push 限时）
   """
   cmd = _maybe_git_fetch_progress(list(cmd))
 
   if stream is None:
     stream = sys.stdout.isatty()
 
+  def _timeout_expired() -> RuntimeError:
+    return RuntimeError(f"命令超时（{timeout_s}s）: {' '.join(cmd)}")
+
   if not stream:
-    p = subprocess.run(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    try:
+      p = subprocess.run(
+        cmd,
+        cwd=cwd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=timeout_s,
+      )
+    except subprocess.TimeoutExpired as e:
+      raise _timeout_expired() from e
     if p.returncode != 0:
       raise RuntimeError(f"命令失败: {' '.join(cmd)}\n{p.stdout}")
     return p.stdout
 
   if _should_inherit_stdio_for_long_git(cmd):
-    p = subprocess.run(cmd, cwd=cwd, env=env)
+    try:
+      p = subprocess.run(cmd, cwd=cwd, env=env, timeout=timeout_s)
+    except subprocess.TimeoutExpired as e:
+      raise _timeout_expired() from e
     if p.returncode != 0:
       raise RuntimeError(f"命令失败: {' '.join(cmd)}")
     return ""
@@ -236,11 +574,15 @@ def run(cmd: list[str], cwd: str | None = None, env: dict[str, str] | None = Non
   p2 = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
   assert p2.stdout is not None
   out_lines: list[str] = []
-  for line in p2.stdout:
-    sys.stdout.write(line)
-    sys.stdout.flush()
-    out_lines.append(line)
-  rc = p2.wait()
+  try:
+    for line in p2.stdout:
+      sys.stdout.write(line)
+      sys.stdout.flush()
+      out_lines.append(line)
+    rc = p2.wait(timeout=timeout_s)
+  except subprocess.TimeoutExpired:
+    p2.kill()
+    raise _timeout_expired()
   out = "".join(out_lines)
   if rc != 0:
     raise RuntimeError(f"命令失败: {' '.join(cmd)}\n{out}")
@@ -2479,64 +2821,24 @@ def load_ci_sync_state() -> dict[str, object]:
 
 
 def write_ci_github_output(state: dict[str, object]) -> None:
-  """供 GitHub Actions 读取 steps.sync.outputs.*（双场景邮件条件）。"""
+  """供 GitHub Actions 读取 steps.sync.outputs.*（分端推送结果 + 邮件）。"""
   if os.environ.get("GITHUB_ACTIONS") != "true":
     return
   path = os.environ.get("GITHUB_OUTPUT")
   if not path:
     return
+  codeup_out = (os.environ.get("CI_STEP_OUTCOME_CODEUP") or "").strip() or None
+  gitee_out = (os.environ.get("CI_STEP_OUTCOME_GITEE") or "").strip() or None
+  plan = build_ci_notify(state, codeup_step_outcome=codeup_out, gitee_step_outcome=gitee_out)
   attempted = bool(state.get("attempted"))
   pushed_gitee = bool(state.get("pushed_gitee"))
   pushed_codeup = bool(state.get("pushed_codeup"))
   pushed = bool(state.get("pushed")) or pushed_gitee or pushed_codeup
   branches = state.get("branches") or []
   br_line = ",".join(str(b) for b in branches) if branches else ""
-  reason_tags: list[str] = list(state.get("sync_reason_tags") or [])
+  variant = _sync_reason_variant(state)
 
-  # 成功邮件正文：区分「上游相对 Gitee 记录有新版本」与「仅 Force 强制重同步」
-  variant = "upstream_only"
-  if reason_tags:
-    uniq = set(reason_tags)
-    if uniq == {"force_same"}:
-      variant = "force_only"
-    elif uniq == {"upstream_delta"}:
-      variant = "upstream_only"
-    else:
-      variant = "mixed"
-
-  push_bits: list[str] = []
-  if pushed_gitee:
-    push_bits.append("Gitee")
-  if pushed_codeup:
-    push_bits.append("Codeup")
-  dest = "、".join(push_bits) if push_bits else "远端"
-  line_ok = f"sunnypilot_cn → {dest} 同步成功（本轮已执行补丁校验并完成推送）。"
-  if variant == "force_only":
-    line_note = "说明：本次为手动 Force 强制重同步（上游 superproject 提交相对上次写入 Gitee 的记录一致，仍重跑补丁并推送）。"
-  elif variant == "upstream_only":
-    line_note = (
-      "说明：本次检测到上游 sunnypilot 主仓库（superproject）提交与上次写入 Gitee 提交信息里的 upstream-* 行不一致，因而同步推送；"
-      "比较的是完整 Git 对象 ID（短哈希与全哈希视为同一提交）。"
-      "子模块指针变化会体现在主仓库树或 .gitmodules 的差异里；若你只看网页上的「某个依赖版本」而主仓库 commit 未变，脚本仍会认为无同步必要。"
-    )
-  else:
-    line_note = "说明：本次同步中兼有「上游 superproject 有变化」与「强制重同步」情况，详见 Actions 日志。"
-  success_body = f"{line_ok}\n\n{line_note}"
-  notes = state.get("notify_branch_notes") or []
-  if notes:
-    success_body += "\n\n分支核对：\n" + "\n".join(str(x) for x in notes)
-  commit_blocks = state.get("upstream_commit_blocks") or []
-  if commit_blocks:
-    if variant == "force_only":
-      sec_title = "上游提交说明（本次为 Force 重同步，下列为各分支情况）"
-    elif variant == "mixed":
-      sec_title = "上游提交摘要（主仓库 subject，与 GitHub 一致；可能含 Force 分支的说明行）"
-    else:
-      sec_title = "上游新提交摘要（sunnypilot 主仓库，与 GitHub 提交列表 subject 一致）"
-    success_body += f"\n\n---\n{sec_title}：\n\n"
-    success_body += "\n\n".join(str(b) for b in commit_blocks)
-
-  delim = "SYNC_OK_BODY_EOF"
+  delim_body = "SYNC_NOTIFY_BODY_EOF"
   with open(path, "a", encoding="utf-8") as f:
     f.write(f"attempted_sync={'true' if attempted else 'false'}\n")
     f.write(f"pushed={'true' if pushed else 'false'}\n")
@@ -2544,11 +2846,20 @@ def write_ci_github_output(state: dict[str, object]) -> None:
     f.write(f"pushed_codeup={'true' if pushed_codeup else 'false'}\n")
     f.write(f"sync_branches={br_line}\n")
     f.write(f"notify_variant={variant}\n")
-    f.write(f"notify_success_body<<{delim}\n")
-    f.write(success_body)
-    if not success_body.endswith("\n"):
+    f.write(f"notify_mail_kind={plan.mail_kind}\n")
+    f.write(f"notify_send={'true' if plan.notify_send else 'false'}\n")
+    f.write(f"notify_subject={plan.subject}\n")
+    f.write(f"notify_body<<{delim_body}\n")
+    f.write(plan.body)
+    if plan.body and not plan.body.endswith("\n"):
       f.write("\n")
-    f.write(f"{delim}\n")
+    f.write(f"{delim_body}\n")
+    if plan.mail_kind == "full_ok":
+      f.write(f"notify_success_body<<{delim_body}\n")
+      f.write(plan.body)
+      if plan.body and not plan.body.endswith("\n"):
+        f.write("\n")
+      f.write(f"{delim_body}\n")
 
 
 def _gitee_git_ssh_env(port: int = 22) -> dict[str, str]:
@@ -2850,12 +3161,21 @@ def main() -> None:
       help="已废弃：此前将本地 master 强推到远端 staging。当前仅同步 staging，此选项无操作。",
   )
   ap.add_argument("--action",
-                  choices=["menu", "pull", "push", "push-gitee", "push-codeup", "emit-outputs", "all"],
+                  choices=[
+                    "menu", "pull", "push", "push-gitee", "push-codeup", "emit-outputs",
+                    "print-ci-push-targets", "all",
+                  ],
                   default="menu",
                   help=(
                     "执行模式：menu=交互菜单；pull=拉取+补丁；push=推全部启用源；"
-                    "push-gitee/push-codeup=仅推一端（CI 分步）；emit-outputs=写 GITHUB_OUTPUT；all=pull+push"
+                    "push-gitee/push-codeup=仅推一端（CI 分步）；emit-outputs=写 GITHUB_OUTPUT；"
+                    "print-ci-push-targets=输出 workflow 条件变量；all=pull+push"
                   ))
+  args = ap.parse_args()
+
+  if args.action == "print-ci-push-targets":
+    write_push_targets_github_output()
+    return
   ap.add_argument("--build-installer", action="store_true", default=False, help="在 larch64 设备上构建 installer（需要 extras=on）")
   ap.add_argument("--sync-mapd-release", action="store_true", default=False, help="同步 mapd 二进制到 Gitee Release（需要 GITEE_TOKEN）")
   ap.add_argument("--comma-host", default=COMMA_HOST_DEFAULT, help="comma 设备 IP/域名（用于远程编译 installer）")
@@ -2865,7 +3185,6 @@ def main() -> None:
   ap.add_argument("--installer-repo", default=INSTALLER_REPO_DEFAULT, help="用于发布 installer 的仓库（默认 sp-cn_install）")
   ap.add_argument("--installer-repo-branch", default="master", help="发布 installer 的分支")
   ap.add_argument("--publish-installer-release", action="store_true", default=True, help="发布 installer 后自动创建 Gitee Release（tag=YYYYMMDDHHMM）")
-  args = ap.parse_args()
 
   root = Path(args.workdir).resolve()
   if not (root / ".git").exists():
@@ -3089,8 +3408,9 @@ def main() -> None:
       *,
       targets: set[str] | None = None,
       squash_first: bool = False,
+      sync_state: dict[str, object] | None = None,
     ) -> bool:
-      """推送单个分支；targets 为 {"gitee","codeup"} 子集。返回是否执行过至少一次 push。"""
+      """推送单个分支；targets 为 {"gitee","codeup"} 子集。返回是否至少一端 push 成功。"""
       log(branch, "verify patches (gate before push)")
       verify_patches(root)
       codeup_ssh_url = (env.get("ALIYUN_REPO_SSH") or main_repo_source_codeup().ssh_url).strip()
@@ -3102,11 +3422,18 @@ def main() -> None:
       if squash_first and _env_truthy("SYNC_GITEE_SINGLE_COMMIT"):
         squash_branch_single_commit(root, branch, env)
       did_push = False
+      gitee_to = push_target_timeout_s("gitee")
 
       def _push_gitee() -> None:
         origin_env = dict(env)
+        origin_env["GIT_SSH_COMMAND"] = _gitee_git_ssh_env()["GIT_SSH_COMMAND"]
         origin_env["GIT_LFS_SKIP_PUSH"] = "1"
-        run(["git", "push", "-f", "-u", "origin", branch], str(root), env=origin_env)
+        run(
+          ["git", "push", "-f", "-u", "origin", branch],
+          str(root),
+          env=origin_env,
+          timeout_s=gitee_to,
+        )
         log("push", f"{branch}: {main_repo_source_gitee().label} pushed (origin)")
 
       def _push_codeup_ssh() -> None:
@@ -3136,6 +3463,8 @@ def main() -> None:
       def _push_codeup() -> None:
         if not aliyun_push_available(env):
           log("push", f"{branch}: {main_repo_source_codeup().label} push skipped（无 SSH 密钥且无 HTTPS 令牌）")
+          if sync_state is not None:
+            record_push_branch(sync_state, "codeup", branch, "skip", "无 SSH 密钥且无 HTTPS 令牌")
           return
         if aliyun_push_via_https(env):
           try:
@@ -3150,12 +3479,27 @@ def main() -> None:
           _push_codeup_ssh()
 
       for src in push_sources:
-        if src.id == "gitee":
-          retry(f"git push origin {branch}", _push_gitee, tries=4, base_sleep_s=2.0)
+        tid = src.id
+        tries = 2 if tid == "gitee" else 4
+        try:
+          if tid == "gitee":
+            retry(f"git push origin {branch}", _push_gitee, tries=tries, base_sleep_s=2.0)
+          elif tid == "codeup":
+            retry(f"git push aliyun {branch}", _push_codeup, tries=tries, base_sleep_s=2.0)
+          if sync_state is not None:
+            pr = ensure_push_results(sync_state)
+            br = (pr.get(tid) or {}).get("branches", {}) if isinstance(pr.get(tid), dict) else {}
+            if not (isinstance(br, dict) and branch in br and br[branch].get("status") == "skip"):
+              record_push_branch(sync_state, tid, branch, "ok")
           did_push = True
-        elif src.id == "codeup":
-          retry(f"git push aliyun {branch}", _push_codeup, tries=4, base_sleep_s=2.0)
-          did_push = True
+        except Exception as e:
+          st_label, detail = _exception_push_status(e)
+          if sync_state is not None:
+            record_push_branch(sync_state, tid, branch, st_label, detail)
+          log("push", f"{branch}: {src.label} {st_label}: {e}")
+      if sync_state is not None:
+        for src in push_sources:
+          finalize_push_target(sync_state, src.id)
       return did_push
 
     def pull_all() -> list[str]:
@@ -3170,6 +3514,7 @@ def main() -> None:
       *,
       targets: set[str] | None = None,
       squash_first: bool = False,
+      sync_state: dict[str, object] | None = None,
     ) -> bool:
       branches = branches or list(SYNC_BRANCHES)
       any_pushed = False
@@ -3178,10 +3523,35 @@ def main() -> None:
           run(["git", "show-ref", "--verify", "--quiet", f"refs/heads/{b}"], str(root), env=env)
         except Exception:
           print(f"[skip] push {b}: local branch missing")
+          if sync_state is not None and targets:
+            for tid in targets:
+              record_push_branch(sync_state, tid, b, "skip", "本地分支不存在")
+              finalize_push_target(sync_state, tid)
           continue
-        if push_branch(b, targets=targets, squash_first=squash_first and not any_pushed):
+        if push_branch(
+          b,
+          targets=targets,
+          squash_first=squash_first and not any_pushed,
+          sync_state=sync_state,
+        ):
           any_pushed = True
       return any_pushed
+
+    def _ci_state_for_push() -> dict[str, object]:
+      st = load_ci_sync_state()
+      if st:
+        ensure_push_results(st)
+        return st
+      assert ci_sync_state is not None
+      ensure_push_results(ci_sync_state)
+      return ci_sync_state
+
+    def _target_push_failed(st: dict[str, object], target_id: str) -> bool:
+      pr = st.get("push_results") or {}
+      entry = pr.get(target_id) if isinstance(pr, dict) else None
+      if not isinstance(entry, dict) or not entry.get("enabled"):
+        return False
+      return entry.get("overall") in ("fail", "timeout", "partial")
 
     def _branches_to_push_from_state() -> list[str]:
       st = load_ci_sync_state()
@@ -3205,14 +3575,9 @@ def main() -> None:
       if not to_push:
         print("[skip] no branches changed; nothing to push")
       else:
-        if push_all(to_push, squash_first=True):
-          assert ci_sync_state is not None
-          enabled_ids = {s.id for s in enabled_main_repo_push_sources()}
-          ci_sync_state["pushed"] = True
-          if "gitee" in enabled_ids:
-            ci_sync_state["pushed_gitee"] = True
-          if "codeup" in enabled_ids:
-            ci_sync_state["pushed_codeup"] = True
+        push_all(to_push, squash_first=True, sync_state=ci_sync_state)
+        assert ci_sync_state is not None
+        update_pushed_flags_from_push_results(ci_sync_state)
       if args.force_staging:
         log("warn", "--force-staging 已废弃：当前仅同步 staging，不再执行 master→staging 强推。")
       maybe_sync_mapd_release()
@@ -3222,6 +3587,7 @@ def main() -> None:
       ci_sync_state["to_push"] = bool(to_push)
       if to_push:
         ci_sync_state["branches"] = list(to_push)
+      ensure_push_results(ci_sync_state)
       save_ci_sync_state(ci_sync_state)
 
     def interactive_menu() -> None:
@@ -3266,35 +3632,57 @@ def main() -> None:
       maybe_sync_mapd_release()
     elif args.action == "push":
       env.setdefault("GIT_LFS_SKIP_PUSH", "1")
+      st = _ci_state_for_push()
       branches = _branches_to_push_from_state() or list(SYNC_BRANCHES)
-      if push_all(branches, squash_first=True):
-        assert ci_sync_state is not None
-        ci_sync_state["pushed"] = True
-        ci_sync_state["pushed_gitee"] = True
-        ci_sync_state["pushed_codeup"] = True
-        save_ci_sync_state(ci_sync_state)
+      push_all(branches, squash_first=True, sync_state=st)
+      update_pushed_flags_from_push_results(st)
+      save_ci_sync_state(st)
       if args.force_staging:
         log("warn", "--force-staging 已废弃：当前仅同步 staging，不再执行 master→staging 强推。")
       maybe_sync_mapd_release()
     elif args.action == "push-gitee":
       env.setdefault("GIT_LFS_SKIP_PUSH", "1")
-      branches = _branches_to_push_from_state()
-      if not branches:
-        print("[skip] push-gitee: pull 阶段未产生待推送分支（upstream 未变？）")
-      elif push_all(branches, targets={"gitee"}, squash_first=False):
-        st = load_ci_sync_state()
-        st["pushed_gitee"] = True
-        st["pushed"] = True
+      st = _ci_state_for_push()
+      if "gitee" not in enabled_push_target_ids():
+        for b in (st.get("branches") or list(SYNC_BRANCHES)):
+          record_push_branch(st, "gitee", str(b), "disabled")
+        finalize_push_target(st, "gitee")
+        update_pushed_flags_from_push_results(st)
         save_ci_sync_state(st)
+        print("[skip] push-gitee: enabled_main_repo_push_sources 未启用 Gitee")
+      else:
+        branches = _branches_to_push_from_state()
+        if not branches:
+          print("[skip] push-gitee: pull 阶段未产生待推送分支（upstream 未变？）")
+        else:
+          try:
+            push_all(branches, targets={"gitee"}, squash_first=False, sync_state=st)
+          finally:
+            update_pushed_flags_from_push_results(st)
+            save_ci_sync_state(st)
+          if _target_push_failed(st, "gitee"):
+            raise SystemExit(1)
     elif args.action == "push-codeup":
-      branches = _branches_to_push_from_state()
-      if not branches:
-        print("[skip] push-codeup: pull 阶段未产生待推送分支（upstream 未变？）")
-      elif push_all(branches, targets={"codeup"}, squash_first=True):
-        st = load_ci_sync_state()
-        st["pushed_codeup"] = True
-        st["pushed"] = bool(st.get("pushed")) or True
+      st = _ci_state_for_push()
+      if "codeup" not in enabled_push_target_ids():
+        for b in (st.get("branches") or list(SYNC_BRANCHES)):
+          record_push_branch(st, "codeup", str(b), "disabled")
+        finalize_push_target(st, "codeup")
+        update_pushed_flags_from_push_results(st)
         save_ci_sync_state(st)
+        print("[skip] push-codeup: enabled_main_repo_push_sources 未启用 Codeup")
+      else:
+        branches = _branches_to_push_from_state()
+        if not branches:
+          print("[skip] push-codeup: pull 阶段未产生待推送分支（upstream 未变？）")
+        else:
+          try:
+            push_all(branches, targets={"codeup"}, squash_first=True, sync_state=st)
+          finally:
+            update_pushed_flags_from_push_results(st)
+            save_ci_sync_state(st)
+          if _target_push_failed(st, "codeup"):
+            raise SystemExit(1)
     elif args.action == "emit-outputs":
       write_ci_github_output(load_ci_sync_state())
     elif args.action == "all":
