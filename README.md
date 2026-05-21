@@ -41,9 +41,9 @@ ssh-keygen -t ed25519 -C "github-actions-sync-to-gitee" -f gitee_deploy_key -N "
 - **（可选）`GITEE_TOKEN`**：仅当你要启用脚本的 `--sync-mapd-release` / 发布 Release 等功能时需要
 
 ### 4) （可选）邮件通知（QQ 邮箱 SMTP）
-工作流在 **两种** 情况下尝试发信（均要求：本轮**实际跑过**完整同步流程 `attempted_sync`，而不是「定时跳过」那种未进入补丁的情形）：
-- **成功**：`success()` 且 **已完成推送** `pushed`（补丁校验通过后才提交/推送）。
-- **失败**：已进入同步流程但作业失败（如 `verify_patches`、git、推送错误等）。
+工作流在 pull 成功后根据 `notify_send` 发 **推送结果** 邮件（不要求整 job `success()`；Codeup 成功、Gitee 超时也可收到 **`[Partially OK]`**）。另在 pull 失败时发单独失败信。
+
+常见主题：`[OK]` / `[Partially OK]` / `[FAIL]` sp_cn_sync-bot（正文含各端推送结果、分支核对、upstream/Force 说明块）。
 
 说明：**「上游是否有新变化」与「是否发成功信」不是简单等同**。通知用的是 **`attempted_sync`（本轮是否执行了检出+补丁流程）** 与 **`pushed`** 的组合（AND）。手动勾选 **Force re-sync** 时，即使上游 SHA 相对 Gitee **未变**，也会设置 `attempted_sync`，推送成功后同样会发成功通知。
 
@@ -56,7 +56,7 @@ ssh-keygen -t ed25519 -C "github-actions-sync-to-gitee" -f gitee_deploy_key -N "
 
 端口固定为 **465 + SSL**（与工作流一致）。若不用 QQ，可自行改工作流里的 `server_port` / `secure`。
 
-成功邮件标题固定为 **`[OK] sp_cn_sync-bot`**；正文由脚本写入 `GITHUB_OUTPUT`，按本次同步是「sunnypilot 相对 Gitee 记录有新版本」还是「仅手动 Force、上游 SHA 未变」切换第二段说明（输出键 `notify_variant`：`upstream_only` / `force_only` / `mixed`）。
+正文由 `emit-outputs` 写入 `GITHUB_OUTPUT`；按 `notify_mail_kind` 与 `notify_variant`（`upstream_only` / `force_only` / `mixed`）生成说明与上游提交摘要。Gitee 推送 step 限时 **10 分钟**（`continue-on-error`），避免长时间卡住不发 Codeup 结果邮件。
 
 与 QQ 邮箱官方「第三方客户端」说明一致（仅需 **发信 SMTP**，无需填 IMAP/POP）：
 
@@ -74,6 +74,20 @@ ssh-keygen -t ed25519 -C "github-actions-sync-to-gitee" -f gitee_deploy_key -N "
 [`tools/sync_to_gitee.py`](tools/sync_to_gitee.py) 在每个分支打完补丁后、提交前会执行 **`verify_patches`**：检查关键文件是否已包含约定的 Gitee 镜像字符串、`updated.py` 是否已注入 `insteadof` 辅助函数、`.gitmodules` 是否仍残留未改写的 GitHub URL 等；必要时对关键 `.py` 做 **`py_compile`**。任一检查失败会 **`RuntimeError` 退出**，该分支**不会 commit / push**，避免半成品进入 Gitee。
 
 日志中会列出具体缺失项，形如：`verify_patches 失败（不会提交/推送）： ...`
+
+### 驾驶员监控（DM）补丁
+
+由 [`patch_dm_relaxed_terminal`](tools/sync_to_gitee.py) 写入同步树中的 `selfdrive/monitoring/helpers.py`（`verify_patches` 会检查 sentinel）。
+
+**产品决策：红屏只警告、不因 DM 收纵向（不 forceDecel）**
+
+- **目标**：分心到红色全屏时仍提醒驾驶员，但不因 DM 触发强制减速、不锁死下次上车；专注恢复约 **6 秒** 可自动退出红屏。
+- **补丁要点**（与官方 sunnypilot 对照）：
+  - `awareness` 递减下限 **0**（官方为 **-0.1**）：避免 `awarenessStatus < 0` → `controlsState.forceDecel`。
+  - 红线保留 `driverDistracted3` 全屏/鸣音，**去掉** `terminal_time` / `terminal_alert_cnt` 累计（官方可能写入 `DriverTooDistracted`，影响再次 engage）。
+  - 红屏下若「脸在 + 姿态稳 + 分心滤波低」持续约 6 秒，自动将 `awareness` 拉回橙区并清 `alert`（官方通常需 disengage 才清红）。
+- **纵向控车**：官方在**刚到红**（`awareness = 0`）时纵向仍正常；**持续分心**时 awareness 可到 -0.1，触发 `forceDecel` → 纵向规划 `v_cruise = 0`（强烈收油/趋向停车）。国内化在红屏期间**不因 DM 收油**，相对官方持续分心路径更保留 ACC；相对「应立即接管」官方更严——为团队有意选择，**代码维持现状**。
+- `driverDistracted3` 仍为 `ET.PERMANENT`（非 `SOFT_DISABLE` / `IMMEDIATE_DISABLE`）；文案 “DISENGAGE IMMEDIATELY” 为提示，不表示栈自动断纵向。
 
 ### 本地专用脚本（不参与云端同步）
 [`tools/sync_to_gitee_local.py`](tools/sync_to_gitee_local.py) 仅用于本机交互菜单（如远程编译 installer 等），**GitHub Actions 只调用 `sync_to_gitee.py`**。若不希望把本地脚本提交到 GitHub 工具仓，可将其列入 `.gitignore`（见仓库内 `.gitignore`）。
