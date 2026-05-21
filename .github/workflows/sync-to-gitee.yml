@@ -279,7 +279,7 @@ jobs:
             --action emit-outputs \
             --workdir "$GITHUB_WORKSPACE/sunnypilot"
 
-      - name: Notify mail — 推送结果
+      - name: Notify mail — push results
         if: >-
           steps.sync_pull.outcome == 'success' &&
           steps.sync_outputs.outputs.notify_send == 'true'
