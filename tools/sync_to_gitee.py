@@ -457,7 +457,7 @@ def build_ci_notify(
 
   subject_map = {
     "full_ok": "[OK] sp_cn_sync-bot",
-    "partial_ok": "[部分成功] sp_cn_sync-bot",
+    "partial_ok": "[Partially OK] sp_cn_sync-bot",
     "fail": "[FAIL] sp_cn_sync-bot",
   }
   subject = subject_map.get(mail_kind, "")
