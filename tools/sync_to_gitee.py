@@ -90,17 +90,55 @@ UPSTREAM_DEFAULT = "https://github.com/sunnypilot/sunnypilot.git"
 COMMA_HOST_DEFAULT = "10.90.1.231"
 COMMA_USER_DEFAULT = "comma"
 COMMA_SSH_KEY_DEFAULT = str(Path("/home/perfume/sp/sp-cn"))
-INSTALLER_REPO_DEFAULT = "https://gitee.com/xc2026/sp-cn_install.git"
-
 GITEE_OWNER = "xc2026"
 MAPD_REPO = "openpilot-mapd"
 MAPD_UPSTREAM = "pfeiferj/openpilot-mapd"
+
+INSTALLER_REPO_DEFAULT = f"https://gitee.com/{GITEE_OWNER}/sp-cn_install.git"
 
 ALIYUN_SSH_KEY_DEFAULT = "~/.ssh/sp-cn"
 SP_CN_TOKEN_ENV = "sp-cn-token"
 
 # 设备/安装器静态补丁默认 Gitee；车端 OTA 实际主仓由 cn_main_repo_route 按私钥运行时选择。
 MAIN_REPO_DEVICE_DEFAULT = "gitee"  # "gitee" | "codeup"，也可用 MAIN_REPO_DEVICE 覆盖（仅静态补丁如 setup.sh）
+
+
+def gitee_https_repo(repo: str, *, owner: str | None = None) -> str:
+  """https://gitee.com/{owner}/{repo}（repo 可含 .git 后缀）。"""
+  o = owner or GITEE_OWNER
+  return f"https://gitee.com/{o}/{repo}"
+
+
+def gitee_git_ssh_repo(repo: str, *, owner: str | None = None) -> str:
+  """git@gitee.com:{owner}/{repo}（无 .git 时自动追加）。"""
+  o = owner or GITEE_OWNER
+  name = repo if repo.endswith(".git") else f"{repo}.git"
+  return f"git@gitee.com:{o}/{name}"
+
+
+def gitee_raw_repo(repo: str, branch: str = "master", *, owner: str | None = None) -> str:
+  return f"{gitee_https_repo(repo, owner=owner)}/raw/{branch}/"
+
+
+def gitee_sp_cn_installer_openpilot_url() -> str:
+  return f"{gitee_https_repo('sp-cn_install')}/raw/master/installer_openpilot"
+
+
+def gitee_insteadof_rules() -> list[tuple[str, str]]:
+  """updated.py ensure_url_insteadof 的 (url_key, instead_of) 对。"""
+  o = GITEE_OWNER
+  return [
+    (f"url.https://gitee.com/{o}/.insteadof", "https://github.com/"),
+    (f"url.https://gitee.com/{o}/.insteadof", "https://raw.githubusercontent.com/"),
+    (f"url.git@gitee.com:{o}/.insteadof", "git@github.com:"),
+    (f"url.git@gitee.com:{o}/.insteadof", "ssh://git@github.com/"),
+  ]
+
+
+def _render_gitee_insteadof_ensure_lines() -> str:
+  return "\n".join(
+    f'  ensure_url_insteadof("{url_key}", "{instead_of}")' for url_key, instead_of in gitee_insteadof_rules()
+  )
 
 
 @dataclass(frozen=True)
@@ -117,17 +155,50 @@ class MainRepoSource:
 
 
 def main_repo_source_gitee() -> MainRepoSource:
-  """主仓 · Gitee（xc2026/sunnypilot_cn）。"""
+  """主仓 · Gitee（{GITEE_OWNER}/sunnypilot_cn）。"""
+  o = GITEE_OWNER
+  ssh = gitee_git_ssh_repo("sunnypilot_cn")
+  https = f"{gitee_https_repo('sunnypilot_cn')}.git"
   return MainRepoSource(
     id="gitee",
     label="Gitee",
-    ssh_url="git@gitee.com:xc2026/sunnypilot_cn.git",
-    https_url="https://gitee.com/xc2026/sunnypilot_cn.git",
-    installer_ssh_define='#define GIT_SSH_URL "git@gitee.com:xc2026/sunnypilot_cn.git"',
-    version_remote_key="gitee.com/xc2026/sunnypilot_cn",
+    ssh_url=ssh,
+    https_url=https,
+    installer_ssh_define=f'#define GIT_SSH_URL "{ssh}"',
+    version_remote_key=f"gitee.com/{o}/sunnypilot_cn",
     git_remote_name="origin",
     push_lfs_skip=True,
   )
+
+
+def gitee_mirror_needles() -> list[str]:
+  """verify_patches / 门禁：应从 GITEE_OWNER 派生的镜像 URL 片段。"""
+  g = main_repo_source_gitee()
+  o = GITEE_OWNER
+  needles: list[str] = [
+    g.https_url,
+    g.ssh_url,
+    g.version_remote_key,
+    f"gitee.com/{o}/",
+    f"git@gitee.com:{o}/",
+  ]
+  for repo in (
+    "sunnypilot-models",
+    "openpilot-mapd",
+    "Catch2.git",
+    "dependencies.git",
+    "msgq.git",
+    "opendbc.git",
+    "rednose.git",
+    "teleoprtc.git",
+    "tinygrad.git",
+    "panda.git",
+    "neural_network_data.git",
+    "sp-cn_install",
+  ):
+    needles.append(f"gitee.com/{o}/{repo}")
+  needles.append(gitee_sp_cn_installer_openpilot_url())
+  return list(dict.fromkeys(needles))
 
 
 def main_repo_source_codeup() -> MainRepoSource:
@@ -1374,7 +1445,7 @@ def inject_updated_insteadof_block_flex(s: str) -> str:
   """在 updated.py 中注入 ensure_url_insteadof；兼容上游微调 for option 循环。"""
   if "ensure_url_insteadof(" in s:
     return s
-  block = """
+  block = f"""
 
   def ensure_url_insteadof(url_key: str, instead_of: str) -> None:
     \"\"\"Idempotently add a url.<base>.insteadof rewrite rule to the repo config.\"\"\"
@@ -1387,10 +1458,7 @@ def inject_updated_insteadof_block_flex(s: str) -> str:
     run([\"git\", \"config\", \"--add\", url_key, instead_of], cwd)
 
   # 国内化：将常见 GitHub 源自动重写到 Gitee 镜像（同时覆盖 https 与 ssh）。
-  ensure_url_insteadof(\"url.https://gitee.com/xc2026/.insteadof\", \"https://github.com/\")
-  ensure_url_insteadof(\"url.https://gitee.com/xc2026/.insteadof\", \"https://raw.githubusercontent.com/\")
-  ensure_url_insteadof(\"url.git@gitee.com:xc2026/.insteadof\", \"git@github.com:\")
-  ensure_url_insteadof(\"url.git@gitee.com:xc2026/.insteadof\", \"ssh://git@github.com/\")
+{_render_gitee_insteadof_ensure_lines()}
 """
   anchors = [
     "for option, value in git_cfg:\n    run([\"git\", \"config\", option, value], cwd)\n",
@@ -1817,43 +1885,44 @@ def _track_change(res: PatchResult, path: Path, changed: bool) -> None:
     res.changed_files.append(str(path))
 
 
-_INSTALLER_CN_ROUTE_BLOCK = '''
+def _installer_cn_route_block(gitee: MainRepoSource, codeup: MainRepoSource) -> str:
+  return f'''
 #include <unistd.h>
 
 // cn_main_repo_route_installer — author: /data/ssh/id_ed25519_codeup → Codeup, else Gitee public
 static const char *CN_DATA_CODEUP_KEY = "/data/ssh/id_ed25519_codeup";
-static const char *CN_GITEE_HTTPS = "https://gitee.com/xc2026/sunnypilot_cn.git";
-static const char *CN_GITEE_SSH = "git@gitee.com:xc2026/sunnypilot_cn.git";
-static const char *CN_CODEUP_HTTPS = "https://codeup.aliyun.com/6a0b0c8d706afd34aa607161/sunnypilot_cn.git";
-static const char *CN_CODEUP_SSH = "git@codeup.aliyun.com:6a0b0c8d706afd34aa607161/sunnypilot_cn.git";
+static const char *CN_GITEE_HTTPS = "{gitee.https_url}";
+static const char *CN_GITEE_SSH = "{gitee.ssh_url}";
+static const char *CN_CODEUP_HTTPS = "{codeup.https_url}";
+static const char *CN_CODEUP_SSH = "{codeup.ssh_url}";
 
-static bool cn_is_author_device() {
+static bool cn_is_author_device() {{
   return access(CN_DATA_CODEUP_KEY, F_OK) == 0;
-}
+}}
 
-static std::string cn_main_repo_https_url() {
+static std::string cn_main_repo_https_url() {{
   return cn_is_author_device() ? CN_CODEUP_HTTPS : CN_GITEE_HTTPS;
-}
+}}
 
-static std::string cn_main_repo_ssh_url() {
+static std::string cn_main_repo_ssh_url() {{
   return cn_is_author_device() ? CN_CODEUP_SSH : CN_GITEE_SSH;
-}
+}}
 
-static void cn_prepare_installer_git_env() {
-  if (!cn_is_author_device()) {
+static void cn_prepare_installer_git_env() {{
+  if (!cn_is_author_device()) {{
     unsetenv("GIT_SSH_COMMAND");
     return;
-  }
+  }}
   setenv("GIT_SSH_COMMAND",
          "ssh -i /data/ssh/id_ed25519_codeup -o IdentitiesOnly=yes "
          "-o StrictHostKeyChecking=accept-new -o BatchMode=yes",
          1);
-}
+}}
 
 '''
 
 
-def _inject_installer_cn_route(s: str, gitee: MainRepoSource) -> str:
+def _inject_installer_cn_route(s: str, gitee: MainRepoSource, codeup: MainRepoSource) -> str:
   """刷机安装器：有私钥走 Codeup，无钥走 Gitee 公开。"""
   s2 = apply_text_replacement_rows(
     s,
@@ -1870,7 +1939,7 @@ def _inject_installer_cn_route(s: str, gitee: MainRepoSource) -> str:
     anchor = '#include "third_party/raylib/include/raylib.h"\n'
     if anchor not in s2:
       raise RuntimeError("installer.cc: 未找到 raylib include，无法注入 cn_main_repo_route_installer")
-    s2 = s2.replace(anchor, anchor + _INSTALLER_CN_ROUTE_BLOCK, 1)
+    s2 = s2.replace(anchor, anchor + _installer_cn_route_block(gitee, codeup), 1)
 
   git_url_line = re.compile(
     r'const std::string GIT_URL = get_str\("[^"]+"\s*\?[^;]+;\s*\n',
@@ -1928,20 +1997,17 @@ def _inject_installer_cn_route(s: str, gitee: MainRepoSource) -> str:
   return s2
 
 
-def patch_cn_main_repo_route_py(root: Path) -> PatchResult:
-  res = PatchResult("cn_main_repo_route_py")
+def patch_main_repo_cn_routing(root: Path) -> PatchResult:
+  """主仓 cn_main_repo_route.py 全量写入 + installer 运行时选 URL。"""
+  res = PatchResult("main_repo_cn_routing")
   route_py = root / "system/cn_main_repo_route.py"
   body = _render_cn_main_repo_route_py(main_repo_source_gitee(), main_repo_source_codeup())
   _track_change(res, route_py, write_if_changed(route_py, body))
-  return res
-
-
-def patch_installer_urls(root: Path) -> PatchResult:
-  res = PatchResult("installer_urls")
   gitee = main_repo_source_gitee()
+  codeup = main_repo_source_codeup()
   installer = root / "selfdrive/ui/installer/installer.cc"
   s = installer.read_text(encoding="utf-8")
-  s2 = _inject_installer_cn_route(s, gitee)
+  s2 = _inject_installer_cn_route(s, gitee, codeup)
   _track_change(res, installer, write_if_changed(installer, s2))
   return res
 
@@ -1974,22 +2040,45 @@ def patch_updated_insteadof(root: Path) -> PatchResult:
   return res
 
 
+def inject_mici_home_repo_suffix_flex(s: str, path: Path) -> str:
+  """在 mici home.py 的 _get_version_text return 行注入 main_repo_ui_suffix（多锚点 + regex）。"""
+  if "main_repo_ui_suffix" in s:
+    return s
+  import_line = "    from openpilot.system.cn_main_repo_route import main_repo_ui_suffix\n"
+
+  def _inject_for_slice(n: int) -> str:
+    return (
+      import_line
+      + f"    return version, branch, commit[:{n}] + main_repo_ui_suffix(), date_str"
+    )
+
+  anchors = [
+    "    return version, branch, commit[:7], date_str",
+    "    return version, branch, commit[:8], date_str",
+  ]
+  for old in anchors:
+    if old in s:
+      m = re.search(r"commit\[:(\d+)\]", old)
+      n = int(m.group(1)) if m else 7
+      return s.replace(old, _inject_for_slice(n), 1)
+  m = re.search(
+    r"\n([ \t]+return version, branch, commit\[:(\d+)\], date_str)",
+    s,
+  )
+  if m:
+    old = m.group(0).lstrip("\n")
+    n = int(m.group(2))
+    return s.replace(old, _inject_for_slice(n), 1)
+  raise RuntimeError(f"{path}: 未找到 _get_version_text return，无法注入 {_CN_MICI_HOME_SUFFIX_SENTINEL}")
+
+
 def patch_mici_home_repo_suffix(root: Path) -> PatchResult:
   res = PatchResult("mici_home_repo_suffix")
   home_py = root / "selfdrive/ui/mici/layouts/home.py"
   if not home_py.exists():
     return res
   s = home_py.read_text(encoding="utf-8")
-  if "main_repo_ui_suffix" in s:
-    return res
-  old = "    return version, branch, commit[:7], date_str"
-  new = (
-    "    from openpilot.system.cn_main_repo_route import main_repo_ui_suffix\n"
-    "    return version, branch, commit[:7] + main_repo_ui_suffix(), date_str"
-  )
-  if old not in s:
-    raise RuntimeError(f"{home_py}: 未找到 _get_version_text return，无法注入 {_CN_MICI_HOME_SUFFIX_SENTINEL}")
-  s2 = s.replace(old, new, 1)
+  s2 = inject_mici_home_repo_suffix_flex(s, home_py)
   _track_change(res, home_py, write_if_changed(home_py, s2))
   return res
 
@@ -2002,7 +2091,7 @@ def patch_tici_setup(root: Path) -> PatchResult:
 
   s = tici_setup.read_text(encoding="utf-8")
   orig = s
-  gitee_install = 'OPENPILOT_URL = "https://gitee.com/xc2026/sp-cn_install/raw/master/installer_openpilot"\n'
+  gitee_install = f'OPENPILOT_URL = "{gitee_sp_cn_installer_openpilot_url()}"\n'
   s = replace_first_alias(
     s,
     [
@@ -2013,9 +2102,9 @@ def patch_tici_setup(root: Path) -> PatchResult:
   )
   if "CONNECTIVITY_CHECK_URLS" not in s:
     s = s.replace(
-      'OPENPILOT_URL = "https://gitee.com/xc2026/sp-cn_install/raw/master/installer_openpilot"\n',
-      'OPENPILOT_URL = "https://gitee.com/xc2026/sp-cn_install/raw/master/installer_openpilot"\n'
-      '# 国内环境可能无法访问 openpilot.comma.ai，导致安装流程卡在 “Waiting for internet”。\n'
+      gitee_install,
+      gitee_install
+      + '# 国内环境可能无法访问 openpilot.comma.ai，导致安装流程卡在 “Waiting for internet”。\n'
       '# 这里使用多个候选 URL：任意一个可访问即认为“已联网”。\n'
       'CONNECTIVITY_CHECK_URLS = [\n'
       '  # 恢复/刚刷机阶段系统时间可能不准，HTTPS 证书校验会失败，导致误判“无网络”\n'
@@ -2103,7 +2192,7 @@ def patch_mici_setup(root: Path) -> PatchResult:
     return res
   s = mici_setup.read_text(encoding="utf-8")
   orig = s
-  gitee_install = 'OPENPILOT_URL = "https://gitee.com/xc2026/sp-cn_install/raw/master/installer_openpilot"\n'
+  gitee_install = f'OPENPILOT_URL = "{gitee_sp_cn_installer_openpilot_url()}"\n'
   s = replace_first_alias(
     s,
     [
@@ -2114,9 +2203,9 @@ def patch_mici_setup(root: Path) -> PatchResult:
   )
   if "CONNECTIVITY_CHECK_URLS" not in s:
     s = s.replace(
-      'OPENPILOT_URL = "https://gitee.com/xc2026/sp-cn_install/raw/master/installer_openpilot"\n',
-      'OPENPILOT_URL = "https://gitee.com/xc2026/sp-cn_install/raw/master/installer_openpilot"\n'
-      '# 国内环境可能无法访问 openpilot.comma.ai，导致 setup 卡在 “waiting for internet...”。\n'
+      gitee_install,
+      gitee_install
+      + '# 国内环境可能无法访问 openpilot.comma.ai，导致 setup 卡在 “waiting for internet...”。\n'
       '# 这里使用多个候选 URL：任意一个可访问即认为“已联网”。\n'
       'CONNECTIVITY_CHECK_URLS = [\n'
       '  # 恢复/刚刷机阶段系统时间可能不准，HTTPS 证书校验会失败，导致误判“无网络”\n'
@@ -2232,7 +2321,7 @@ def patch_msgq_setup(root: Path) -> PatchResult:
       [
         (
           _with_git_url_variants("https://github.com/catchorg/Catch2.git"),
-          "https://gitee.com/xc2026/Catch2.git",
+          gitee_https_repo("Catch2.git"),
         ),
       ],
       path=msgq_setup,
@@ -2256,7 +2345,7 @@ def patch_opendbc_pyproject(root: Path) -> PatchResult:
             "git+https://github.com/commaai/dependencies",
             "git+http://github.com/commaai/dependencies.git",
           ],
-          "git+https://gitee.com/xc2026/dependencies.git",
+          f"git+{gitee_https_repo('dependencies.git')}",
         ),
       ],
       path=opendbc_pyproj,
@@ -2278,7 +2367,7 @@ def patch_models_fetcher(root: Path) -> PatchResult:
           "https://raw.githubusercontent.com/sunnypilot/sunnypilot-models/",
           "https://raw.githubusercontent.com/sunnypilot/sunnypilot-models",
         ],
-        "https://gitee.com/xc2026/sunnypilot-models/raw/",
+        gitee_raw_repo("sunnypilot-models"),
       ),
     ],
     path=fetcher,
@@ -2300,7 +2389,7 @@ def patch_osm(root: Path) -> PatchResult:
           "https://raw.githubusercontent.com/pfeiferj/openpilot-mapd/main/",
           "https://raw.githubusercontent.com/pfeiferj/openpilot-mapd/main",
         ],
-        "https://gitee.com/xc2026/openpilot-mapd/raw/main/",
+        gitee_raw_repo("openpilot-mapd", "main"),
       ),
     ],
     path=osm_py,
@@ -2314,7 +2403,7 @@ def patch_mapd_installer(root: Path) -> PatchResult:
   res = PatchResult("mapd_installer")
   mapd_installer = root / "sunnypilot/mapd/mapd_installer.py"
   s = mapd_installer.read_text(encoding="utf-8")
-  if "gitee.com/xc2026/openpilot-mapd" in s:
+  if f"gitee.com/{GITEE_OWNER}/openpilot-mapd" in s:
     return res
   s2 = s
   if 'os.getenv("MAPD_TAG"' not in s and "os.getenv('MAPD_TAG'" not in s:
@@ -2335,7 +2424,7 @@ def patch_mapd_installer(root: Path) -> PatchResult:
           "https://github.com/pfeiferj/openpilot-mapd/releases/download/",
           "http://github.com/pfeiferj/openpilot-mapd/releases/download/",
         ],
-        "https://gitee.com/xc2026/openpilot-mapd/releases/download/",
+        f"{gitee_https_repo('openpilot-mapd')}/releases/download/",
       ),
     ],
     path=mapd_installer,
@@ -2588,13 +2677,13 @@ def patch_gitmodules(root: Path) -> PatchResult:
   gm2 = apply_text_replacement_rows(
     gm,
     [
-      (_with_git_url_variants("https://github.com/commaai/msgq.git"), "git@gitee.com:xc2026/msgq.git"),
-      (_with_git_url_variants("https://github.com/sunnypilot/opendbc.git"), "git@gitee.com:xc2026/opendbc.git"),
-      (_with_git_url_variants("https://github.com/commaai/rednose.git"), "git@gitee.com:xc2026/rednose.git"),
-      (teleop_old, "git@gitee.com:xc2026/teleoprtc.git"),
-      (_with_git_url_variants("https://github.com/sunnypilot/tinygrad.git"), "git@gitee.com:xc2026/tinygrad.git"),
-      (_with_git_url_variants("https://github.com/sunnyhaibin/panda.git"), "git@gitee.com:xc2026/panda.git"),
-      (_with_git_url_variants("https://github.com/sunnypilot/neural-network-data.git"), "git@gitee.com:xc2026/neural_network_data.git"),
+      (_with_git_url_variants("https://github.com/commaai/msgq.git"), gitee_git_ssh_repo("msgq")),
+      (_with_git_url_variants("https://github.com/sunnypilot/opendbc.git"), gitee_git_ssh_repo("opendbc")),
+      (_with_git_url_variants("https://github.com/commaai/rednose.git"), gitee_git_ssh_repo("rednose")),
+      (teleop_old, gitee_git_ssh_repo("teleoprtc")),
+      (_with_git_url_variants("https://github.com/sunnypilot/tinygrad.git"), gitee_git_ssh_repo("tinygrad")),
+      (_with_git_url_variants("https://github.com/sunnyhaibin/panda.git"), gitee_git_ssh_repo("panda")),
+      (_with_git_url_variants("https://github.com/sunnypilot/neural-network-data.git"), gitee_git_ssh_repo("neural_network_data")),
     ],
     path=gitmodules,
     require_all=False,
@@ -2605,8 +2694,7 @@ def patch_gitmodules(root: Path) -> PatchResult:
 
 def patch_all(root: Path) -> list[PatchResult]:
   patches = [
-    patch_cn_main_repo_route_py,
-    patch_installer_urls,
+    patch_main_repo_cn_routing,
     patch_version_py,
     patch_updated_insteadof,
     patch_mici_home_repo_suffix,
@@ -2709,6 +2797,9 @@ def verify_patches(root: Path) -> None:
     errors.append("system/updated/updated.py: 缺少 prepare_main_repo_git 注入")
   if "inject_cn_check_for_update_order" not in upd:
     errors.append("system/updated/updated.py: check_for_update 未在 ls-remote 前调用 setup_git_options")
+  owner_needle = f"gitee.com/{GITEE_OWNER}"
+  if "ensure_url_insteadof" in upd and owner_needle not in upd:
+    errors.append(f"system/updated/updated.py: ensure_url_insteadof 未指向 Gitee 组织 {GITEE_OWNER!r}")
 
   if gitee.version_remote_key not in rt("tools/setup.sh"):
     errors.append(f"tools/setup.sh: 缺少主仓 URL（{gitee.label} 公开默认）")
@@ -2717,21 +2808,26 @@ def verify_patches(root: Path) -> None:
   if home_py.exists() and "main_repo_ui_suffix" not in rt("selfdrive/ui/mici/layouts/home.py"):
     errors.append("selfdrive/ui/mici/layouts/home.py: 缺少 main_repo_ui_suffix（主页 commit 后缀）")
 
-  if (root / "msgq_repo/setup.sh").exists() and "gitee.com/xc2026/Catch2" not in rt("msgq_repo/setup.sh"):
-    errors.append("msgq_repo/setup.sh: 缺少 Gitee Catch2 URL")
+  mirror_needles = gitee_mirror_needles()
+  catch2_needle = next(n for n in mirror_needles if "Catch2" in n)
+  if (root / "msgq_repo/setup.sh").exists() and catch2_needle not in rt("msgq_repo/setup.sh"):
+    errors.append(f"msgq_repo/setup.sh: 缺少 Gitee Catch2 URL（期望含 {catch2_needle!r}）")
 
   if (root / "opendbc_repo/pyproject.toml").exists():
-    if "gitee.com/xc2026/dependencies" not in rt("opendbc_repo/pyproject.toml"):
-      errors.append("opendbc_repo/pyproject.toml: 缺少 Gitee dependencies URL")
+    dep_needle = f"gitee.com/{GITEE_OWNER}/dependencies"
+    if dep_needle not in rt("opendbc_repo/pyproject.toml"):
+      errors.append(f"opendbc_repo/pyproject.toml: 缺少 Gitee dependencies URL（期望含 {dep_needle!r}）")
 
-  if "gitee.com/xc2026/sunnypilot-models" not in rt("sunnypilot/models/fetcher.py"):
-    errors.append("sunnypilot/models/fetcher.py: 缺少 Gitee models raw URL")
+  models_needle = f"gitee.com/{GITEE_OWNER}/sunnypilot-models"
+  if models_needle not in rt("sunnypilot/models/fetcher.py"):
+    errors.append(f"sunnypilot/models/fetcher.py: 缺少 Gitee models raw URL（期望含 {models_needle!r}）")
 
-  if "gitee.com/xc2026/openpilot-mapd" not in rt("selfdrive/ui/sunnypilot/layouts/settings/osm.py"):
-    errors.append("selfdrive/ui/sunnypilot/layouts/settings/osm.py: 缺少 Gitee mapd raw URL")
+  mapd_needle = f"gitee.com/{GITEE_OWNER}/openpilot-mapd"
+  if mapd_needle not in rt("selfdrive/ui/sunnypilot/layouts/settings/osm.py"):
+    errors.append(f"selfdrive/ui/sunnypilot/layouts/settings/osm.py: 缺少 Gitee mapd raw URL（期望含 {mapd_needle!r}）")
 
-  if "gitee.com/xc2026/openpilot-mapd" not in rt("sunnypilot/mapd/mapd_installer.py"):
-    errors.append("sunnypilot/mapd/mapd_installer.py: 缺少 Gitee mapd release URL")
+  if mapd_needle not in rt("sunnypilot/mapd/mapd_installer.py"):
+    errors.append(f"sunnypilot/mapd/mapd_installer.py: 缺少 Gitee mapd release URL（期望含 {mapd_needle!r}）")
 
   if (root / ".gitmodules").exists():
     gm = rt(".gitmodules")
@@ -2747,8 +2843,9 @@ def verify_patches(root: Path) -> None:
   for rel, label in (("system/ui/tici_setup.py", "tici_setup"), ("system/ui/mici_setup.py", "mici_setup")):
     if (root / rel).exists():
       tx = rt(rel)
-      if "OPENPILOT_URL" in tx and "gitee.com/xc2026/sp-cn_install" not in tx:
-        errors.append(f"{label}: 仍存在 OPENPILOT_URL 但未指向 Gitee sp-cn_install")
+      sp_install = f"gitee.com/{GITEE_OWNER}/sp-cn_install"
+      if "OPENPILOT_URL" in tx and sp_install not in tx:
+        errors.append(f"{label}: 仍存在 OPENPILOT_URL 但未指向 Gitee sp-cn_install（期望含 {sp_install!r}）")
 
   helpers_dm = root / "selfdrive/monitoring/helpers.py"
   if helpers_dm.exists():
@@ -2768,6 +2865,11 @@ def verify_patches(root: Path) -> None:
       )
     if re.search(r"max\s*\(\s*self\.awareness\s*-\s*self\.step_change\s*,\s*-0\.1\s*\)", hm):
       errors.append("selfdrive/monitoring/helpers.py: 仍存在原版 -0.1 awareness 下限（空白不限），DM 补丁未生效")
+    if not re.search(
+      r"max\s*\(\s*self\.awareness\s*-\s*self\.step_change\s*,\s*0\.?\s*\)",
+      hm,
+    ):
+      errors.append("selfdrive/monitoring/helpers.py: 缺少 0. awareness 下限，DM 补丁未生效")
     # 上游若换行/缩进与旧版不同，仍应能检出「红线 alert 下一行仍在 += terminal_time」
     if re.search(
       r"driverDistracted3[^\n]*\n\s*self\.terminal_time\s*\+=\s*1",
@@ -2775,6 +2877,12 @@ def verify_patches(root: Path) -> None:
       re.MULTILINE,
     ):
       errors.append("selfdrive/monitoring/helpers.py: 红线分支仍在累计 terminal_time，DM 补丁未生效")
+    if re.search(
+      r"driverDistracted3[^\n]*\n\s*self\.terminal_alert_cnt\s*\+=\s*1",
+      hm,
+      re.MULTILINE,
+    ):
+      errors.append("selfdrive/monitoring/helpers.py: 红线分支仍在累计 terminal_alert_cnt，DM 补丁未生效")
 
   # 语法兜底（不验证逻辑正确性）
   py_verify = [
@@ -2887,7 +2995,7 @@ def ensure_tinygrad_submodule_commit_reachable() -> None:
   子模块 update 阶段仍走 GitHub upstream；此处仅为 Gitee 克隆者兜底。
   """
   sha = "3501a714785ff370cffb966a45d5f9cdf6c9ea7a"
-  url = "git@gitee.com:xc2026/tinygrad.git"
+  url = gitee_git_ssh_repo("tinygrad")
 
   def _gitee_has_commit(port: int) -> bool:
     with tempfile.TemporaryDirectory() as td:
