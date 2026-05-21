@@ -3293,13 +3293,16 @@ def main() -> None:
       upstream_sha = run(["git", "rev-parse", f"upstream/{branch}"], str(root), env=env).strip().lower()
 
       recorded_sha: str | None = None
+      gitee_head_sha: str | None = None
       try:
         # 只取远端最新一条提交即可（不依赖本地历史）
         run(["git", "fetch", "--depth=1", "origin", branch], str(root), env=env)
+        gitee_head_sha = run(["git", "rev-parse", "FETCH_HEAD"], str(root), env=env).strip().lower()
         body = run(["git", "log", "-1", "--format=%B", "FETCH_HEAD"], str(root), env=env)
         recorded_sha = parse_recorded_upstream_sha(body, branch)
       except Exception:
         recorded_sha = None
+        gitee_head_sha = None
 
       recorded_canon = canonical_commit_sha(recorded_sha, root, env)
 
@@ -3326,10 +3329,11 @@ def main() -> None:
         rec_note = short_sha(recorded_canon) or recorded_canon[:EMAIL_SHA_LEN]
       elif recorded_sha:
         rec_note = short_sha(recorded_sha) or recorded_sha[:EMAIL_SHA_LEN]
-      elif force_sync:
-        rec_note = f"（Gitee 提交信息中无 upstream-{branch} 行；本次为手动 Force 重同步）"
+      elif gitee_head_sha:
+        # 提交正文无 upstream-* 行时，用 Gitee 该分支最新提交短哈希（与旧版成功邮件一致，避免长段说明）
+        rec_note = short_sha(gitee_head_sha) or gitee_head_sha[:EMAIL_SHA_LEN]
       else:
-        rec_note = f"（Gitee 提交信息中无 upstream-{branch} 行）"
+        rec_note = "—"
       up_note = short_sha(upstream_sha) or upstream_sha[:EMAIL_SHA_LEN]
       ci_sync_state.setdefault("notify_branch_notes", []).append(
         f"- {branch}: 上次 Gitee 记录 upstream-{branch}={rec_note} → 当前 upstream/{branch}={up_note}"
