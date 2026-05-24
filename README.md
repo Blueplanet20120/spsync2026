@@ -1,6 +1,6 @@
 # sunnypilot_cn（GitHub→Gitee 自动同步闭环）
 
-本仓库用于将上游 [`sunnypilot/sunnypilot`](https://github.com/sunnypilot/sunnypilot) 的 **`staging`** 分支定时同步到你的 Gitee 仓库（**不对上游 `master` 打补丁或推送**，避免重复大包推送；设备侧使用 `staging`）。同步过程中会应用“国内化补丁”（将常见 GitHub/Raw 地址重写为 Gitee 镜像等）。
+本仓库用于将上游 [`sunnypilot/sunnypilot`](https://github.com/sunnypilot/sunnypilot) 的 **`staging`** 分支定时同步到你的 Gitee 仓库（**不对上游 `master` 打补丁或推送**，避免重复大包推送；设备侧使用 `staging`）。同步过程中会应用“国内化补丁”（将常见 GitHub/Raw 地址重写为 Gitee 镜像等）。。
 
 同步逻辑由：
 - 云端 / CI：[`tools/sync_to_gitee.py`](tools/sync_to_gitee.py) + [`.github/workflows/sync-to-gitee.yml`](.github/workflows/sync-to-gitee.yml)

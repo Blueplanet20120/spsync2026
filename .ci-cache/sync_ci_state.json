@@ -1,0 +1,32 @@
+{
+  "attempted": false,
+  "pushed": true,
+  "pushed_gitee": true,
+  "pushed_codeup": false,
+  "to_push": false,
+  "branches": [],
+  "sync_reason_tags": [],
+  "push_results": {
+    "codeup": {
+      "enabled": true,
+      "label": "Codeup",
+      "overall": "fail",
+      "branches": {
+        "staging": {
+          "status": "skip",
+          "detail": "无 SSH 密钥且无 HTTPS 令牌"
+        }
+      }
+    },
+    "gitee": {
+      "enabled": true,
+      "label": "Gitee",
+      "overall": "ok",
+      "branches": {
+        "staging": {
+          "status": "ok"
+        }
+      }
+    }
+  }
+}
