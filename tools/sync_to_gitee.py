@@ -213,7 +213,7 @@ def main_repo_source_codeup() -> MainRepoSource:
     ),
     version_remote_key="codeup.aliyun.com/6a0b0c8d706afd34aa607161/sunnypilot_cn",
     git_remote_name="aliyun",
-    push_lfs_skip=False,
+    push_lfs_skip=True,
   )
 
 
@@ -750,22 +750,22 @@ def aliyun_ssh_key_path() -> Path:
 
 
 def aliyun_git_push_env(base_env: dict[str, str]) -> dict[str, str]:
-  """推送到云效（SSH）：专用密钥，并启用 LFS 上传。"""
+  """推送到云效（SSH）：专用密钥；与 Gitee 一致跳过 LFS 上传（OTA 不依赖主仓 LFS）。"""
   out = dict(base_env)
   key = aliyun_ssh_key_path()
   out["GIT_SSH_COMMAND"] = (
     f"ssh -i {key} -o StrictHostKeyChecking=no -o BatchMode=yes"
   )
-  out["GIT_LFS_SKIP_PUSH"] = "0"
+  out["GIT_LFS_SKIP_PUSH"] = "1"
   return out
 
 
 def aliyun_git_https_push_env(base_env: dict[str, str]) -> dict[str, str]:
-  """推送到云效（HTTPS）：与 Codeup 官方指引一致，凭据嵌入 remote URL（oauth2:令牌）。"""
+  """推送到云效（HTTPS）：凭据嵌入 remote URL；与 Gitee 一致跳过 LFS。"""
   out = dict(base_env)
   out.pop("GIT_SSH_COMMAND", None)
   out["GIT_TERMINAL_PROMPT"] = "0"
-  out["GIT_LFS_SKIP_PUSH"] = "0"
+  out["GIT_LFS_SKIP_PUSH"] = "1"
   return out
 
 
