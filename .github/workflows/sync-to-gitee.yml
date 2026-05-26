@@ -311,7 +311,7 @@ jobs:
           to: ${{ secrets.MAIL_TO }}
           from: ${{ secrets.MAIL_FROM }}
           body: |
-            sunnypilot_cn 同步失败：pull 阶段未成功（补丁/拉取），未执行推送。
+            spsync2026 同步失败：pull 阶段未成功（补丁/拉取），未执行推送。
 
             pull: ${{ steps.sync_pull.outcome }}
 
