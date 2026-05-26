@@ -10,3 +10,15 @@ __pycache__/
 spcn_install.sh
 installer_openpilot_staging
 .venv/
+
+# 仅本机保留，不推送到 GitHub（公开仓亦不上传）
+README.md
+sp_sync.py
+sp-sync
+setup_local_venv.cmd
+tools/requirements-sync.txt
+tools/setup_local_venv.py
+tools/setup_local_venv.sh
+tools/sync_to_gitee_local.py
+.cursor/
+.ci-cache/
