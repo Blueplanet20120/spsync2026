@@ -12,7 +12,6 @@ installer_openpilot_staging
 .venv/
 
 # 仅本机保留，不推送到 GitHub（公开仓亦不上传）
-README.md
 sp_sync.py
 sp-sync
 setup_local_venv.cmd
