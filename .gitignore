@@ -19,5 +19,7 @@ tools/requirements-sync.txt
 tools/setup_local_venv.py
 tools/setup_local_venv.sh
 tools/sync_to_gitee_local.py
+sunnypilot_cn_github\README_local.md
 .cursor/
 .ci-cache/
+.gitignore
