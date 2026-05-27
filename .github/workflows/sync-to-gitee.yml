@@ -241,18 +241,18 @@ jobs:
         if: >-
           steps.sync_pull.outcome == 'success' &&
           steps.push_targets.outputs.gitee_enabled == 'true'
-        timeout-minutes: 10
+        timeout-minutes: 15
         continue-on-error: true
         shell: bash
         env:
           GITEE_REPO_SSH: ${{ secrets.GITEE_REPO_SSH }}
           GIT_LFS_SKIP_PUSH: "1"
-          GITEE_PUSH_TIMEOUT_S: "600"
+          GITEE_PUSH_TIMEOUT_S: "900"
           SP_CN_TOKEN: ${{ secrets.SP_CN_TOKEN }}
         run: |
           set -euo pipefail
           WORKDIR="$GITHUB_WORKSPACE/sunnypilot"
-          echo "[push-gitee] single attempt (step timeout 10min)"
+          echo "[push-gitee] single attempt (step timeout 15min)"
           set +e
           python3 "$GITHUB_WORKSPACE/tools/sync_to_gitee.py" \
             --action push-gitee \
