@@ -450,8 +450,9 @@ def _build_push_results_section(state: dict[str, object]) -> str:
         st = str(rec.get("status", "pending"))
         extra = str(rec.get("detail", "")).strip()
         line = f"  - {br}: {_push_status_label(st)}"
+        # 邮件里不回显命令失败的原始输出/命令行（避免噪声/潜在泄露）；需要细节请查 Actions 日志。
         if extra and st != "ok":
-          line += f"（{extra}）"
+          line += "（详见 Actions 日志）"
         lines.append(line)
     elif entry.get("overall") in ("skip", "pending"):
       lines.append("  - （本轮无待推送分支或未执行 push step）")
