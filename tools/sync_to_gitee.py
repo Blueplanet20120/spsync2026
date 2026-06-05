@@ -2331,20 +2331,23 @@ def patch_setup_sh(root: Path) -> PatchResult:
 def patch_msgq_setup(root: Path) -> PatchResult:
   res = PatchResult("msgq_setup")
   msgq_setup = root / "msgq_repo/setup.sh"
-  if msgq_setup.exists():
-    s = msgq_setup.read_text(encoding="utf-8")
-    s2 = apply_text_replacement_rows(
-      s,
-      [
-        (
-          _with_git_url_variants("https://github.com/catchorg/Catch2.git"),
-          gitee_https_repo("Catch2.git"),
-        ),
-      ],
-      path=msgq_setup,
-      require_all=True,
-    )
-    _track_change(res, msgq_setup, write_if_changed(msgq_setup, s2))
+  if not msgq_setup.exists():
+    return res
+  s = msgq_setup.read_text(encoding="utf-8")
+  catch2_old = _with_git_url_variants("https://github.com/catchorg/Catch2.git")
+  catch2_new = gitee_https_repo("Catch2.git")
+  # 上游 staging 已改为 uv sync，setup.sh 内不再 git clone Catch2；无旧 URL 则跳过。
+  if not any(o in s for o in catch2_old) and catch2_new not in s:
+    return res
+  s2 = apply_text_replacement_rows(
+    s,
+    [
+      (catch2_old, catch2_new),
+    ],
+    path=msgq_setup,
+    require_all=True,
+  )
+  _track_change(res, msgq_setup, write_if_changed(msgq_setup, s2))
   return res
 
 
@@ -2827,8 +2830,12 @@ def verify_patches(root: Path) -> None:
 
   mirror_needles = gitee_mirror_needles()
   catch2_needle = next(n for n in mirror_needles if "Catch2" in n)
-  if (root / "msgq_repo/setup.sh").exists() and catch2_needle not in rt("msgq_repo/setup.sh"):
-    errors.append(f"msgq_repo/setup.sh: 缺少 Gitee Catch2 URL（期望含 {catch2_needle!r}）")
+  msgq_setup_path = root / "msgq_repo/setup.sh"
+  if msgq_setup_path.exists():
+    msgq_setup_text = rt("msgq_repo/setup.sh")
+    catch2_old = _with_git_url_variants("https://github.com/catchorg/Catch2.git")
+    if any(o in msgq_setup_text for o in catch2_old) and catch2_needle not in msgq_setup_text:
+      errors.append(f"msgq_repo/setup.sh: 缺少 Gitee Catch2 URL（期望含 {catch2_needle!r}）")
 
   if (root / "opendbc_repo/pyproject.toml").exists():
     dep_needle = f"gitee.com/{GITEE_OWNER}/dependencies"
