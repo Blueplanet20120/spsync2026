@@ -1923,6 +1923,22 @@ static void cn_prepare_installer_git_env() {{
 '''
 
 
+_RAYLIB_INCLUDE_ANCHORS = (
+  '#include "third_party/raylib/include/raylib.h"\n',
+  '#include "raylib.h"\n',
+)
+
+
+def _installer_cn_route_inject_anchor(s: str) -> str | None:
+  for anchor in _RAYLIB_INCLUDE_ANCHORS:
+    if anchor in s:
+      return anchor
+  hw_anchor = '#include "system/hardware/hw.h"\n'
+  if hw_anchor in s:
+    return hw_anchor
+  return None
+
+
 def _inject_installer_cn_route(s: str, gitee: MainRepoSource, codeup: MainRepoSource) -> str:
   """刷机安装器：有私钥走 Codeup，无钥走 Gitee 公开。"""
   s2 = apply_text_replacement_rows(
@@ -1937,9 +1953,9 @@ def _inject_installer_cn_route(s: str, gitee: MainRepoSource, codeup: MainRepoSo
     require_all=False,
   )
   if _CN_INSTALLER_ROUTE_SENTINEL not in s2:
-    anchor = '#include "third_party/raylib/include/raylib.h"\n'
-    if anchor not in s2:
-      raise RuntimeError("installer.cc: 未找到 raylib include，无法注入 cn_main_repo_route_installer")
+    anchor = _installer_cn_route_inject_anchor(s2)
+    if not anchor:
+      raise RuntimeError("installer.cc: 未找到 raylib/hw.h include 锚点，无法注入 cn_main_repo_route_installer")
     s2 = s2.replace(anchor, anchor + _installer_cn_route_block(gitee, codeup), 1)
 
   git_url_line = re.compile(
