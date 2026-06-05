@@ -2484,6 +2484,31 @@ _RE_DM_TERMINAL_STRIP = re.compile(
   re.MULTILINE,
 )
 
+# 策略 3：upstream staging 起 DM 迁至 policy.py（alertLevel 分级，无 EventName alert 变量）。
+_RE_DM_TERMINAL_POLICY_STRICT = re.compile(
+  r"^([ \t]+)if\s+self\.awareness\s*<=\s*(?:0\.|0)\s*:\s*\n"
+  r"[ \t]*#\s*terminal alert[^\n]*\n"
+  r"[ \t]*self\.alert_level\s*=\s*AlertLevel\.three\s*\n"
+  r"[ \t]*self\.terminal_time\s*\+=\s*1\s*\n"
+  r"[ \t]*if\s+awareness_prev\s*>\s*(?:0\.|0)\s*:\s*\n"
+  r"[ \t]*self\.terminal_alert_cnt\s*\+=\s*1",
+  re.MULTILINE,
+)
+
+
+def _dm_monitoring_path(root: Path) -> Path | None:
+  policy = root / "selfdrive/monitoring/policy.py"
+  if policy.exists():
+    return policy
+  helpers = root / "selfdrive/monitoring/helpers.py"
+  if helpers.exists():
+    return helpers
+  return None
+
+
+def _dm_is_policy_arch(s: str) -> bool:
+  return "def _update_events" in s and "AlertLevel.three" in s and "if alert is not None" not in s
+
 
 def _patch_dm_awareness_flexible(s: str, path_for_err: Path) -> str:
   """将 max(..., -0.1) 改为 0. 并带 sentinel；匹配处数必须为 1。"""
@@ -2493,7 +2518,7 @@ def _patch_dm_awareness_flexible(s: str, path_for_err: Path) -> str:
   if len(matches) == 0:
     raise RuntimeError(
       f"{path_for_err}: 未找到 max(self.awareness - self.step_change, -0.1)；"
-      "上游可能已改名 step_change 或改写递减逻辑，请人工对照 selfdrive/monitoring/helpers.py。"
+      "上游可能已改名 step_change 或改写递减逻辑，请人工对照 selfdrive/monitoring/policy.py 或 helpers.py。"
     )
   if len(matches) > 1:
     raise RuntimeError(
@@ -2543,9 +2568,26 @@ def _patch_dm_terminal_flexible(s: str, path_for_err: Path) -> str:
       f"{path_for_err}: 宽松模式匹配到多处「driverDistracted3 + terminal_time」片段（{len(strip_hits)}），请人工处理。"
     )
 
+  def _policy_strict(m: re.Match) -> str:
+    ind_if = m.group(1)
+    ind_body = ind_if + "  "
+    return (
+      f"{ind_if}if self.awareness <= 0.:\n"
+      f"{ind_body}# terminal alert: disengagement required ({_DM_SENTINEL_TERMINAL})\n"
+      f"{ind_body}self.alert_level = AlertLevel.three"
+    )
+
+  policy_hits = list(_RE_DM_TERMINAL_POLICY_STRICT.finditer(s))
+  if len(policy_hits) == 1:
+    return _RE_DM_TERMINAL_POLICY_STRICT.sub(_policy_strict, s, count=1)
+  if len(policy_hits) > 1:
+    raise RuntimeError(
+      f"{path_for_err}: policy 严格模式匹配到多处 terminal 累计块（{len(policy_hits)}），请人工处理。"
+    )
+
   raise RuntimeError(
-    f"{path_for_err}: 无法匹配 terminal 累计块（严格/宽松均失败）。"
-    "上游若重构 DM 分支，请对照 driverDistracted3 / terminal_time 附近代码手工合并补丁。"
+    f"{path_for_err}: 无法匹配 terminal 累计块（helpers 严格/宽松与 policy 严格均失败）。"
+    "上游若重构 DM 分支，请对照 terminal_time / alertLevel.three 附近代码手工合并补丁。"
   )
 
 
@@ -2554,9 +2596,9 @@ _RE_DM_RED_EXIT_HEADER = re.compile(
 )
 
 
-def _dm_red_exit_is_misplaced(s: str) -> bool:
+def _dm_red_exit_is_misplaced_helpers(s: str) -> bool:
   """
-  旧版补丁锚在 driverDistracted1 行之后，会落入 elif threshold_pre 分支（更深缩进）；
+  旧版 helpers 补丁锚在 driverDistracted1 行之后，会落入 elif threshold_pre 分支（更深缩进）；
   红线（awareness<=0）时该分支不执行，6 秒自动恢复形同虚设。
   正确位置：与 `if alert is not None` 同级，在整段 if/elif 分级之后。
   """
@@ -2567,6 +2609,27 @@ def _dm_red_exit_is_misplaced(s: str) -> bool:
   if not m_if_alert:
     return True
   return len(m_sent.group("ind")) != len(m_if_alert.group("ind"))
+
+
+def _dm_red_exit_is_misplaced_policy(s: str) -> bool:
+  """policy.py：red_exit 须在 alertLevel 分级 elif 链之后，不可嵌在 distracted 递减分支内。"""
+  m_sent = _RE_DM_RED_EXIT_HEADER.search(s)
+  m_anchor = re.search(
+    r"(?m)^(?P<ind>[ \t]+)elif self\.awareness <= self\.threshold_alert_1:\s*\n"
+    r"(?P=ind)  self\.alert_level = AlertLevel\.one\s*$",
+    s,
+  )
+  if not m_sent:
+    return False
+  if not m_anchor:
+    return True
+  return m_sent.start() <= m_anchor.end()
+
+
+def _dm_red_exit_is_misplaced(s: str) -> bool:
+  if _dm_is_policy_arch(s):
+    return _dm_red_exit_is_misplaced_policy(s)
+  return _dm_red_exit_is_misplaced_helpers(s)
 
 
 _RE_DM_RED_EXIT_BLOCK = re.compile(
@@ -2590,7 +2653,50 @@ _RE_DM_RED_EXIT_BLOCK = re.compile(
 )
 
 
-def _dm_red_exit_inject_block(ind: str) -> str:
+_RE_DM_RED_EXIT_BLOCK_POLICY = re.compile(
+  r"\n(?P<ind>[ \t]+)# cn_dm_relaxed: auto exit red after 6s attention\n"
+  r"(?P=ind)# allow recovery from red without disengage\.\n"
+  r"(?P=ind)# If driver is clearly attentive again for <=6s, exit red state automatically\.\n"
+  r"(?P=ind)if self\.awareness <= 0\.:\n"
+  r"(?P=ind)  attentive = \(self\.driver_distraction_filter\.x < 0\.37 and self\.face_detected and self\.pose\.low_std\)\n"
+  r"(?P=ind)  if attentive:\n"
+  r"(?P=ind)    self\.red_recover_cnt \+= 1\n"
+  r"(?P=ind)    if self\.red_recover_cnt \* DT_DMON >= 6\.0:\n"
+  r"(?P=ind)      # Move just above orange threshold so banner clears immediately\.\n"
+  r"(?P=ind)      self\.awareness = min\(1\.0, self\.threshold_alert_2 \+ 1e-3\)\n"
+  r"(?P=ind)      self\.alert_level = AlertLevel\.two\n"
+  r"(?P=ind)      self\.red_recover_cnt = 0\n"
+  r"(?P=ind)  else:\n"
+  r"(?P=ind)    self\.red_recover_cnt = 0\n"
+  r"(?P=ind)else:\n"
+  r"(?P=ind)  self\.red_recover_cnt = 0\n",
+  re.MULTILINE,
+)
+
+
+def _dm_red_exit_inject_block_policy(ind: str) -> str:
+  return (
+    f"\n"
+    f"{ind}# {_DM_SENTINEL_RED_EXIT}\n"
+    f"{ind}# allow recovery from red without disengage.\n"
+    f"{ind}# If driver is clearly attentive again for <=6s, exit red state automatically.\n"
+    f"{ind}if self.awareness <= 0.:\n"
+    f"{ind}  attentive = (self.driver_distraction_filter.x < 0.37 and self.face_detected and self.pose.low_std)\n"
+    f"{ind}  if attentive:\n"
+    f"{ind}    self.red_recover_cnt += 1\n"
+    f"{ind}    if self.red_recover_cnt * DT_DMON >= 6.0:\n"
+    f"{ind}      # Move just above orange threshold so banner clears immediately.\n"
+    f"{ind}      self.awareness = min(1.0, self.threshold_alert_2 + 1e-3)\n"
+    f"{ind}      self.alert_level = AlertLevel.two\n"
+    f"{ind}      self.red_recover_cnt = 0\n"
+    f"{ind}  else:\n"
+    f"{ind}    self.red_recover_cnt = 0\n"
+    f"{ind}else:\n"
+    f"{ind}  self.red_recover_cnt = 0\n"
+  )
+
+
+def _dm_red_exit_inject_block_helpers(ind: str) -> str:
   return (
     f"\n"
     f"{ind}# {_DM_SENTINEL_RED_EXIT}\n"
@@ -2613,7 +2719,47 @@ def _dm_red_exit_inject_block(ind: str) -> str:
 
 
 def _strip_dm_red_exit_block(s: str) -> str:
-  return _RE_DM_RED_EXIT_BLOCK.sub("", s, count=1)
+  s2 = _RE_DM_RED_EXIT_BLOCK.sub("", s, count=1)
+  if s2 != s:
+    return s2
+  return _RE_DM_RED_EXIT_BLOCK_POLICY.sub("", s, count=1)
+
+
+def _ensure_dm_red_recover_counter(s: str, path_for_err: Path) -> str:
+  m_init = re.search(r"(?m)^(?P<ind>[ \t]+)self\.terminal_time\s*=\s*0\s*$", s)
+  if not m_init:
+    raise RuntimeError(f"{path_for_err}: 未找到 self.terminal_time = 0 初始化行，无法注入 red_exit 计数器")
+  if "self.red_recover_cnt" not in s:
+    ind = m_init.group("ind")
+    insert_line = f"{ind}self.red_recover_cnt = 0  # {_DM_SENTINEL_RED_EXIT}\n"
+    s = s[: m_init.end()] + "\n" + insert_line + s[m_init.end() + 1 :]
+  return s
+
+
+def _patch_dm_red_exit_helpers(s: str, path_for_err: Path) -> str:
+  m_events_add = re.search(r"(?m)^(?P<ind>[ \t]+)if\s+alert\s+is\s+not\s+None\s*:\s*$", s)
+  if not m_events_add:
+    raise RuntimeError(
+      f"{path_for_err}: 未找到 `if alert is not None:`，无法注入 red_exit 逻辑（上游可能重构）"
+    )
+  ind = m_events_add.group("ind")
+  inject = _dm_red_exit_inject_block_helpers(ind)
+  return s[: m_events_add.start()] + inject + s[m_events_add.start() :]
+
+
+def _patch_dm_red_exit_policy(s: str, path_for_err: Path) -> str:
+  m_anchor = re.search(
+    r"(?m)^(?P<ind>[ \t]+)elif self\.awareness <= self\.threshold_alert_1:\s*\n"
+    r"(?P=ind)  self\.alert_level = AlertLevel\.one\s*\n",
+    s,
+  )
+  if not m_anchor:
+    raise RuntimeError(
+      f"{path_for_err}: 未找到 alertLevel 分级 elif 链末尾，无法注入 red_exit 逻辑（policy.py 可能重构）"
+    )
+  ind = m_anchor.group("ind")
+  inject = _dm_red_exit_inject_block_policy(ind)
+  return s[: m_anchor.end()] + inject + s[m_anchor.end() :]
 
 
 def _patch_dm_red_exit_flexible(s: str, path_for_err: Path) -> str:
@@ -2632,41 +2778,27 @@ def _patch_dm_red_exit_flexible(s: str, path_for_err: Path) -> str:
         f"{path_for_err}: red_exit 补丁块无法剥离（上游可能改写注释/缩进），请人工合并。"
       )
 
-  # 1) 确保 __init__ 里有计数器（兼容空格/Tab 缩进）
-  m_init = re.search(r"(?m)^(?P<ind>[ \t]+)self\.terminal_time\s*=\s*0\s*$", s)
-  if not m_init:
-    raise RuntimeError(f"{path_for_err}: 未找到 self.terminal_time = 0 初始化行，无法注入 red_exit 计数器")
-  if "self.red_recover_cnt" not in s:
-    ind = m_init.group("ind")
-    insert_line = f"{ind}self.red_recover_cnt = 0  # {_DM_SENTINEL_RED_EXIT}\n"
-    s = s[: m_init.end()] + "\n" + insert_line + s[m_init.end() + 1 :]
-
-  # 2) 锚定 alert 分级 if/elif 整段之后、「if alert is not None」之前（与 alert = None 同级缩进）。
-  m_events_add = re.search(r"(?m)^(?P<ind>[ \t]+)if\s+alert\s+is\s+not\s+None\s*:\s*$", s)
-  if not m_events_add:
-    raise RuntimeError(
-      f"{path_for_err}: 未找到 `if alert is not None:`，无法注入 red_exit 逻辑（上游可能重构）"
-    )
-  ind = m_events_add.group("ind")
-  inject = _dm_red_exit_inject_block(ind)
-  s = s[: m_events_add.start()] + inject + s[m_events_add.start() :]
-  return s
+  s = _ensure_dm_red_recover_counter(s, path_for_err)
+  if _dm_is_policy_arch(s):
+    return _patch_dm_red_exit_policy(s, path_for_err)
+  return _patch_dm_red_exit_helpers(s, path_for_err)
 
 
 def patch_dm_relaxed_terminal(root: Path) -> PatchResult:
   """
   国内化 DM：保留分级告警/鸣音，但削弱「第三次终端锁死」与 awareness<0 触发的纵向 forceDecel。
-  - awareness 递减下限由 -0.1 改为 0，避免 driverMonitoringState.awarenessStatus<0
+  - awareness 递减下限由 -0.1 改为 0
   - 红线阶段不再累计 terminal_time / terminal_alert_cnt，避免 DriverTooDistracted / tooDistracted 路径
-  幂等：已含两处 sentinel 则跳过。
-  匹配：先用宽松表达式替换 max(...,-0.1)；terminal 先尝试整段替换再尝试「剥掉累计行」（兼容上游注释/缩进微调）。
+  - 红屏专注恢复约 6 秒自动退出（red_recover_cnt）
+  目标文件：优先 policy.py（upstream staging），回退 helpers.py（旧架构）。
+  幂等：已含 sentinel 则跳过。
   """
   res = PatchResult("dm_relaxed_terminal")
-  helpers = root / "selfdrive/monitoring/helpers.py"
-  if not helpers.exists():
+  dm_path = _dm_monitoring_path(root)
+  if dm_path is None:
     return res
 
-  s = helpers.read_text(encoding="utf-8")
+  s = dm_path.read_text(encoding="utf-8")
   if (
     _DM_SENTINEL_AWARENESS in s
     and _DM_SENTINEL_TERMINAL in s
@@ -2675,12 +2807,12 @@ def patch_dm_relaxed_terminal(root: Path) -> PatchResult:
   ):
     return res
 
-  s = _patch_dm_awareness_flexible(s, helpers)
-  s = _patch_dm_terminal_flexible(s, helpers)
-  s = _patch_dm_red_exit_flexible(s, helpers)
+  s = _patch_dm_awareness_flexible(s, dm_path)
+  s = _patch_dm_terminal_flexible(s, dm_path)
+  s = _patch_dm_red_exit_flexible(s, dm_path)
 
-  changed = write_if_changed(helpers, s)
-  _track_change(res, helpers, changed)
+  changed = write_if_changed(dm_path, s)
+  _track_change(res, dm_path, changed)
   return res
 
 
@@ -2871,42 +3003,57 @@ def verify_patches(root: Path) -> None:
       if "OPENPILOT_URL" in tx and sp_install not in tx:
         errors.append(f"{label}: 仍存在 OPENPILOT_URL 但未指向 Gitee sp-cn_install（期望含 {sp_install!r}）")
 
-  helpers_dm = root / "selfdrive/monitoring/helpers.py"
-  if helpers_dm.exists():
-    hm = rt("selfdrive/monitoring/helpers.py")
+  dm_path = _dm_monitoring_path(root)
+  if dm_path is None:
+    errors.append("selfdrive/monitoring: 缺少 policy.py 与 helpers.py，无法校验 DM 补丁")
+  else:
+    rel = dm_path.relative_to(root).as_posix()
+    hm = rt(rel)
     if _DM_SENTINEL_AWARENESS not in hm:
-      errors.append("selfdrive/monitoring/helpers.py: 缺少 DM 补丁 sentinel（awareness 下限）")
+      errors.append(f"{rel}: 缺少 DM 补丁 sentinel（awareness 下限）")
     if _DM_SENTINEL_TERMINAL not in hm:
-      errors.append("selfdrive/monitoring/helpers.py: 缺少 DM 补丁 sentinel（terminal 累计）")
+      errors.append(f"{rel}: 缺少 DM 补丁 sentinel（terminal 累计）")
     if not _RE_DM_RED_EXIT_HEADER.search(hm):
-      errors.append("selfdrive/monitoring/helpers.py: 缺少 DM 补丁 sentinel（red 自动退出）")
+      errors.append(f"{rel}: 缺少 DM 补丁 sentinel（red 自动退出）")
     elif "self.red_recover_cnt" not in hm:
-      errors.append("selfdrive/monitoring/helpers.py: 缺少 red_recover_cnt 计数器（red 自动退出）")
+      errors.append(f"{rel}: 缺少 red_recover_cnt 计数器（red 自动退出）")
     elif _dm_red_exit_is_misplaced(hm):
       errors.append(
-        "selfdrive/monitoring/helpers.py: red_exit 补丁误嵌在 elif threshold_pre 分支内，"
-        "红线（awareness<=0）时不会执行 6 秒专注自动恢复"
+        f"{rel}: red_exit 补丁位置不正确（须在 alert 分级之后，不可嵌在 distracted 分支内）"
       )
     if re.search(r"max\s*\(\s*self\.awareness\s*-\s*self\.step_change\s*,\s*-0\.1\s*\)", hm):
-      errors.append("selfdrive/monitoring/helpers.py: 仍存在原版 -0.1 awareness 下限（空白不限），DM 补丁未生效")
+      errors.append(f"{rel}: 仍存在原版 -0.1 awareness 下限，DM 补丁未生效")
     if not re.search(
       r"max\s*\(\s*self\.awareness\s*-\s*self\.step_change\s*,\s*0\.?\s*\)",
       hm,
     ):
-      errors.append("selfdrive/monitoring/helpers.py: 缺少 0. awareness 下限，DM 补丁未生效")
-    # 上游若换行/缩进与旧版不同，仍应能检出「红线 alert 下一行仍在 += terminal_time」
-    if re.search(
-      r"driverDistracted3[^\n]*\n\s*self\.terminal_time\s*\+=\s*1",
-      hm,
-      re.MULTILINE,
-    ):
-      errors.append("selfdrive/monitoring/helpers.py: 红线分支仍在累计 terminal_time，DM 补丁未生效")
-    if re.search(
-      r"driverDistracted3[^\n]*\n\s*self\.terminal_alert_cnt\s*\+=\s*1",
-      hm,
-      re.MULTILINE,
-    ):
-      errors.append("selfdrive/monitoring/helpers.py: 红线分支仍在累计 terminal_alert_cnt，DM 补丁未生效")
+      errors.append(f"{rel}: 缺少 0. awareness 下限，DM 补丁未生效")
+    if _dm_is_policy_arch(hm):
+      if re.search(
+        r"if self\.awareness <= 0\.:[^\n]*\n(?:.*\n)*?\s*self\.alert_level = AlertLevel\.three[^\n]*\n\s*self\.terminal_time\s*\+=\s*1",
+        hm,
+        re.MULTILINE,
+      ):
+        errors.append(f"{rel}: 红线分支仍在累计 terminal_time，DM 补丁未生效")
+      if re.search(
+        r"if self\.awareness <= 0\.:[^\n]*\n(?:.*\n)*?\s*self\.alert_level = AlertLevel\.three[^\n]*\n(?:.*\n)*?self\.terminal_alert_cnt\s*\+=\s*1",
+        hm,
+        re.MULTILINE,
+      ):
+        errors.append(f"{rel}: 红线分支仍在累计 terminal_alert_cnt，DM 补丁未生效")
+    else:
+      if re.search(
+        r"driverDistracted3[^\n]*\n\s*self\.terminal_time\s*\+=\s*1",
+        hm,
+        re.MULTILINE,
+      ):
+        errors.append(f"{rel}: 红线分支仍在累计 terminal_time，DM 补丁未生效")
+      if re.search(
+        r"driverDistracted3[^\n]*\n\s*self\.terminal_alert_cnt\s*\+=\s*1",
+        hm,
+        re.MULTILINE,
+      ):
+        errors.append(f"{rel}: 红线分支仍在累计 terminal_alert_cnt，DM 补丁未生效")
 
   # 语法兜底（不验证逻辑正确性）
   py_verify = [
@@ -2919,8 +3066,10 @@ def verify_patches(root: Path) -> None:
     "sunnypilot/models/fetcher.py",
     "selfdrive/ui/sunnypilot/layouts/settings/osm.py",
     "sunnypilot/mapd/mapd_installer.py",
-    "selfdrive/monitoring/helpers.py",
   ]
+  dm_verify = _dm_monitoring_path(root)
+  if dm_verify is not None:
+    py_verify.append(str(dm_verify.relative_to(root)).replace("\\", "/"))
   errors.extend(_verify_python_syntax(root, py_verify))
   errors.extend(_verify_no_debug_markers(root, py_verify))
   for rel in py_verify:
