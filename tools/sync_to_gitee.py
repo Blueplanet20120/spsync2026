@@ -129,6 +129,41 @@ def gitee_models_raw_gh_pages(*, branch: str = "gh-pages", owner: str | None = N
   return f"{gitee_https_repo('sunnypilot-models', owner=owner)}/raw/{branch}/"
 
 
+def _extract_model_json_basename(url: str) -> str:
+  """从 MODEL_URL 或类似路径取出 JSON 文件名。"""
+  tail = url.rsplit("/", 1)[-1].split("?")[0].split("#")[0].strip()
+  return tail if tail.endswith(".json") else "driving_models_v17.json"
+
+
+def _expected_models_json_url(json_name: str | None = None) -> str:
+  name = json_name or "driving_models_v17.json"
+  return f"{gitee_models_raw_gh_pages()}docs/{name}"
+
+
+def _fix_models_json_url_typos(url: str) -> str:
+  """修正 Gitee models JSON 的已知错误 raw 路径（幂等）。"""
+  gh = gitee_models_raw_gh_pages()
+  repo = gitee_https_repo("sunnypilot-models")
+  for wrong in (
+    f"{repo}/raw/master/refs/heads/gh-pages/",
+    f"{repo}/raw/master/gh-pages/",
+    f"{repo}/raw/refs/heads/gh-pages/",
+  ):
+    if wrong in url:
+      url = url.replace(wrong, gh)
+  return url
+
+
+_GIT_SHA40 = re.compile(r"^[0-9a-f]{40}$")
+
+
+def _git_sha40(value: str | None) -> str | None:
+  if not value:
+    return None
+  v = value.strip().lower()
+  return v if _GIT_SHA40.fullmatch(v) else None
+
+
 def gitee_sp_cn_installer_openpilot_url() -> str:
   return f"{gitee_https_repo('sp-cn_install')}/raw/master/installer_openpilot"
 
@@ -2387,24 +2422,23 @@ def patch_opendbc_pyproject(root: Path) -> PatchResult:
 def patch_models_fetcher(root: Path) -> PatchResult:
   res = PatchResult("models_fetcher")
   fetcher = root / "sunnypilot/models/fetcher.py"
-  s = fetcher.read_text(encoding="utf-8")
-  gitee_gh_pages = gitee_models_raw_gh_pages()
+  if not fetcher.is_file():
+    return res
 
+  s = fetcher.read_text(encoding="utf-8")
   m = re.search(r'MODEL_URL\s*=\s*"([^"]+)"', s)
   if not m:
     raise RuntimeError(f"{fetcher}: 找不到 MODEL_URL 赋值")
 
-  old_url = m.group(1)
-  json_name = old_url.rsplit("/", 1)[-1]
-  if not json_name.endswith(".json"):
-    json_name = "driving_models_v17.json"
-  new_url = f"{gitee_gh_pages}docs/{json_name}"
+  json_name = _extract_model_json_basename(m.group(1))
+  new_url = _expected_models_json_url(json_name)
+  current = _fix_models_json_url_typos(m.group(1).strip())
+  if current == new_url:
+    return res
 
-  s2 = re.sub(r'(MODEL_URL\s*=\s*")[^"]+(")', rf'\1{new_url}\2', s, count=1)
-  # 旧版补丁误把 gh-pages 路径替换成 raw/master/refs/heads/gh-pages（Gitee 404）
-  wrong = f"{gitee_https_repo('sunnypilot-models')}/raw/master/refs/heads/gh-pages/"
-  if wrong in s2:
-    s2 = s2.replace(wrong, gitee_gh_pages)
+  s2, n = re.subn(r'(MODEL_URL\s*=\s*")[^"]+(")', rf'\1{new_url}\2', s, count=1)
+  if n != 1:
+    raise RuntimeError(f"{fetcher}: MODEL_URL 替换未生效（请检查 upstream 是否改了字段写法）")
   _track_change(res, fetcher, write_if_changed(fetcher, s2))
   return res
 
@@ -2418,50 +2452,81 @@ def _tinygrad_fetch_remotes() -> list[str]:
 
 def _materialize_tinygrad_commit(commit: str, dest: Path) -> None:
   """将 tinygrad 某 commit 导出为 vendored 目录（不含 .git）。"""
-  commit = commit.strip().lower()
-  if not re.fullmatch(r"[0-9a-f]{40}", commit):
-    raise RuntimeError(f"invalid tinygrad commit: {commit!r}")
+  raw = commit
+  commit = _git_sha40(commit)
+  if not commit:
+    raise RuntimeError(f"invalid tinygrad commit: {raw!r}")
+
+  staging = dest.with_name(f"{dest.name}.__sp_sync_staging__")
+  if staging.exists():
+    shutil.rmtree(staging, ignore_errors=True)
 
   with tempfile.TemporaryDirectory() as td:
     src = Path(td) / "repo"
     src.mkdir()
     run(["git", "init"], str(src))
     fetched = False
+    last_err: str | None = None
     for url in _tinygrad_fetch_remotes():
       try:
         run(["git", "remote", "add", "origin", url], str(src))
         run(["git", "fetch", "--depth", "1", "origin", commit], str(src))
         fetched = True
         break
-      except RuntimeError:
+      except RuntimeError as e:
+        last_err = str(e)
         try:
           run(["git", "remote", "remove", "origin"], str(src))
         except RuntimeError:
           pass
     if not fetched:
-      raise RuntimeError(f"无法 fetch tinygrad {commit[:12]}（已尝试 Gitee/GitHub）")
+      hint = f": {last_err}" if last_err else ""
+      raise RuntimeError(f"无法 fetch tinygrad {commit[:12]}（已尝试 Gitee/GitHub）{hint}")
 
     run(["git", "checkout", "--force", "FETCH_HEAD"], str(src))
-    if dest.exists():
-      shutil.rmtree(dest)
-    dest.mkdir(parents=True)
+    staging.mkdir(parents=True)
     for child in src.iterdir():
       if child.name == ".git":
         continue
-      dst = dest / child.name
+      dst = staging / child.name
       if child.is_dir():
         shutil.copytree(child, dst, symlinks=True)
       else:
         shutil.copy2(child, dst)
-    (dest / ".sp_tinygrad_vendored_ref").write_text(commit + "\n", encoding="utf-8")
+    (staging / ".sp_tinygrad_vendored_ref").write_text(commit + "\n", encoding="utf-8")
+
+  marker = _read_vendored_tinygrad_marker(staging)
+  if marker != commit:
+    shutil.rmtree(staging, ignore_errors=True)
+    raise RuntimeError(f"{dest}: tinygrad 导出后标记文件校验失败")
+
+  try:
+    if dest.exists():
+      shutil.rmtree(dest)
+    staging.rename(dest)
+  except Exception:
+    shutil.rmtree(staging, ignore_errors=True)
+    raise
 
 
 def _read_vendored_tinygrad_marker(tg: Path) -> str | None:
   marker = tg / ".sp_tinygrad_vendored_ref"
   if not marker.is_file():
     return None
-  ref = marker.read_text(encoding="utf-8").strip().lower()
-  return ref if re.fullmatch(r"[0-9a-f]{40}", ref) else None
+  return _git_sha40(marker.read_text(encoding="utf-8"))
+
+
+def _vendored_tinygrad_already_aligned(tg: Path, *, target_commit: str, target_tree: str) -> bool:
+  """HEAD tree 或工作区 marker 已表明 tinygrad 与目标 commit 一致（幂等跳过）。"""
+  root = tg.parent
+  head_ent = _git_ls_tree_entry(root, "HEAD", "tinygrad_repo")
+  if head_ent and head_ent[0] == "tree" and head_ent[1] == target_tree:
+    return True
+  marker = _read_vendored_tinygrad_marker(tg)
+  if marker != target_commit:
+    return False
+  marker_tree = _tinygrad_commit_root_tree(marker)
+  return bool(marker_tree and marker_tree == target_tree)
 
 
 def patch_tinygrad_vendored_align(root: Path) -> PatchResult:
@@ -2484,13 +2549,15 @@ def patch_tinygrad_vendored_align(root: Path) -> PatchResult:
     return res
 
   target_commit = TINYGRAD_MODELS_REF.lower()
+  if not _git_sha40(target_commit):
+    raise RuntimeError(f"patch_tinygrad_vendored_align: 无效 TINYGRAD_MODELS_REF={target_commit!r}")
+
   target_tree = _tinygrad_commit_root_tree(target_commit)
   if not target_tree:
     raise RuntimeError(
       f"patch_tinygrad_vendored_align: 无法解析 TINYGRAD_MODELS_REF={target_commit[:12]} 的根 tree"
     )
-  marker = _read_vendored_tinygrad_marker(tg)
-  if head_ent[1] == target_tree or marker == target_commit:
+  if _vendored_tinygrad_already_aligned(tg, target_commit=target_commit, target_tree=target_tree):
     return res
 
   log(
@@ -2499,6 +2566,10 @@ def patch_tinygrad_vendored_align(root: Path) -> PatchResult:
     f"(models JSON tinygrad_ref，根 tree {target_tree[:7]})",
   )
   _materialize_tinygrad_commit(target_commit, tg)
+  if not _vendored_tinygrad_already_aligned(tg, target_commit=target_commit, target_tree=target_tree):
+    raise RuntimeError(
+      f"{tg}: tinygrad 对齐后校验失败（marker/tree 与 {target_commit[:12]} 不一致）"
+    )
   _track_change(res, tg, True)
   return res
 
@@ -3018,10 +3089,7 @@ def _parse_models_json_url(root: Path) -> str | None:
 
 
 def _normalize_models_json_url(url: str) -> str:
-  wrong = f"{gitee_https_repo('sunnypilot-models')}/raw/master/refs/heads/gh-pages/"
-  if wrong in url:
-    url = url.replace(wrong, gitee_models_raw_gh_pages())
-  return url
+  return _fix_models_json_url_typos(url.strip())
 
 
 def _models_json_url_candidates(primary: str | None) -> list[str]:
@@ -3054,7 +3122,7 @@ def _fetch_models_tinygrad_ref(url: str, *, timeout_s: int = 25) -> str | None:
     if not ref:
       return None
     ref_s = str(ref).strip().lower()
-    return ref_s if re.fullmatch(r"[0-9a-f]{40}", ref_s) else None
+    return _git_sha40(ref_s)
   except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as e:
     log("verify-tinygrad", f"拉取 models JSON 失败 ({url}): {e}")
     return None
@@ -3079,8 +3147,8 @@ def _git_ls_tree_entry(root: Path, treeish: str, subpath: str) -> tuple[str, str
   parts = line.split()
   if len(parts) < 3:
     return None
-  sha = parts[2].strip().lower()
-  if not re.fullmatch(r"[0-9a-f]{40}", sha):
+  sha = _git_sha40(parts[2])
+  if not sha:
     return None
   return parts[1], sha
 
@@ -3195,16 +3263,17 @@ def resolve_workdir_tinygrad_commit(root: Path, *, models_ref: str | None = None
     if marker:
       pin = TINYGRAD_MODELS_REF.lower()
       want = {pin}
-      if models_ref and re.fullmatch(r"[0-9a-f]{40}", models_ref):
+      if models_ref and _git_sha40(models_ref):
         want.add(models_ref.lower())
       if marker in want:
         marker_tree = _tinygrad_commit_root_tree(marker)
         if marker_tree and marker_tree == head_ent[1]:
           return marker, f"vendored tree 匹配 .sp_tinygrad_vendored_ref ({marker[:12]})"
-        return marker, (
-          f"vendored 已对齐 {marker[:12]}（.sp_tinygrad_vendored_ref，工作区待 commit；"
-          f"HEAD tree 仍为 {head_ent[1][:12]}…）"
-        )
+        if marker_tree:
+          return marker, (
+            f"vendored 已对齐 {marker[:12]}（.sp_tinygrad_vendored_ref，工作区待 commit；"
+            f"HEAD tree 仍为 {head_ent[1][:12]}…）"
+          )
     return None, detail
 
   # 旧式 submodule 指针（upstream 仍可能为 gitlink）
@@ -3364,10 +3433,17 @@ def verify_patches(root: Path) -> None:
   if models_needle not in rt("sunnypilot/models/fetcher.py"):
     errors.append(f"sunnypilot/models/fetcher.py: 缺少 Gitee models raw URL（期望含 {models_needle!r}）")
   fetcher_url = _parse_models_json_url(root)
+  if fetcher_url:
+    fetcher_url = _fix_models_json_url_typos(fetcher_url)
   if fetcher_url and "raw/master/refs/heads/gh-pages" in fetcher_url:
     errors.append(
       "sunnypilot/models/fetcher.py: MODEL_URL 仍为错误路径 raw/master/refs/heads/gh-pages（Gitee 404）；"
       "请重新 pull 以应用 models_fetcher 补丁"
+    )
+  gh_pages_prefix = gitee_models_raw_gh_pages()
+  if fetcher_url and models_needle in fetcher_url and gh_pages_prefix not in fetcher_url:
+    errors.append(
+      f"sunnypilot/models/fetcher.py: MODEL_URL 应使用 gh-pages raw 前缀（期望含 {gh_pages_prefix!r}）"
     )
 
   mapd_needle = f"gitee.com/{GITEE_OWNER}/openpilot-mapd"
