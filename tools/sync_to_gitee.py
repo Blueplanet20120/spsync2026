@@ -2637,6 +2637,15 @@ def patch_mapd_installer(root: Path) -> PatchResult:
 _DM_SENTINEL_AWARENESS = "cn_dm_relaxed: avoid awarenessStatus<0 (forceDecel)"
 _DM_SENTINEL_TERMINAL = "cn_dm_relaxed: no terminal strike lockout"
 _DM_SENTINEL_RED_EXIT = "cn_dm_relaxed: auto exit red after 6s attention"
+_DM_SENTINEL_NO_FORCE_DECEL = "cn_dm_relaxed: DM alertLevel.three does not set forceDecel"
+
+_RE_CONTROLS_FORCE_DECEL_WITH_DM = re.compile(
+  r"cs\.forceDecel\s*=\s*bool\s*\(\s*"
+  r"\(\s*self\.sm\['driverMonitoringState'\]\.alertLevel\s*==\s*"
+  r"log\.DriverMonitoringState\.AlertLevel\.three\s*\)\s*or\s*\n"
+  r"\s*\(\s*self\.sm\['selfdriveState'\]\.state\s*==\s*State\.softDisabling\s*\)\s*\)",
+  re.MULTILINE,
+)
 
 # 宽松匹配「递减下限 -0.1」：不绑定整行/赋值左侧写法，便于上游换行、注释微调。
 _RE_DM_AWARENESS_FLOOR_LOOSE = re.compile(
@@ -2964,35 +2973,74 @@ def _patch_dm_red_exit_flexible(s: str, path_for_err: Path) -> str:
   return _patch_dm_red_exit_helpers(s, path_for_err)
 
 
+def _patch_controlsd_no_dm_force_decel(root: Path, res: PatchResult) -> None:
+  """
+  staging 上游在 controlsd 用 alertLevel.three 置 forceDecel → 红屏纵向收油。
+  国内化：仅保留 softDisabling 路径，DM 红屏仍告警但不 forceDecel。
+  """
+  path = root / "selfdrive/controls/controlsd.py"
+  if not path.is_file():
+    return
+  s = path.read_text(encoding="utf-8")
+  if _DM_SENTINEL_NO_FORCE_DECEL in s:
+    return
+  if "cs.forceDecel" not in s:
+    raise RuntimeError(f"{path}: 未找到 cs.forceDecel 赋值，上游可能已重构")
+  if not _RE_CONTROLS_FORCE_DECEL_WITH_DM.search(s):
+    if re.search(
+      r"cs\.forceDecel\s*=\s*bool\s*\(\s*self\.sm\['selfdriveState'\]\.state\s*==\s*State\.softDisabling\s*\)",
+      s,
+    ):
+      # 已等价于国内化写法，补 sentinel 注释
+      s2 = re.sub(
+        r"(cs\.forceDecel\s*=\s*bool\s*\(\s*self\.sm\['selfdriveState'\]\.state\s*==\s*State\.softDisabling\s*\)\s*)",
+        rf"\1  # {_DM_SENTINEL_NO_FORCE_DECEL}",
+        s,
+        count=1,
+      )
+      _track_change(res, path, write_if_changed(path, s2))
+      return
+    raise RuntimeError(
+      f"{path}: 无法匹配 alertLevel.three → forceDecel 赋值块；请人工对照 controlsd.publish"
+    )
+  repl = (
+    f"cs.forceDecel = bool(self.sm['selfdriveState'].state == State.softDisabling)"
+    f"  # {_DM_SENTINEL_NO_FORCE_DECEL}"
+  )
+  s2, n = _RE_CONTROLS_FORCE_DECEL_WITH_DM.subn(repl, s, count=1)
+  if n != 1:
+    raise RuntimeError(f"{path}: forceDecel 替换未生效")
+  _track_change(res, path, write_if_changed(path, s2))
+
+
 def patch_dm_relaxed_terminal(root: Path) -> PatchResult:
   """
-  国内化 DM：保留分级告警/鸣音，但削弱「第三次终端锁死」与 awareness<0 触发的纵向 forceDecel。
+  国内化 DM：保留分级告警/鸣音，但削弱「第三次终端锁死」与红屏纵向 forceDecel。
   - awareness 递减下限由 -0.1 改为 0
   - 红线阶段不再累计 terminal_time / terminal_alert_cnt，避免 DriverTooDistracted / tooDistracted 路径
   - 红屏专注恢复约 6 秒自动退出（red_recover_cnt）
-  目标文件：优先 policy.py（upstream staging），回退 helpers.py（旧架构）。
-  幂等：已含 sentinel 则跳过。
+  - controlsd：红屏 alertLevel.three 不再置 forceDecel（仅 softDisabling 仍 forceDecel）
+  目标：policy.py（staging）或 helpers.py（旧架构）+ selfdrive/controls/controlsd.py
+  幂等：各 sentinel 已存在则跳过对应子补丁。
   """
   res = PatchResult("dm_relaxed_terminal")
   dm_path = _dm_monitoring_path(root)
-  if dm_path is None:
-    return res
+  if dm_path is not None:
+    s = dm_path.read_text(encoding="utf-8")
+    monitoring_done = (
+      _DM_SENTINEL_AWARENESS in s
+      and _DM_SENTINEL_TERMINAL in s
+      and _RE_DM_RED_EXIT_HEADER.search(s)
+      and not _dm_red_exit_is_misplaced(s)
+    )
+    if not monitoring_done:
+      s = _patch_dm_awareness_flexible(s, dm_path)
+      s = _patch_dm_terminal_flexible(s, dm_path)
+      s = _patch_dm_red_exit_flexible(s, dm_path)
+      changed = write_if_changed(dm_path, s)
+      _track_change(res, dm_path, changed)
 
-  s = dm_path.read_text(encoding="utf-8")
-  if (
-    _DM_SENTINEL_AWARENESS in s
-    and _DM_SENTINEL_TERMINAL in s
-    and _RE_DM_RED_EXIT_HEADER.search(s)
-    and not _dm_red_exit_is_misplaced(s)
-  ):
-    return res
-
-  s = _patch_dm_awareness_flexible(s, dm_path)
-  s = _patch_dm_terminal_flexible(s, dm_path)
-  s = _patch_dm_red_exit_flexible(s, dm_path)
-
-  changed = write_if_changed(dm_path, s)
-  _track_change(res, dm_path, changed)
+  _patch_controlsd_no_dm_force_decel(root, res)
   return res
 
 
@@ -3566,6 +3614,23 @@ def verify_patches(root: Path) -> None:
       ):
         errors.append(f"{rel}: 红线分支仍在累计 terminal_alert_cnt，DM 补丁未生效")
 
+  controls_rel = "selfdrive/controls/controlsd.py"
+  if (root / controls_rel).is_file():
+    cs_tx = rt(controls_rel)
+    if _DM_SENTINEL_NO_FORCE_DECEL not in cs_tx:
+      errors.append(f"{controls_rel}: 缺少 DM forceDecel 补丁 sentinel")
+    if _RE_CONTROLS_FORCE_DECEL_WITH_DM.search(cs_tx):
+      errors.append(
+        f"{controls_rel}: 仍为 alertLevel.three → forceDecel（红屏会收纵向，国内化未生效）"
+      )
+    if re.search(
+      r"driverMonitoringState[^\n]*alertLevel[^\n]*three",
+      cs_tx,
+    ) and "cs.forceDecel" in cs_tx and _DM_SENTINEL_NO_FORCE_DECEL not in cs_tx:
+      errors.append(
+        f"{controls_rel}: forceDecel 仍可能关联 DM 红屏（需仅 softDisabling 置 forceDecel）"
+      )
+
   # 语法兜底（不验证逻辑正确性）
   py_verify = [
     "system/cn_main_repo_route.py",
@@ -3577,6 +3642,7 @@ def verify_patches(root: Path) -> None:
     "sunnypilot/models/fetcher.py",
     "selfdrive/ui/sunnypilot/layouts/settings/osm.py",
     "sunnypilot/mapd/mapd_installer.py",
+    controls_rel,
   ]
   dm_verify = _dm_monitoring_path(root)
   if dm_verify is not None:
