@@ -13,6 +13,7 @@
 用法示例：
   python3 tools/sync_to_gitee.py --action all                  # CI / 一键同步（常用）
   python3 tools/sync_to_gitee.py                               # 交互菜单：仅 1~3（pull / push / all）
+  python3 tools/sync_to_gitee.py --action verify-tinygrad-models  # 校验 tinygrad_repo 与 models JSON ref
   python3 tools/sync_to_gitee.py --sync-mapd-release           # 仅脚本/自动化调用 mapd（非菜单）
   python3 tools/sync_to_gitee.py --build-installer             # 仅脚本调用 installer（非菜单）
 """
@@ -91,6 +92,9 @@ COMMA_HOST_DEFAULT = "10.90.1.231"
 COMMA_USER_DEFAULT = "comma"
 COMMA_SSH_KEY_DEFAULT = str(Path("/home/perfume/sp/sp-cn"))
 GITEE_OWNER = "xc2026"
+# 与 sunnypilot-models JSON 的 tinygrad_ref、GitLab recompiled 模型编译 ref 对齐（见 verify_tinygrad_models）
+TINYGRAD_MODELS_REF = "ac1632ab966c77ba96a7048b893a30f1a714dc87"
+TINYGRAD_UPSTREAM_URL = "https://github.com/sunnypilot/tinygrad.git"
 MAPD_REPO = "openpilot-mapd"
 MAPD_UPSTREAM = "pfeiferj/openpilot-mapd"
 
@@ -118,6 +122,11 @@ def gitee_git_ssh_repo(repo: str, *, owner: str | None = None) -> str:
 
 def gitee_raw_repo(repo: str, branch: str = "master", *, owner: str | None = None) -> str:
   return f"{gitee_https_repo(repo, owner=owner)}/raw/{branch}/"
+
+
+def gitee_models_raw_gh_pages(*, branch: str = "gh-pages", owner: str | None = None) -> str:
+  """sunnypilot-models 的 JSON 在 gh-pages 分支，非 master。"""
+  return f"{gitee_https_repo('sunnypilot-models', owner=owner)}/raw/{branch}/"
 
 
 def gitee_sp_cn_installer_openpilot_url() -> str:
@@ -2379,21 +2388,118 @@ def patch_models_fetcher(root: Path) -> PatchResult:
   res = PatchResult("models_fetcher")
   fetcher = root / "sunnypilot/models/fetcher.py"
   s = fetcher.read_text(encoding="utf-8")
-  s2 = apply_text_replacement_rows(
-    s,
-    [
-      (
-        [
-          "https://raw.githubusercontent.com/sunnypilot/sunnypilot-models/",
-          "https://raw.githubusercontent.com/sunnypilot/sunnypilot-models",
-        ],
-        gitee_raw_repo("sunnypilot-models"),
-      ),
-    ],
-    path=fetcher,
-    require_all=True,
-  )
+  gitee_gh_pages = gitee_models_raw_gh_pages()
+
+  m = re.search(r'MODEL_URL\s*=\s*"([^"]+)"', s)
+  if not m:
+    raise RuntimeError(f"{fetcher}: 找不到 MODEL_URL 赋值")
+
+  old_url = m.group(1)
+  json_name = old_url.rsplit("/", 1)[-1]
+  if not json_name.endswith(".json"):
+    json_name = "driving_models_v17.json"
+  new_url = f"{gitee_gh_pages}docs/{json_name}"
+
+  s2 = re.sub(r'(MODEL_URL\s*=\s*")[^"]+(")', rf'\1{new_url}\2', s, count=1)
+  # 旧版补丁误把 gh-pages 路径替换成 raw/master/refs/heads/gh-pages（Gitee 404）
+  wrong = f"{gitee_https_repo('sunnypilot-models')}/raw/master/refs/heads/gh-pages/"
+  if wrong in s2:
+    s2 = s2.replace(wrong, gitee_gh_pages)
   _track_change(res, fetcher, write_if_changed(fetcher, s2))
+  return res
+
+
+def _tinygrad_fetch_remotes() -> list[str]:
+  return [
+    gitee_https_repo("tinygrad") + ".git",
+    TINYGRAD_UPSTREAM_URL,
+  ]
+
+
+def _materialize_tinygrad_commit(commit: str, dest: Path) -> None:
+  """将 tinygrad 某 commit 导出为 vendored 目录（不含 .git）。"""
+  commit = commit.strip().lower()
+  if not re.fullmatch(r"[0-9a-f]{40}", commit):
+    raise RuntimeError(f"invalid tinygrad commit: {commit!r}")
+
+  with tempfile.TemporaryDirectory() as td:
+    src = Path(td) / "repo"
+    src.mkdir()
+    run(["git", "init"], str(src))
+    fetched = False
+    for url in _tinygrad_fetch_remotes():
+      try:
+        run(["git", "remote", "add", "origin", url], str(src))
+        run(["git", "fetch", "--depth", "1", "origin", commit], str(src))
+        fetched = True
+        break
+      except RuntimeError:
+        try:
+          run(["git", "remote", "remove", "origin"], str(src))
+        except RuntimeError:
+          pass
+    if not fetched:
+      raise RuntimeError(f"无法 fetch tinygrad {commit[:12]}（已尝试 Gitee/GitHub）")
+
+    run(["git", "checkout", "--force", "FETCH_HEAD"], str(src))
+    if dest.exists():
+      shutil.rmtree(dest)
+    dest.mkdir(parents=True)
+    for child in src.iterdir():
+      if child.name == ".git":
+        continue
+      dst = dest / child.name
+      if child.is_dir():
+        shutil.copytree(child, dst, symlinks=True)
+      else:
+        shutil.copy2(child, dst)
+    (dest / ".sp_tinygrad_vendored_ref").write_text(commit + "\n", encoding="utf-8")
+
+
+def _read_vendored_tinygrad_marker(tg: Path) -> str | None:
+  marker = tg / ".sp_tinygrad_vendored_ref"
+  if not marker.is_file():
+    return None
+  ref = marker.read_text(encoding="utf-8").strip().lower()
+  return ref if re.fullmatch(r"[0-9a-f]{40}", ref) else None
+
+
+def patch_tinygrad_vendored_align(root: Path) -> PatchResult:
+  """
+  upstream staging 将 tinygrad_repo vendored 为 tree，可能与 models JSON tinygrad_ref 不一致。
+  国内镜像在此对齐 vendored 内容，避免 OTA 上 ModelManager 下载模型 unpickle 失败（nan m/s）。
+  """
+  res = PatchResult("tinygrad_vendored_align")
+  if (os.environ.get("SYNC_PATCH_TINYGRAD_VENDORED") or "1").strip().lower() in ("0", "false", "no", "off"):
+    return res
+
+  tg = root / "tinygrad_repo"
+  if not tg.is_dir():
+    return res
+  if (tg / ".git").exists():
+    return res
+
+  head_ent = _git_ls_tree_entry(root, "HEAD", "tinygrad_repo")
+  if not head_ent or head_ent[0] != "tree":
+    return res
+
+  target_commit = TINYGRAD_MODELS_REF.lower()
+  target_tree = _tinygrad_commit_root_tree(target_commit)
+  if not target_tree:
+    raise RuntimeError(
+      f"patch_tinygrad_vendored_align: 无法解析 TINYGRAD_MODELS_REF={target_commit[:12]} 的根 tree"
+    )
+  marker = _read_vendored_tinygrad_marker(tg)
+  if head_ent[1] == target_tree or marker == target_commit:
+    return res
+
+  log(
+    "tinygrad",
+    f"vendored tree {head_ent[1][:7]} → {target_commit[:7]} "
+    f"(models JSON tinygrad_ref，根 tree {target_tree[:7]})",
+  )
+  _materialize_tinygrad_commit(target_commit, tg)
+  _track_change(res, tg, True)
   return res
 
 
@@ -2856,6 +2962,7 @@ def patch_all(root: Path) -> list[PatchResult]:
     patch_msgq_setup,
     patch_opendbc_pyproject,
     patch_models_fetcher,
+    patch_tinygrad_vendored_align,
     patch_osm,
     patch_mapd_installer,
     patch_dm_relaxed_terminal,
@@ -2894,6 +3001,285 @@ def _verify_no_debug_markers(root: Path, rel_paths: list[str]) -> list[str]:
       if n in tx:
         out.append(f"{rel}: 含调试标记 {n!r}，禁止推送半成品")
   return out
+
+
+def _skip_tinygrad_models_verify() -> bool:
+  return (os.environ.get("VERIFY_TINYGRAD_MODELS") or "").strip().lower() in ("0", "false", "no", "skip")
+
+
+def _parse_models_json_url(root: Path) -> str | None:
+  fetcher = root / "sunnypilot/models/fetcher.py"
+  if not fetcher.is_file():
+    return None
+  m = re.search(r'MODEL_URL\s*=\s*"([^"]+)"', fetcher.read_text(encoding="utf-8"))
+  if not m:
+    return None
+  return _normalize_models_json_url(m.group(1).strip())
+
+
+def _normalize_models_json_url(url: str) -> str:
+  wrong = f"{gitee_https_repo('sunnypilot-models')}/raw/master/refs/heads/gh-pages/"
+  if wrong in url:
+    url = url.replace(wrong, gitee_models_raw_gh_pages())
+  return url
+
+
+def _models_json_url_candidates(primary: str | None) -> list[str]:
+  out: list[str] = []
+
+  def add(u: str | None) -> None:
+    if not u:
+      return
+    u = _normalize_models_json_url(u.strip())
+    if u not in out:
+      out.append(u)
+
+  add(primary)
+  add(f"{gitee_models_raw_gh_pages()}docs/driving_models_v17.json")
+  allow_gh = (os.environ.get("VERIFY_TINYGRAD_ALLOW_GITHUB_MODELS") or "").strip().lower()
+  if allow_gh in ("1", "true", "yes", "on"):
+    add(
+      "https://raw.githubusercontent.com/sunnypilot/sunnypilot-models/"
+      "refs/heads/gh-pages/docs/driving_models_v17.json"
+    )
+  return out
+
+
+def _fetch_models_tinygrad_ref(url: str, *, timeout_s: int = 25) -> str | None:
+  try:
+    req = urllib.request.Request(url, headers={"User-Agent": "spsync-verify-tinygrad/1"})
+    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+      payload = json.loads(resp.read().decode("utf-8"))
+    ref = payload.get("tinygrad_ref")
+    if not ref:
+      return None
+    ref_s = str(ref).strip().lower()
+    return ref_s if re.fullmatch(r"[0-9a-f]{40}", ref_s) else None
+  except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as e:
+    log("verify-tinygrad", f"拉取 models JSON 失败 ({url}): {e}")
+    return None
+
+
+def _fetch_models_tinygrad_ref_candidates(urls: list[str], *, timeout_s: int = 25) -> tuple[str | None, str | None]:
+  for url in urls:
+    ref = _fetch_models_tinygrad_ref(url, timeout_s=timeout_s)
+    if ref:
+      return ref, url
+  return None, urls[0] if urls else None
+
+
+def _git_ls_tree_entry(root: Path, treeish: str, subpath: str) -> tuple[str, str] | None:
+  """返回 ls-tree 条目 (mode, sha)，mode 如 commit / tree / blob。"""
+  try:
+    line = run(["git", "ls-tree", treeish, subpath], str(root)).strip()
+  except RuntimeError:
+    return None
+  if not line:
+    return None
+  parts = line.split()
+  if len(parts) < 3:
+    return None
+  sha = parts[2].strip().lower()
+  if not re.fullmatch(r"[0-9a-f]{40}", sha):
+    return None
+  return parts[1], sha
+
+
+def _git_ls_tree_submodule_sha(root: Path, treeish: str, subpath: str) -> str | None:
+  ent = _git_ls_tree_entry(root, treeish, subpath)
+  if ent and ent[0] == "commit":
+    return ent[1]
+  return None
+
+
+_tinygrad_commit_root_tree_cache: dict[str, str | None] = {}
+
+
+def _tinygrad_commit_root_tree(commit: str) -> str | None:
+  """tinygrad commit 的根 tree SHA（用于与 superproject 内 vendored tinygrad_repo tree 比对）。"""
+  commit = commit.strip().lower()
+  if commit in _tinygrad_commit_root_tree_cache:
+    return _tinygrad_commit_root_tree_cache[commit]
+  if not re.fullmatch(r"[0-9a-f]{40}", commit):
+    _tinygrad_commit_root_tree_cache[commit] = None
+    return None
+
+  tree: str | None = None
+  with tempfile.TemporaryDirectory() as td:
+    run(["git", "init"], td)
+    for url in _tinygrad_fetch_remotes():
+      try:
+        run(["git", "remote", "remove", "origin"], td)
+      except RuntimeError:
+        pass
+      try:
+        run(["git", "remote", "add", "origin", url], td)
+        run(["git", "fetch", "--depth", "1", "origin", commit], td)
+        got = run(["git", "rev-parse", "FETCH_HEAD^{tree}"], td).strip().lower()
+        if re.fullmatch(r"[0-9a-f]{40}", got):
+          tree = got
+          break
+      except RuntimeError:
+        continue
+
+  _tinygrad_commit_root_tree_cache[commit] = tree
+  return tree
+
+
+def _match_vendored_tinygrad_tree(
+  vendored_tree: str,
+  *,
+  models_ref: str | None = None,
+) -> tuple[str | None, str]:
+  """将 superproject 内 vendored tree SHA 映射到 tinygrad commit（比对 commit 根 tree）。"""
+  candidates: list[tuple[str, str]] = []
+  if models_ref and re.fullmatch(r"[0-9a-f]{40}", models_ref):
+    candidates.append((models_ref.lower(), "models JSON tinygrad_ref"))
+  pin = TINYGRAD_MODELS_REF.lower()
+  if pin not in {c[0] for c in candidates}:
+    candidates.append((pin, "TINYGRAD_MODELS_REF"))
+
+  for commit, label in candidates:
+    root_tree = _tinygrad_commit_root_tree(commit)
+    if root_tree and root_tree == vendored_tree:
+      return commit, f"vendored tree 匹配 {label} ({commit[:12]})"
+
+  ref_note = ""
+  if models_ref and re.fullmatch(r"[0-9a-f]{40}", models_ref):
+    models_tree = _tinygrad_commit_root_tree(models_ref.lower())
+    if models_tree:
+      ref_note = f"models tinygrad_ref 根 tree={models_tree[:12]}… ≠ vendored {vendored_tree[:12]}…。"
+
+  return None, (
+    f"tinygrad_repo 为 vendored tree ({vendored_tree[:12]}…)，与 models JSON tinygrad_ref 不一致。"
+    f"{ref_note}"
+    "upstream staging 亦可能为 vendored tree（非 submodule gitlink）。"
+    "推送后 ModelManager 下载模型可能 unpickle 失败（Speed Error: nan m/s）；"
+    f"需 OTA 将 tinygrad 对齐到 {TINYGRAD_MODELS_REF[:7]}，或用当前 tinygrad 重编 GitLab 模型并更新 JSON。"
+  )
+
+
+def resolve_workdir_tinygrad_commit(root: Path, *, models_ref: str | None = None) -> tuple[str | None, str]:
+  """解析 workdir 内 tinygrad_repo 当前 commit（checkout / gitlink / vendored tree 映射）。"""
+  root = root.resolve()
+  tg = root / "tinygrad_repo"
+  if not tg.is_dir():
+    return None, "tinygrad_repo 目录不存在"
+
+  if (tg / ".git").exists():
+    try:
+      sha = run(["git", "-C", str(tg), "rev-parse", "HEAD"], str(root)).strip().lower()
+      if re.fullmatch(r"[0-9a-f]{40}", sha):
+        return sha, "tinygrad_repo checkout HEAD"
+    except RuntimeError:
+      pass
+
+  sha = _git_ls_tree_submodule_sha(root, "HEAD", "tinygrad_repo")
+  if sha:
+    return sha, "git ls-tree HEAD tinygrad_repo (submodule gitlink)"
+
+  try:
+    st = run(["git", "submodule", "status", "tinygrad_repo"], str(root)).strip()
+    m = re.search(r"([0-9a-f]{40})", st)
+    if m:
+      return m.group(1).lower(), "git submodule status tinygrad_repo"
+  except RuntimeError:
+    pass
+
+  head_ent = _git_ls_tree_entry(root, "HEAD", "tinygrad_repo")
+  if head_ent and head_ent[0] == "tree":
+    matched, detail = _match_vendored_tinygrad_tree(head_ent[1], models_ref=models_ref)
+    if matched:
+      return matched, detail
+    marker = _read_vendored_tinygrad_marker(tg)
+    if marker:
+      pin = TINYGRAD_MODELS_REF.lower()
+      want = {pin}
+      if models_ref and re.fullmatch(r"[0-9a-f]{40}", models_ref):
+        want.add(models_ref.lower())
+      if marker in want:
+        marker_tree = _tinygrad_commit_root_tree(marker)
+        if marker_tree and marker_tree == head_ent[1]:
+          return marker, f"vendored tree 匹配 .sp_tinygrad_vendored_ref ({marker[:12]})"
+        return marker, (
+          f"vendored 已对齐 {marker[:12]}（.sp_tinygrad_vendored_ref，工作区待 commit；"
+          f"HEAD tree 仍为 {head_ent[1][:12]}…）"
+        )
+    return None, detail
+
+  # 旧式 submodule 指针（upstream 仍可能为 gitlink）
+  for treeish, label in (("upstream/staging", "upstream/staging"), ("origin/staging", "origin/staging")):
+    sha = _git_ls_tree_submodule_sha(root, treeish, "tinygrad_repo")
+    if sha:
+      return sha, f"git ls-tree {label} tinygrad_repo（HEAD 非 gitlink 时用 upstream 指针）"
+
+  return None, "无法解析 tinygrad_repo commit（请先 pull / git submodule update --init tinygrad_repo）"
+
+
+def collect_tinygrad_models_verify_errors(root: Path) -> list[str]:
+  """
+  校验 staging workdir 的 tinygrad_repo 与 models JSON tinygrad_ref 一致。
+  不一致时 OTA 上 ModelManager 下载模型 JIT unpickle 失败 → speed error nan m/s。
+  """
+  if _skip_tinygrad_models_verify():
+    return []
+
+  errors: list[str] = []
+  models_url_used: str | None = None
+
+  models_url = _parse_models_json_url(root)
+  if not models_url:
+    errors.append("sunnypilot/models/fetcher.py: 无法解析 MODEL_URL")
+    models_ref: str | None = None
+    models_url_used = None
+  elif (os.environ.get("VERIFY_TINYGRAD_SKIP_JSON_FETCH") or "").strip().lower() in ("1", "true", "yes", "on"):
+    models_ref = TINYGRAD_MODELS_REF
+    models_url_used = models_url
+    log("verify-tinygrad", f"离线模式：使用脚本常量 TINYGRAD_MODELS_REF={models_ref[:7]}")
+  else:
+    candidates = _models_json_url_candidates(models_url)
+    models_ref, models_url_used = _fetch_models_tinygrad_ref_candidates(candidates)
+    if not models_ref:
+      tried = "\n      ".join(candidates)
+      errors.append(
+        "无法从模型 JSON 读取 tinygrad_ref（已尝试）：\n      "
+        f"{tried}\n      若 MODEL_URL 含 raw/master/refs/heads/gh-pages，请先菜单 1 pull 修复 fetcher 补丁"
+      )
+
+  workdir_sha, workdir_src = resolve_workdir_tinygrad_commit(root, models_ref=models_ref)
+
+  if models_ref and models_ref != TINYGRAD_MODELS_REF:
+    errors.append(
+      f"models JSON tinygrad_ref ({models_ref[:12]}…) 与 sync 脚本 TINYGRAD_MODELS_REF "
+      f"({TINYGRAD_MODELS_REF[:12]}…) 不一致；请同步更新 ensure_tinygrad 镜像 pin 与 JSON"
+    )
+
+  if not workdir_sha:
+    errors.append(f"workdir tinygrad: {workdir_src}")
+  elif models_ref and workdir_sha != models_ref:
+    errors.append(
+      "tinygrad_repo 与 models JSON tinygrad_ref 不一致："
+      f"workdir={workdir_sha} ({workdir_src}) ≠ models tinygrad_ref={models_ref}。"
+      "推送此 staging 后，ModelManager 下载模型会在设备上 unpickle 失败（Speed Error: nan m/s）；"
+      "Default CD210 仍可用（固件自带 pkl 与 OTA tinygrad 同链编译）。"
+      f"修复：将 tinygrad_repo 对齐到 {models_ref[:7]}，或用当前 tinygrad 重编 GitLab recompiled 模型并更新 JSON tinygrad_ref。"
+    )
+
+  if models_url_used and models_url_used != models_url:
+    log("verify-tinygrad", f"models JSON 自 {models_url_used}")
+
+  if not errors and workdir_sha and models_ref:
+    log(
+      "verify-tinygrad",
+      f"OK tinygrad_repo={workdir_sha[:7]} models_json={models_ref[:7]} pin={TINYGRAD_MODELS_REF[:7]}",
+    )
+  return errors
+
+
+def verify_tinygrad_models_alignment(root: Path) -> None:
+  errors = collect_tinygrad_models_verify_errors(root)
+  if errors:
+    raise RuntimeError("verify_tinygrad_models 失败（不会提交/推送）：\n  - " + "\n  - ".join(errors))
 
 
 def verify_patches(root: Path) -> None:
@@ -2977,6 +3363,12 @@ def verify_patches(root: Path) -> None:
   models_needle = f"gitee.com/{GITEE_OWNER}/sunnypilot-models"
   if models_needle not in rt("sunnypilot/models/fetcher.py"):
     errors.append(f"sunnypilot/models/fetcher.py: 缺少 Gitee models raw URL（期望含 {models_needle!r}）")
+  fetcher_url = _parse_models_json_url(root)
+  if fetcher_url and "raw/master/refs/heads/gh-pages" in fetcher_url:
+    errors.append(
+      "sunnypilot/models/fetcher.py: MODEL_URL 仍为错误路径 raw/master/refs/heads/gh-pages（Gitee 404）；"
+      "请重新 pull 以应用 models_fetcher 补丁"
+    )
 
   mapd_needle = f"gitee.com/{GITEE_OWNER}/openpilot-mapd"
   if mapd_needle not in rt("selfdrive/ui/sunnypilot/layouts/settings/osm.py"):
@@ -3086,6 +3478,8 @@ def verify_patches(root: Path) -> None:
       if not compileall.compile_dir(str(d), quiet=1):
         errors.append(f"{sub}/: compileall 失败")
 
+  errors.extend(collect_tinygrad_models_verify_errors(root))
+
   if errors:
     raise RuntimeError("verify_patches 失败（不会提交/推送）：\n  - " + "\n  - ".join(errors))
 
@@ -3167,7 +3561,7 @@ def ensure_tinygrad_submodule_commit_reachable() -> None:
   确保 Gitee tinygrad 镜像含 superproject 固定的 submodule SHA。
   子模块 update 阶段仍走 GitHub upstream；此处仅为 Gitee 克隆者兜底。
   """
-  sha = "3501a714785ff370cffb966a45d5f9cdf6c9ea7a"
+  sha = TINYGRAD_MODELS_REF
   url = gitee_git_ssh_repo("tinygrad")
 
   def _gitee_has_commit(port: int) -> bool:
@@ -3189,7 +3583,7 @@ def ensure_tinygrad_submodule_commit_reachable() -> None:
       log("tinygrad", f"Gitee mirror already has {sha[:7]} (ssh port {port})")
       return
 
-  branch = "submodule-pin-3501a714"
+  branch = f"submodule-pin-{sha[:12]}"
   with tempfile.TemporaryDirectory() as td:
     run(["git", "init"], td)
     run(["git", "remote", "add", "upstream", "https://github.com/sunnypilot/tinygrad.git"], td)
@@ -3453,13 +3847,14 @@ def main() -> None:
   ap.add_argument("--action",
                   choices=[
                     "menu", "pull", "push", "push-gitee", "push-codeup", "emit-outputs",
-                    "print-ci-push-targets", "all",
+                    "print-ci-push-targets", "verify-tinygrad-models", "all",
                   ],
                   default="menu",
                   help=(
                     "执行模式：menu=交互菜单；pull=拉取+补丁；push=推全部启用源；"
                     "push-gitee/push-codeup=仅推一端（CI 分步）；emit-outputs=写 GITHUB_OUTPUT；"
-                    "print-ci-push-targets=输出 workflow 条件变量；all=pull+push"
+                    "print-ci-push-targets=输出 workflow 条件变量；"
+                    "verify-tinygrad-models=仅校验 tinygrad_repo 与 models JSON ref；all=pull+push"
                   ))
   ap.add_argument("--build-installer", action="store_true", default=False, help="在 larch64 设备上构建 installer（需要 extras=on）")
   ap.add_argument("--sync-mapd-release", action="store_true", default=False, help="同步 mapd 二进制到 Gitee Release（需要 GITEE_TOKEN）")
@@ -3994,6 +4389,9 @@ def main() -> None:
             raise SystemExit(1)
     elif args.action == "emit-outputs":
       write_ci_github_output(load_ci_sync_state())
+    elif args.action == "verify-tinygrad-models":
+      verify_tinygrad_models_alignment(root)
+      print("[ok] tinygrad_repo 与 models JSON tinygrad_ref 一致")
     elif args.action == "all":
       do_all()
     else:

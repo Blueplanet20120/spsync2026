@@ -157,6 +157,7 @@ jobs:
 
       - name: Sync upstream -> patch (no push)
         id: sync_pull
+        # pull 内 verify_patches 含 tinygrad_repo ↔ models JSON tinygrad_ref 门禁（防 OTA 下载模型 nan）
         shell: bash
         env:
           GITEE_REPO_SSH: ${{ secrets.GITEE_REPO_SSH }}
