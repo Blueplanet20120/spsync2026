@@ -1217,15 +1217,56 @@ def replace_or_fail(path: Path, replacements: list[tuple[str, str]]) -> None:
       raise RuntimeError(f"{path} 未找到预期内容: {a}")
     s = s.replace(a, b)
   if s != orig:
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(s, encoding="utf-8")
 
 
 def write_if_changed(path: Path, new_text: str) -> bool:
   old = path.read_text(encoding="utf-8") if path.exists() else ""
   if new_text != old:
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(new_text, encoding="utf-8")
     return True
   return False
+
+
+def _uses_openpilot_pkg_layout(root: Path) -> bool:
+  """上游将 system/selfdrive/sunnypilot 迁入 openpilot/ 包目录后的布局检测。"""
+  return (root / "openpilot" / "system").is_dir() and not (root / "system").is_dir()
+
+
+def cn_rel(root: Path, rel: str) -> str:
+  """
+  将历史根相对路径适配到当前仓库布局。
+  - 新布局：system|selfdrive|sunnypilot → openpilot/...
+  - version.py：system/version.py → openpilot/common/version.py
+  """
+  rel = rel.replace("\\", "/")
+  while rel.startswith("./"):
+    rel = rel[2:]
+  rel = rel.lstrip("/")
+  if rel in ("system/version.py", "openpilot/common/version.py", "openpilot/system/version.py"):
+    for cand in (
+      "openpilot/common/version.py",
+      "system/version.py",
+      "openpilot/system/version.py",
+    ):
+      if (root / cand).is_file():
+        return cand
+    return "openpilot/common/version.py" if _uses_openpilot_pkg_layout(root) else "system/version.py"
+  if rel.startswith("openpilot/"):
+    return rel
+  if rel.startswith(("system/", "selfdrive/", "sunnypilot/")):
+    if _uses_openpilot_pkg_layout(root) or (root / "openpilot" / rel).exists():
+      return f"openpilot/{rel}"
+    if (root / rel).exists() or not (root / "openpilot").is_dir():
+      return rel
+    return f"openpilot/{rel}"
+  return rel
+
+
+def cn_path(root: Path, rel: str) -> Path:
+  return root / cn_rel(root, rel)
 
 
 def replace_or_fail_changed(path: Path, replacements: list[tuple[str, str]]) -> bool:
@@ -1938,15 +1979,15 @@ def _installer_cn_route_block(gitee: MainRepoSource, codeup: MainRepoSource) -> 
 static const char *CN_DATA_CODEUP_KEY = "/data/ssh/id_ed25519_codeup";
 static const char *CN_GITEE_HTTPS = "{gitee.https_url}";
 static const char *CN_GITEE_SSH = "{gitee.ssh_url}";
-static const char *CN_CODEUP_HTTPS = "{codeup.https_url}";
 static const char *CN_CODEUP_SSH = "{codeup.ssh_url}";
 
 static bool cn_is_author_device() {{
   return access(CN_DATA_CODEUP_KEY, F_OK) == 0;
 }}
 
-static std::string cn_main_repo_https_url() {{
-  return cn_is_author_device() ? CN_CODEUP_HTTPS : CN_GITEE_HTTPS;
+static std::string cn_main_repo_fetch_url() {{
+  // Codeup 仓库需要认证；作者设备必须用 /data 私钥对应的 SSH URL。
+  return cn_is_author_device() ? CN_CODEUP_SSH : CN_GITEE_HTTPS;
 }}
 
 static std::string cn_main_repo_ssh_url() {{
@@ -1977,9 +2018,12 @@ def _installer_cn_route_inject_anchor(s: str) -> str | None:
   for anchor in _RAYLIB_INCLUDE_ANCHORS:
     if anchor in s:
       return anchor
-  hw_anchor = '#include "system/hardware/hw.h"\n'
-  if hw_anchor in s:
-    return hw_anchor
+  for hw_anchor in (
+    '#include "system/hardware/hw.h"\n',
+    '#include "common/hardware/hw.h"\n',
+  ):
+    if hw_anchor in s:
+      return hw_anchor
   return None
 
 
@@ -2002,8 +2046,9 @@ def _inject_installer_cn_route(s: str, gitee: MainRepoSource, codeup: MainRepoSo
       raise RuntimeError("installer.cc: 未找到 raylib/hw.h include 锚点，无法注入 cn_main_repo_route_installer")
     s2 = s2.replace(anchor, anchor + _installer_cn_route_block(gitee, codeup), 1)
 
+  # 兼容 get_str("url" "?padding") 与 get_str("url?padding") 两种上游写法。
   git_url_line = re.compile(
-    r'const std::string GIT_URL = get_str\("[^"]+"\s*\?[^;]+;\s*\n',
+    r"const\s+std::string\s+GIT_URL\s*=\s*get_str\([^;]*\);\s*\n",
     re.MULTILINE,
   )
   if git_url_line.search(s2):
@@ -2012,61 +2057,76 @@ def _inject_installer_cn_route(s: str, gitee: MainRepoSource, codeup: MainRepoSo
   if "#define GIT_SSH_URL" in s2:
     s2 = re.sub(r'#define GIT_SSH_URL[^\n]+\n', "", s2, count=1)
 
-  if "std::string git_url = cn_main_repo_https_url()" not in s2:
+  # 迁移已生成的旧版动态路由。
+  s2 = s2.replace("cn_main_repo_https_url()", "cn_main_repo_fetch_url()")
+  s2 = re.sub(r'^static const char \*CN_CODEUP_HTTPS = "[^"]+";\n', "", s2, count=1, flags=re.MULTILINE)
+  s2 = s2.replace(
+    "static std::string cn_main_repo_fetch_url() {\n"
+    "  return cn_is_author_device() ? CN_CODEUP_HTTPS : CN_GITEE_HTTPS;\n"
+    "}",
+    "static std::string cn_main_repo_fetch_url() {\n"
+    "  // Codeup 仓库需要认证；作者设备必须用 /data 私钥对应的 SSH URL。\n"
+    "  return cn_is_author_device() ? CN_CODEUP_SSH : CN_GITEE_HTTPS;\n"
+    "}",
+  )
+
+  if "int freshClone() {\n  cn_prepare_installer_git_env();" not in s2:
     s2 = s2.replace(
       "int freshClone() {\n",
       "int freshClone() {\n  cn_prepare_installer_git_env();\n",
       1,
     )
+  if "std::string git_url = cn_main_repo_fetch_url()" not in s2:
     s2 = s2.replace(
       '  std::string cmd = util::string_format("git clone --progress %s -b %s --depth=1 --recurse-submodules %s 2>&1",\n'
       "                                        GIT_URL.c_str(), migrated_branch.c_str(), TMP_INSTALL_PATH);",
-      '  std::string git_url = cn_main_repo_https_url();\n'
+      '  std::string git_url = cn_main_repo_fetch_url();\n'
       '  std::string cmd = util::string_format("git clone --progress %s -b %s --depth=1 --recurse-submodules %s 2>&1",\n'
       "                                        git_url.c_str(), migrated_branch.c_str(), TMP_INSTALL_PATH);",
       1,
     )
+  if "int cachedFetch(const std::string &cache) {\n  cn_prepare_installer_git_env();" not in s2:
     s2 = s2.replace(
       "int cachedFetch(const std::string &cache) {\n",
       "int cachedFetch(const std::string &cache) {\n  cn_prepare_installer_git_env();\n",
       1,
     )
-    s2 = s2.replace(
-      'run(util::string_format("cd %s && git remote set-url origin %s", TMP_INSTALL_PATH, GIT_URL.c_str()).c_str());',
-      'run(util::string_format("cd %s && git remote set-url origin %s", TMP_INSTALL_PATH, cn_main_repo_https_url().c_str()).c_str());',
-      1,
+  s2 = s2.replace(
+    'run(util::string_format("cd %s && git remote set-url origin %s", TMP_INSTALL_PATH, GIT_URL.c_str()).c_str());',
+    'run(util::string_format("cd %s && git remote set-url origin %s", TMP_INSTALL_PATH, cn_main_repo_fetch_url().c_str()).c_str());',
+    1,
+  )
+  old_push = (
+    '  run(("cd " + INSTALL_PATH + " && "\n'
+    '      "git remote set-url origin --push " GIT_SSH_URL " && "\n'
+    '      "git config --replace-all remote.origin.fetch \\"+refs/heads/*:refs/remotes/origin/*\\"").c_str());'
+  )
+  new_push = (
+    '  run(("cd " + INSTALL_PATH + " && "\n'
+    '      "git remote set-url origin --push " + cn_main_repo_ssh_url() + " && "\n'
+    '      "git config --replace-all remote.origin.fetch \\"+refs/heads/*:refs/remotes/origin/*\\"").c_str());'
+  )
+  if old_push in s2:
+    s2 = s2.replace(old_push, new_push, 1)
+  elif "GIT_SSH_URL" in s2:
+    s2 = re.sub(
+      r'"git remote set-url origin --push " GIT_SSH_URL " && "',
+      '"git remote set-url origin --push " + cn_main_repo_ssh_url() + " && "',
+      s2,
+      count=1,
     )
-    old_push = (
-      '  run(("cd " + INSTALL_PATH + " && "\n'
-      '      "git remote set-url origin --push " GIT_SSH_URL " && "\n'
-      '      "git config --replace-all remote.origin.fetch \\"+refs/heads/*:refs/remotes/origin/*\\"").c_str());'
-    )
-    new_push = (
-      '  run(("cd " + INSTALL_PATH + " && "\n'
-      '      "git remote set-url origin --push " + cn_main_repo_ssh_url() + " && "\n'
-      '      "git config --replace-all remote.origin.fetch \\"+refs/heads/*:refs/remotes/origin/*\\"").c_str());'
-    )
-    if old_push in s2:
-      s2 = s2.replace(old_push, new_push, 1)
-    elif "GIT_SSH_URL" in s2:
-      s2 = re.sub(
-        r'"git remote set-url origin --push " GIT_SSH_URL " && "',
-        '"git remote set-url origin --push " + cn_main_repo_ssh_url() + " && "',
-        s2,
-        count=1,
-      )
   return s2
 
 
 def patch_main_repo_cn_routing(root: Path) -> PatchResult:
   """主仓 cn_main_repo_route.py 全量写入 + installer 运行时选 URL。"""
   res = PatchResult("main_repo_cn_routing")
-  route_py = root / "system/cn_main_repo_route.py"
+  route_py = cn_path(root, "system/cn_main_repo_route.py")
   body = _render_cn_main_repo_route_py(main_repo_source_gitee(), main_repo_source_codeup())
   _track_change(res, route_py, write_if_changed(route_py, body))
   gitee = main_repo_source_gitee()
   codeup = main_repo_source_codeup()
-  installer = root / "selfdrive/ui/installer/installer.cc"
+  installer = cn_path(root, "selfdrive/ui/installer/installer.cc")
   s = installer.read_text(encoding="utf-8")
   s2 = _inject_installer_cn_route(s, gitee, codeup)
   _track_change(res, installer, write_if_changed(installer, s2))
@@ -2077,7 +2137,7 @@ def patch_version_py(root: Path) -> PatchResult:
   res = PatchResult("system_version_py")
   gitee = main_repo_source_gitee()
   codeup = main_repo_source_codeup()
-  version_py = root / "system/version.py"
+  version_py = cn_path(root, "system/version.py")
   s = version_py.read_text(encoding="utf-8")
   s2 = s
   for key in (gitee.version_remote_key, codeup.version_remote_key):
@@ -2092,7 +2152,7 @@ def patch_version_py(root: Path) -> PatchResult:
 
 def patch_updated_insteadof(root: Path) -> PatchResult:
   res = PatchResult("updated_insteadof")
-  updated_py = root / "system/updated/updated.py"
+  updated_py = cn_path(root, "system/updated/updated.py")
   s = updated_py.read_text(encoding="utf-8")
   s2 = inject_updated_insteadof_block_flex(s)
   s2 = inject_updated_cn_route_hook(s2)
@@ -2135,7 +2195,7 @@ def inject_mici_home_repo_suffix_flex(s: str, path: Path) -> str:
 
 def patch_mici_home_repo_suffix(root: Path) -> PatchResult:
   res = PatchResult("mici_home_repo_suffix")
-  home_py = root / "selfdrive/ui/mici/layouts/home.py"
+  home_py = cn_path(root, "selfdrive/ui/mici/layouts/home.py")
   if not home_py.exists():
     return res
   s = home_py.read_text(encoding="utf-8")
@@ -2146,7 +2206,7 @@ def patch_mici_home_repo_suffix(root: Path) -> PatchResult:
 
 def patch_tici_setup(root: Path) -> PatchResult:
   res = PatchResult("tici_setup")
-  tici_setup = root / "system/ui/tici_setup.py"
+  tici_setup = cn_path(root, "system/ui/tici_setup.py")
   if not tici_setup.exists():
     return res
 
@@ -2229,18 +2289,33 @@ def patch_tici_setup(root: Path) -> PatchResult:
       "      except Exception:\n"
       "        return False\n\n"
     )
-    s = s.replace(
-      "          if HARDWARE.get_network_type() == NetworkType.wifi:\n"
-      "            self.wifi_connected.set()\n"
-      "          else:\n"
-      "            self.wifi_connected.clear()\n",
-      "          # Wi-Fi connect detection in recovery should not depend on network_type reporting.\n"
-      "          # If wlan0 has an IPv4 address, treat it as connected.\n"
-      "          if wlan0_has_ipv4():\n"
-      "            self.wifi_connected.set()\n"
-      "          else:\n"
-      "            self.wifi_connected.clear()\n"
+  # 旧补丁把 Wi-Fi 状态更新放在联网探测成功之后，首次探测失败时无法放行。
+  stale_wifi_block = (
+    "          # Wi-Fi connect detection in recovery should not depend on network_type reporting.\n"
+    "          # If wlan0 has an IPv4 address, treat it as connected.\n"
+    "          if wlan0_has_ipv4():\n"
+    "            self.wifi_connected.set()\n"
+    "          else:\n"
+    "            self.wifi_connected.clear()\n"
+  )
+  s = s.replace(stale_wifi_block, "")
+  if "cn_wifi_ipv4_bypass" not in s:
+    loop_anchor = (
+      "    while not self.stop_network_check_thread.is_set():\n"
+      "      if self.state == SetupState.NETWORK_SETUP:\n"
     )
+    loop_repl = (
+      "    while not self.stop_network_check_thread.is_set():\n"
+      "      if self.state == SetupState.NETWORK_SETUP:\n"
+      "        # cn_wifi_ipv4_bypass: Wi-Fi 状态独立于外网探测，且每轮清理陈旧状态。\n"
+      "        if wlan0_has_ipv4():\n"
+      "          self.wifi_connected.set()\n"
+      "        else:\n"
+      "          self.wifi_connected.clear()\n"
+    )
+    if loop_anchor not in s:
+      raise RuntimeError(f"{tici_setup}: 未找到网络检测循环，无法注入 Wi-Fi 独立放行")
+    s = s.replace(loop_anchor, loop_repl, 1)
   if s != orig:
     _track_change(res, tici_setup, write_if_changed(tici_setup, s))
   return res
@@ -2248,7 +2323,7 @@ def patch_tici_setup(root: Path) -> PatchResult:
 
 def patch_mici_setup(root: Path) -> PatchResult:
   res = PatchResult("mici_setup")
-  mici_setup = root / "system/ui/mici_setup.py"
+  mici_setup = cn_path(root, "system/ui/mici_setup.py")
   if not mici_setup.exists():
     return res
   s = mici_setup.read_text(encoding="utf-8")
@@ -2318,18 +2393,22 @@ def patch_mici_setup(root: Path) -> PatchResult:
   else:
     s = s.replace('"https://gitee.com/",\n  "https://www.baidu.com/",\n', '"http://www.baidu.com/",\n  "https://www.baidu.com/",\n')
 
-  if "wifi_connected = self._wifi_manager.wifi_state.status == ConnectStatus.CONNECTED" not in s:
-    s = s.replace(
+  if "cn_wifi_connected_bypass" not in s:
+    old_has_internet = (
       "    has_internet = (self._network_monitor.network_connected.is_set() and\n"
       "                    not network_changing and\n"
-      "                    not self._network_monitor.recheck_event.is_set())\n",
-      "    # 恢复/安装流程中，某些网络环境下“联网探测”可能失败（DNS/证书/出口限制），导致卡死。\n"
-      "    # 只要 Wi-Fi 已连接，就允许继续；后续实际更新/下载阶段再做真正的网络错误提示。\n"
+      "                    not self._network_monitor.recheck_event.is_set())\n"
+    )
+    new_has_internet = (
+      "    # cn_wifi_connected_bypass: Wi-Fi 已连接即可继续，下载阶段再报告真实网络错误。\n"
       "    wifi_connected = self._wifi_manager.wifi_state.status == ConnectStatus.CONNECTED\n"
       "    has_internet = (wifi_connected or self._network_monitor.network_connected.is_set()) and \\\n"
       "                   (not network_changing) and \\\n"
       "                   (not self._network_monitor.recheck_event.is_set())\n"
     )
+    if old_has_internet not in s:
+      raise RuntimeError(f"{mici_setup}: 未找到 _has_internet 原始逻辑，无法注入 Wi-Fi 放行")
+    s = s.replace(old_has_internet, new_has_internet, 1)
 
   if s != orig:
     _track_change(res, mici_setup, write_if_changed(mici_setup, s))
@@ -2368,6 +2447,11 @@ def patch_setup_sh(root: Path) -> PatchResult:
       f"{old_base}/blob/master/docs/CONTRIBUTING.md",
       contrib,
     )
+  interactive_url = f"{repo_base}/raw/staging/tools/setup.sh"
+  s2 = s2.replace(
+    "bash <(curl -fsSL openpilot.comma.ai)",
+    f"bash <(curl -fsSL {interactive_url})",
+  )
   _track_change(res, setup_sh, write_if_changed(setup_sh, s2))
   return res
 
@@ -2375,23 +2459,36 @@ def patch_setup_sh(root: Path) -> PatchResult:
 def patch_msgq_setup(root: Path) -> PatchResult:
   res = PatchResult("msgq_setup")
   msgq_setup = root / "msgq_repo/setup.sh"
-  if not msgq_setup.exists():
-    return res
-  s = msgq_setup.read_text(encoding="utf-8")
-  catch2_old = _with_git_url_variants("https://github.com/catchorg/Catch2.git")
-  catch2_new = gitee_https_repo("Catch2.git")
-  # 上游 staging 已改为 uv sync，setup.sh 内不再 git clone Catch2；无旧 URL 则跳过。
-  if not any(o in s for o in catch2_old) and catch2_new not in s:
-    return res
-  s2 = apply_text_replacement_rows(
-    s,
-    [
-      (catch2_old, catch2_new),
-    ],
-    path=msgq_setup,
-    require_all=True,
-  )
-  _track_change(res, msgq_setup, write_if_changed(msgq_setup, s2))
+  if msgq_setup.exists():
+    s = msgq_setup.read_text(encoding="utf-8")
+    catch2_old = _with_git_url_variants("https://github.com/catchorg/Catch2.git")
+    catch2_new = gitee_https_repo("Catch2.git")
+    if any(o in s for o in catch2_old) or catch2_new in s:
+      s2 = apply_text_replacement_rows(
+        s,
+        [(catch2_old, catch2_new)],
+        path=msgq_setup,
+        require_all=True,
+      )
+      _track_change(res, msgq_setup, write_if_changed(msgq_setup, s2))
+
+  # 新版 msgq 由 pyproject/uv 管理 Catch2，实际依赖已迁到 commaai/dependencies。
+  msgq_pyproject = root / "msgq_repo/pyproject.toml"
+  if msgq_pyproject.exists():
+    s = msgq_pyproject.read_text(encoding="utf-8")
+    old_urls = [
+      "git+https://github.com/commaai/dependencies.git",
+      "git+https://github.com/commaai/dependencies",
+      "git+http://github.com/commaai/dependencies.git",
+    ]
+    if any(url in s for url in old_urls):
+      s2 = apply_text_replacement_rows(
+        s,
+        [(old_urls, f"git+{gitee_https_repo('dependencies.git')}")],
+        path=msgq_pyproject,
+        require_all=True,
+      )
+      _track_change(res, msgq_pyproject, write_if_changed(msgq_pyproject, s2))
   return res
 
 
@@ -2421,7 +2518,7 @@ def patch_opendbc_pyproject(root: Path) -> PatchResult:
 
 def patch_models_fetcher(root: Path) -> PatchResult:
   res = PatchResult("models_fetcher")
-  fetcher = root / "sunnypilot/models/fetcher.py"
+  fetcher = cn_path(root, "sunnypilot/models/fetcher.py")
   if not fetcher.is_file():
     return res
 
@@ -2579,7 +2676,7 @@ def patch_tinygrad_vendored_align(root: Path) -> PatchResult:
 
 def patch_osm(root: Path) -> PatchResult:
   res = PatchResult("osm_layout")
-  osm_py = root / "selfdrive/ui/sunnypilot/layouts/settings/osm.py"
+  osm_py = cn_path(root, "selfdrive/ui/sunnypilot/layouts/settings/osm.py")
   s = osm_py.read_text(encoding="utf-8")
   s2 = apply_text_replacement_rows(
     s,
@@ -2601,10 +2698,8 @@ def patch_osm(root: Path) -> PatchResult:
 
 def patch_mapd_installer(root: Path) -> PatchResult:
   res = PatchResult("mapd_installer")
-  mapd_installer = root / "sunnypilot/mapd/mapd_installer.py"
+  mapd_installer = cn_path(root, "sunnypilot/mapd/mapd_installer.py")
   s = mapd_installer.read_text(encoding="utf-8")
-  if f"gitee.com/{GITEE_OWNER}/openpilot-mapd" in s:
-    return res
   s2 = s
   if 'os.getenv("MAPD_TAG"' not in s and "os.getenv('MAPD_TAG'" not in s:
     s2 = re.sub(
@@ -2616,20 +2711,21 @@ def patch_mapd_installer(root: Path) -> PatchResult:
     )
     if s2 == s:
       raise RuntimeError(f"{mapd_installer}: 未找到 VERSION = \"…\" 赋值行，上游 mapd_installer 可能已改版")
-  s2 = apply_text_replacement_rows(
-    s2,
-    [
-      (
-        [
-          "https://github.com/pfeiferj/openpilot-mapd/releases/download/",
-          "http://github.com/pfeiferj/openpilot-mapd/releases/download/",
-        ],
-        f"{gitee_https_repo('openpilot-mapd')}/releases/download/",
-      ),
-    ],
-    path=mapd_installer,
-    require_all=True,
-  )
+  if f"gitee.com/{GITEE_OWNER}/openpilot-mapd" not in s2:
+    s2 = apply_text_replacement_rows(
+      s2,
+      [
+        (
+          [
+            "https://github.com/pfeiferj/openpilot-mapd/releases/download/",
+            "http://github.com/pfeiferj/openpilot-mapd/releases/download/",
+          ],
+          f"{gitee_https_repo('openpilot-mapd')}/releases/download/",
+        ),
+      ],
+      path=mapd_installer,
+      require_all=True,
+    )
   _track_change(res, mapd_installer, write_if_changed(mapd_installer, s2))
   return res
 
@@ -2638,12 +2734,28 @@ _DM_SENTINEL_AWARENESS = "cn_dm_relaxed: avoid awarenessStatus<0 (forceDecel)"
 _DM_SENTINEL_TERMINAL = "cn_dm_relaxed: no terminal strike lockout"
 _DM_SENTINEL_RED_EXIT = "cn_dm_relaxed: auto exit red after 6s attention"
 _DM_SENTINEL_NO_FORCE_DECEL = "cn_dm_relaxed: DM alertLevel.three does not set forceDecel"
+_DM_SENTINEL_ESCALATION_TIMER = "cn_dm_relaxed: preserve no-response escalation timer"
 
 _RE_CONTROLS_FORCE_DECEL_WITH_DM = re.compile(
   r"cs\.forceDecel\s*=\s*bool\s*\(\s*"
   r"\(\s*self\.sm\['driverMonitoringState'\]\.alertLevel\s*==\s*"
   r"log\.DriverMonitoringState\.AlertLevel\.three\s*\)\s*or\s*\n"
   r"\s*\(\s*self\.sm\['selfdriveState'\]\.state\s*==\s*State\.softDisabling\s*\)\s*\)",
+  re.MULTILINE,
+)
+
+# 上游改用 noResponseForceDecel 驱动纵向收油（仍属 DM 红屏升级路径）。
+_RE_CONTROLS_FORCE_DECEL_NO_RESPONSE = re.compile(
+  r"cs\.forceDecel\s*=\s*bool\s*\(\s*"
+  r"self\.sm\['driverMonitoringState'\]\.noResponseForceDecel\s*or\s*\n?"
+  r"\s*\(?\s*self\.sm\['selfdriveState'\]\.state\s*==\s*State\.softDisabling\s*\)?\s*\)",
+  re.MULTILINE,
+)
+
+_RE_CONTROLS_FORCE_DECEL_AWARENESS = re.compile(
+  r"cs\.forceDecel\s*=\s*bool\s*\(\s*"
+  r"(?:\(\s*)?self\.sm\['driverMonitoringState'\]\.awarenessStatus\s*<\s*0\.?\s*\)?\s*or\s*\n?"
+  r"\s*\(?\s*self\.sm\['selfdriveState'\]\.state\s*==\s*State\.softDisabling\s*\)?\s*\)",
   re.MULTILINE,
 )
 
@@ -2684,14 +2796,30 @@ _RE_DM_TERMINAL_POLICY_STRICT = re.compile(
   re.MULTILINE,
 )
 
+# 策略 4：policy v2（alert_3_cnt / no_response_cnt / lockout，无 terminal_time）。
+_RE_DM_TERMINAL_POLICY_V2 = re.compile(
+  r"^([ \t]+)if\s+self\.awareness\s*<=\s*(?:0\.|0)\s*:\s*\n"
+  r"[ \t]*#\s*terminal alert[^\n]*\n"
+  r"[ \t]*self\.alert_level\s*=\s*AlertLevel\.three\s*\n"
+  r"[ \t]*if\s+awareness_prev\s*>\s*(?:0\.|0)\s*:\s*\n"
+  r"[ \t]*self\.alert_3_cnt\s*\+=\s*1\s*\n"
+  r"[ \t]*self\.cnt_since_alert_3\s*=\s*0\s*\n"
+  r"[ \t]*else:\s*\n"
+  r"[ \t]*self\.cnt_since_alert_3\s*\+=\s*1\s*\n"
+  r"[ \t]*if\s+self\.cnt_since_alert_3\s*==\s*self\.no_response_timeout\s*:\s*\n"
+  r"[ \t]*self\.no_response_cnt\s*\+=\s*1",
+  re.MULTILINE,
+)
+
 
 def _dm_monitoring_path(root: Path) -> Path | None:
-  policy = root / "selfdrive/monitoring/policy.py"
-  if policy.exists():
-    return policy
-  helpers = root / "selfdrive/monitoring/helpers.py"
-  if helpers.exists():
-    return helpers
+  for base in ("openpilot/selfdrive/monitoring", "selfdrive/monitoring"):
+    policy = root / base / "policy.py"
+    if policy.exists():
+      return policy
+    helpers = root / base / "helpers.py"
+    if helpers.exists():
+      return helpers
   return None
 
 
@@ -2745,11 +2873,10 @@ def _patch_dm_terminal_flexible(s: str, path_for_err: Path) -> str:
     alert_line = m.group(1)
     ind_m = re.match(r"^([ \t]*)", alert_line)
     ind = ind_m.group(1) if ind_m else ""
-    body_ind = ind + ("  " if ind else "    ")
     return (
       s[: m.start()]
       + alert_line
-      + f"{body_ind}# {_DM_SENTINEL_TERMINAL}\n"
+      + f"{ind}# {_DM_SENTINEL_TERMINAL}\n"
       + s[m.end() :]
     )
   if len(strip_hits) > 1:
@@ -2774,10 +2901,55 @@ def _patch_dm_terminal_flexible(s: str, path_for_err: Path) -> str:
       f"{path_for_err}: policy 严格模式匹配到多处 terminal 累计块（{len(policy_hits)}），请人工处理。"
     )
 
+  def _policy_v2(m: re.Match) -> str:
+    ind_if = m.group(1)
+    ind_body = ind_if + "  "
+    return (
+      f"{ind_if}if self.awareness <= 0.:\n"
+      f"{ind_body}# terminal alert: disengagement required ({_DM_SENTINEL_TERMINAL})\n"
+      f"{ind_body}self.alert_level = AlertLevel.three\n"
+      f"{ind_body}if awareness_prev > 0.:\n"
+      f"{ind_body}  self.cnt_since_alert_3 = 0\n"
+      f"{ind_body}else:\n"
+      f"{ind_body}  self.cnt_since_alert_3 += 1  # {_DM_SENTINEL_ESCALATION_TIMER}"
+    )
+
+  policy_v2_hits = list(_RE_DM_TERMINAL_POLICY_V2.finditer(s))
+  if len(policy_v2_hits) == 1:
+    return _RE_DM_TERMINAL_POLICY_V2.sub(_policy_v2, s, count=1)
+  if len(policy_v2_hits) > 1:
+    raise RuntimeError(
+      f"{path_for_err}: policy v2 模式匹配到多处 alert_3/no_response 累计块（{len(policy_v2_hits)}），请人工处理。"
+    )
+
   raise RuntimeError(
-    f"{path_for_err}: 无法匹配 terminal 累计块（helpers 严格/宽松与 policy 严格均失败）。"
-    "上游若重构 DM 分支，请对照 terminal_time / alertLevel.three 附近代码手工合并补丁。"
+    f"{path_for_err}: 无法匹配 terminal 累计块（helpers 严格/宽松与 policy 严格/v2 均失败）。"
+    "上游若重构 DM 分支，请对照 terminal_time / alert_3_cnt / alertLevel.three 附近代码手工合并补丁。"
   )
+
+
+def _ensure_dm_policy_escalation_timer(s: str, path_for_err: Path) -> str:
+  """新版 policy 保留 noResponseForceDecel 的计时，仅移除 strike/no_response 锁定累计。"""
+  if not _dm_is_policy_arch(s) or "noResponseForceDecel" not in s:
+    return s
+  if _DM_SENTINEL_ESCALATION_TIMER in s:
+    return s
+  anchor = re.search(
+    rf"(?m)^(?P<ind>[ \t]+)# terminal alert: disengagement required "
+    rf"\({_DM_SENTINEL_TERMINAL}\)\s*\n"
+    rf"(?P=ind)self\.alert_level = AlertLevel\.three\s*$",
+    s,
+  )
+  if not anchor:
+    raise RuntimeError(f"{path_for_err}: 未找到已削弱的 policy 红屏块，无法恢复原厂 escalation 计时")
+  ind = anchor.group("ind")
+  timer = (
+    f"\n{ind}if awareness_prev > 0.:\n"
+    f"{ind}  self.cnt_since_alert_3 = 0\n"
+    f"{ind}else:\n"
+    f"{ind}  self.cnt_since_alert_3 += 1  # {_DM_SENTINEL_ESCALATION_TIMER}"
+  )
+  return s[:anchor.end()] + timer + s[anchor.end():]
 
 
 _RE_DM_RED_EXIT_HEADER = re.compile(
@@ -2801,18 +2973,26 @@ def _dm_red_exit_is_misplaced_helpers(s: str) -> bool:
 
 
 def _dm_red_exit_is_misplaced_policy(s: str) -> bool:
-  """policy.py：red_exit 须在 alertLevel 分级 elif 链之后，不可嵌在 distracted 递减分支内。"""
+  """policy.py：red_exit 须与外层 awareness 分支同级，并位于下一方法之前。"""
   m_sent = _RE_DM_RED_EXIT_HEADER.search(s)
-  m_anchor = re.search(
-    r"(?m)^(?P<ind>[ \t]+)elif self\.awareness <= self\.threshold_alert_1:\s*\n"
-    r"(?P=ind)  self\.alert_level = AlertLevel\.one\s*$",
+  m_outer = re.search(
+    r"(?m)^(?P<ind>[ \t]+)if self\.awareness <= 0\.:\s*\n"
+    r"(?P=ind)  # terminal alert",
     s,
   )
   if not m_sent:
     return False
-  if not m_anchor:
+  if not m_outer:
     return True
-  return m_sent.start() <= m_anchor.end()
+  m_next_def = re.search(r"(?m)^  def\s+\w+\(", s[m_outer.end():])
+  next_def_pos = m_outer.end() + m_next_def.start() if m_next_def else len(s)
+  no_face_recovery = "or (not self.face_detected and self.driver_interacting)" in s[m_sent.start():next_def_pos]
+  return (
+    m_sent.start() <= m_outer.end()
+    or m_sent.start() >= next_def_pos
+    or m_sent.group("ind") != m_outer.group("ind")
+    or not no_face_recovery
+  )
 
 
 def _dm_red_exit_is_misplaced(s: str) -> bool:
@@ -2862,15 +3042,24 @@ _RE_DM_RED_EXIT_BLOCK_POLICY = re.compile(
   re.MULTILINE,
 )
 
+_RE_DM_RED_EXIT_BLOCK_GENERIC = re.compile(
+  r"\n(?P<ind>[ \t]+)# cn_dm_relaxed: auto exit red after 6s attention\n"
+  r".*?"
+  r"(?P=ind)else:\n"
+  r"(?P=ind)  self\.red_recover_cnt = 0\n",
+  re.MULTILINE | re.DOTALL,
+)
+
 
 def _dm_red_exit_inject_block_policy(ind: str) -> str:
   return (
     f"\n"
     f"{ind}# {_DM_SENTINEL_RED_EXIT}\n"
     f"{ind}# allow recovery from red without disengage.\n"
-    f"{ind}# If driver is clearly attentive again for <=6s, exit red state automatically.\n"
+    f"{ind}# Face attention or continuous no-face driver interaction for 6s exits red.\n"
     f"{ind}if self.awareness <= 0.:\n"
-    f"{ind}  attentive = (self.driver_distraction_filter.x < 0.37 and self.face_detected and self.pose.low_std)\n"
+    f"{ind}  attentive = ((self.driver_distraction_filter.x < 0.37 and self.face_detected and self.pose.low_std)\n"
+    f"{ind}               or (not self.face_detected and self.driver_interacting))\n"
     f"{ind}  if attentive:\n"
     f"{ind}    self.red_recover_cnt += 1\n"
     f"{ind}    if self.red_recover_cnt * DT_DMON >= 6.0:\n"
@@ -2911,18 +3100,27 @@ def _strip_dm_red_exit_block(s: str) -> str:
   s2 = _RE_DM_RED_EXIT_BLOCK.sub("", s, count=1)
   if s2 != s:
     return s2
-  return _RE_DM_RED_EXIT_BLOCK_POLICY.sub("", s, count=1)
+  s2 = _RE_DM_RED_EXIT_BLOCK_POLICY.sub("", s, count=1)
+  if s2 != s:
+    return s2
+  return _RE_DM_RED_EXIT_BLOCK_GENERIC.sub("", s, count=1)
 
 
 def _ensure_dm_red_recover_counter(s: str, path_for_err: Path) -> str:
+  if "self.red_recover_cnt" in s:
+    return s
   m_init = re.search(r"(?m)^(?P<ind>[ \t]+)self\.terminal_time\s*=\s*0\s*$", s)
   if not m_init:
-    raise RuntimeError(f"{path_for_err}: 未找到 self.terminal_time = 0 初始化行，无法注入 red_exit 计数器")
-  if "self.red_recover_cnt" not in s:
-    ind = m_init.group("ind")
-    insert_line = f"{ind}self.red_recover_cnt = 0  # {_DM_SENTINEL_RED_EXIT}\n"
-    s = s[: m_init.end()] + "\n" + insert_line + s[m_init.end() + 1 :]
-  return s
+    m_init = re.search(r"(?m)^(?P<ind>[ \t]+)self\.alert_3_cnt\s*=\s*0\s*$", s)
+  if not m_init:
+    m_init = re.search(r"(?m)^(?P<ind>[ \t]+)self\.step_change\s*=\s*0\.\s*$", s)
+  if not m_init:
+    raise RuntimeError(
+      f"{path_for_err}: 未找到 terminal_time/alert_3_cnt/step_change 初始化行，无法注入 red_exit 计数器"
+    )
+  ind = m_init.group("ind")
+  insert_line = f"{ind}self.red_recover_cnt = 0  # {_DM_SENTINEL_RED_EXIT}\n"
+  return s[: m_init.end()] + "\n" + insert_line + s[m_init.end() + 1 :]
 
 
 def _patch_dm_red_exit_helpers(s: str, path_for_err: Path) -> str:
@@ -2937,24 +3135,28 @@ def _patch_dm_red_exit_helpers(s: str, path_for_err: Path) -> str:
 
 
 def _patch_dm_red_exit_policy(s: str, path_for_err: Path) -> str:
-  m_anchor = re.search(
-    r"(?m)^(?P<ind>[ \t]+)elif self\.awareness <= self\.threshold_alert_1:\s*\n"
-    r"(?P=ind)  self\.alert_level = AlertLevel\.one\s*\n",
+  m_outer = re.search(
+    r"(?m)^(?P<ind>[ \t]+)if self\.awareness <= 0\.:\s*\n"
+    r"(?P=ind)  # terminal alert",
     s,
   )
-  if not m_anchor:
+  if not m_outer:
     raise RuntimeError(
-      f"{path_for_err}: 未找到 alertLevel 分级 elif 链末尾，无法注入 red_exit 逻辑（policy.py 可能重构）"
+      f"{path_for_err}: 未找到 awareness 红屏外层分支，无法注入 red_exit 逻辑（policy.py 可能重构）"
     )
-  ind = m_anchor.group("ind")
+  m_next_def = re.search(r"(?m)^  def\s+\w+\(", s[m_outer.end():])
+  if not m_next_def:
+    raise RuntimeError(f"{path_for_err}: 未找到 awareness 分支后的下一方法，无法安全注入 red_exit")
+  insert_at = m_outer.end() + m_next_def.start()
+  ind = m_outer.group("ind")
   inject = _dm_red_exit_inject_block_policy(ind)
-  return s[: m_anchor.end()] + inject + s[m_anchor.end() :]
+  return s[:insert_at].rstrip() + "\n" + inject + "\n" + s[insert_at:].lstrip("\n")
 
 
 def _patch_dm_red_exit_flexible(s: str, path_for_err: Path) -> str:
   """
   红色告警（awareness<=0）默认会“粘住”，需要 disengage 才能恢复。
-  国内化补丁：当检测到明显“已注意”（face+low_std+filter）累计满 6 秒，自动退出红色告警。
+  国内化补丁：检测到人脸专注，或无人脸时持续驾驶交互满 6 秒，自动退出红色告警。
   幂等：sentinel 已在正确位置则跳过；旧版误嵌 elif 分支则先剥离再重插。
   """
   if _DM_SENTINEL_RED_EXIT in s and not _dm_red_exit_is_misplaced(s):
@@ -2975,42 +3177,78 @@ def _patch_dm_red_exit_flexible(s: str, path_for_err: Path) -> str:
 
 def _patch_controlsd_no_dm_force_decel(root: Path, res: PatchResult) -> None:
   """
-  staging 上游在 controlsd 用 alertLevel.three 置 forceDecel → 红屏纵向收油。
+  staging 上游用 DM 红屏/无响应置 forceDecel → 纵向收油。
   国内化：仅保留 softDisabling 路径，DM 红屏仍告警但不 forceDecel。
   """
-  path = root / "selfdrive/controls/controlsd.py"
+  path = cn_path(root, "selfdrive/controls/controlsd.py")
   if not path.is_file():
     return
   s = path.read_text(encoding="utf-8")
-  if _DM_SENTINEL_NO_FORCE_DECEL in s:
-    return
   if "cs.forceDecel" not in s:
     raise RuntimeError(f"{path}: 未找到 cs.forceDecel 赋值，上游可能已重构")
-  if not _RE_CONTROLS_FORCE_DECEL_WITH_DM.search(s):
-    if re.search(
-      r"cs\.forceDecel\s*=\s*bool\s*\(\s*self\.sm\['selfdriveState'\]\.state\s*==\s*State\.softDisabling\s*\)",
-      s,
+
+  soft_only = (
+    f"cs.forceDecel = bool(self.sm['selfdriveState'].state == State.softDisabling)"
+    f"  # {_DM_SENTINEL_NO_FORCE_DECEL}"
+  )
+  dm_escalation_expr: str | None = None
+  matcher_exprs = (
+    (
+      _RE_CONTROLS_FORCE_DECEL_NO_RESPONSE,
+      "self.sm['driverMonitoringState'].noResponseForceDecel",
+    ),
+    (
+      _RE_CONTROLS_FORCE_DECEL_WITH_DM,
+      "(self.sm['driverMonitoringState'].alertLevel == log.DriverMonitoringState.AlertLevel.three)",
+    ),
+    (
+      _RE_CONTROLS_FORCE_DECEL_AWARENESS,
+      "(self.sm['driverMonitoringState'].awarenessStatus < 0.)",
+    ),
+  )
+  for rx, escalation_expr in matcher_exprs:
+    if rx.search(s):
+      s2, n = rx.subn(soft_only, s, count=1)
+      if n != 1:
+        raise RuntimeError(f"{path}: forceDecel 替换未生效")
+      s = s2
+      dm_escalation_expr = escalation_expr
+      break
+  else:
+    if _DM_SENTINEL_NO_FORCE_DECEL not in s and re.search(
+    r"cs\.forceDecel\s*=\s*bool\s*\(\s*self\.sm\['selfdriveState'\]\.state\s*==\s*State\.softDisabling\s*\)",
+    s,
     ):
-      # 已等价于国内化写法，补 sentinel 注释
-      s2 = re.sub(
+      s = re.sub(
         r"(cs\.forceDecel\s*=\s*bool\s*\(\s*self\.sm\['selfdriveState'\]\.state\s*==\s*State\.softDisabling\s*\)\s*)",
         rf"\1  # {_DM_SENTINEL_NO_FORCE_DECEL}",
         s,
         count=1,
       )
-      _track_change(res, path, write_if_changed(path, s2))
-      return
-    raise RuntimeError(
-      f"{path}: 无法匹配 alertLevel.three → forceDecel 赋值块；请人工对照 controlsd.publish"
-    )
-  repl = (
-    f"cs.forceDecel = bool(self.sm['selfdriveState'].state == State.softDisabling)"
-    f"  # {_DM_SENTINEL_NO_FORCE_DECEL}"
-  )
-  s2, n = _RE_CONTROLS_FORCE_DECEL_WITH_DM.subn(repl, s, count=1)
-  if n != 1:
-    raise RuntimeError(f"{path}: forceDecel 替换未生效")
-  _track_change(res, path, write_if_changed(path, s2))
+    elif _DM_SENTINEL_NO_FORCE_DECEL not in s:
+      raise RuntimeError(
+        f"{path}: 无法匹配 DM → forceDecel 赋值块"
+        "（alertLevel.three / noResponseForceDecel / awarenessStatus）；请人工对照 controlsd.publish"
+      )
+
+  # forceDecel 仅控制纵向减速；保留原厂 driverMonitoringEscalation 行为。
+  if "cn_dm_relaxed: preserve stock DM escalation" not in s:
+    if dm_escalation_expr is None:
+      policy = _dm_monitoring_path(root)
+      policy_text = policy.read_text(encoding="utf-8", errors="replace") if policy else ""
+      if "noResponseForceDecel" in policy_text:
+        dm_escalation_expr = "self.sm['driverMonitoringState'].noResponseForceDecel"
+      elif "AlertLevel.three" in policy_text:
+        dm_escalation_expr = "(self.sm['driverMonitoringState'].alertLevel == log.DriverMonitoringState.AlertLevel.three)"
+    if dm_escalation_expr and "CC.driverMonitoringEscalation = cs.forceDecel" in s:
+      s = s.replace(
+        "CC.driverMonitoringEscalation = cs.forceDecel",
+        f"CC.driverMonitoringEscalation = bool({dm_escalation_expr} or cs.forceDecel)"
+        "  # cn_dm_relaxed: preserve stock DM escalation",
+        1,
+      )
+
+  _track_change(res, path, write_if_changed(path, s))
 
 
 def patch_dm_relaxed_terminal(root: Path) -> PatchResult:
@@ -3032,15 +3270,87 @@ def patch_dm_relaxed_terminal(root: Path) -> PatchResult:
       and _DM_SENTINEL_TERMINAL in s
       and _RE_DM_RED_EXIT_HEADER.search(s)
       and not _dm_red_exit_is_misplaced(s)
+      and (not _dm_is_policy_arch(s) or _DM_SENTINEL_ESCALATION_TIMER in s)
     )
     if not monitoring_done:
       s = _patch_dm_awareness_flexible(s, dm_path)
       s = _patch_dm_terminal_flexible(s, dm_path)
+      s = _ensure_dm_policy_escalation_timer(s, dm_path)
       s = _patch_dm_red_exit_flexible(s, dm_path)
       changed = write_if_changed(dm_path, s)
       _track_change(res, dm_path, changed)
 
   _patch_controlsd_no_dm_force_decel(root, res)
+  return res
+
+
+def patch_dm_relaxed_tests(root: Path) -> PatchResult:
+  """同步调整上游 DM 测试，并覆盖有人脸/无人脸两种红屏自动恢复。"""
+  res = PatchResult("dm_relaxed_tests")
+  path = cn_path(root, "selfdrive/monitoring/test_monitoring.py")
+  if not path.is_file():
+    return res
+  s = path.read_text(encoding="utf-8")
+  s2 = s.replace(
+    "  # engaged, distracted past red and beyond the no-response window -> unavailability response + lockout\n"
+    "  def test_distracted_lockout(self):\n",
+    "  # engaged and distracted past red: alert remains, but no persistent lockout is accumulated\n"
+    "  def test_distracted_no_lockout(self):\n",
+  )
+  s2 = s2.replace(
+    "  # no face -> wheeltouch red, sustained past the no-response timeout -> unavailability response + lockout\n"
+    "  def test_invisible_lockout(self):\n",
+    "  # no face -> wheeltouch red: alert remains, but no persistent lockout is accumulated\n"
+    "  def test_invisible_no_lockout(self):\n",
+  )
+  s2 = s2.replace(
+    "    assert d_status.lockout_active\n"
+    "    assert d_status.lockout_time_elapsed > 0\n"
+    "    assert d_status.lockout_count >= 1\n",
+    "    # cn_dm_relaxed: terminal strikes do not create a persistent lockout\n"
+    "    assert not d_status.lockout_active\n"
+    "    assert d_status.alert_3_cnt == 0\n"
+    "    assert d_status.no_response_cnt == 0\n",
+    1,
+  )
+  s2 = s2.replace(
+    "    assert d_status.lockout_active\n"
+    "    assert d_status.lockout_count >= 1\n",
+    "    # cn_dm_relaxed: no-face red alert does not create a persistent lockout\n"
+    "    assert not d_status.lockout_active\n"
+    "    assert d_status.alert_3_cnt == 0\n"
+    "    assert d_status.no_response_cnt == 0\n",
+    1,
+  )
+  if "test_cn_red_recovery_with_face" not in s2:
+    anchor = "  # engaged, down to orange, driver pays attention, back to normal; then down to orange, driver touches wheel\n"
+    tests = (
+      "  # cn_dm_relaxed: red exits after 6s of clear face attention\n"
+      "  def test_cn_red_recovery_with_face(self):\n"
+      "    red = [msg_DISTRACTED] * int(DISTRACTED_SECONDS_TO_RED / DT_DMON)\n"
+      "    recovery = [msg_ATTENTIVE] * int(7 / DT_DMON)\n"
+      "    alert_lvls, d_status = self._run_seq(red + recovery, always_false[:len(red + recovery)],\n"
+      "                                          always_true[:len(red + recovery)], always_false[:len(red + recovery)])\n"
+      "    assert log.DriverMonitoringState.AlertLevel.three in alert_lvls\n"
+      "    assert d_status.awareness > 0.\n"
+      "    assert d_status.alert_level != log.DriverMonitoringState.AlertLevel.three\n"
+      "\n"
+      "  # cn_dm_relaxed: no-face wheeltouch red exits after 6s of continuous driver interaction\n"
+      "  def test_cn_red_recovery_without_face(self):\n"
+      "    red = [msg_NO_FACE_DETECTED] * int(INVISIBLE_SECONDS_TO_RED / DT_DMON)\n"
+      "    recovery = [msg_NO_FACE_DETECTED] * int(7 / DT_DMON)\n"
+      "    interactions = [False] * len(red) + [True] * len(recovery)\n"
+      "    msgs = red + recovery\n"
+      "    alert_lvls, d_status = self._run_seq(msgs, interactions, always_true[:len(msgs)], always_false[:len(msgs)])\n"
+      "    assert log.DriverMonitoringState.AlertLevel.three in alert_lvls\n"
+      "    assert d_status.awareness > 0.\n"
+      "    assert d_status.alert_level != log.DriverMonitoringState.AlertLevel.three\n"
+      "\n"
+    )
+    if anchor not in s2:
+      raise RuntimeError(f"{path}: 未找到 test_normal_driver 锚点，无法注入 DM 恢复测试")
+    s2 = s2.replace(anchor, tests + anchor, 1)
+  _track_change(res, path, write_if_changed(path, s2))
   return res
 
 
@@ -3088,6 +3398,7 @@ def patch_all(root: Path) -> list[PatchResult]:
     patch_osm,
     patch_mapd_installer,
     patch_dm_relaxed_terminal,
+    patch_dm_relaxed_tests,
     patch_gitmodules,
   ]
   results: list[PatchResult] = []
@@ -3130,7 +3441,7 @@ def _skip_tinygrad_models_verify() -> bool:
 
 
 def _parse_models_json_url(root: Path) -> str | None:
-  fetcher = root / "sunnypilot/models/fetcher.py"
+  fetcher = cn_path(root, "sunnypilot/models/fetcher.py")
   if not fetcher.is_file():
     return None
   m = re.search(r'MODEL_URL\s*=\s*"([^"]+)"', fetcher.read_text(encoding="utf-8"))
@@ -3449,8 +3760,11 @@ def verify_patches(root: Path) -> None:
   """
   errors: list[str] = []
 
+  def rpath(rel: str) -> str:
+    return cn_rel(root, rel)
+
   def rt(rel: str) -> str:
-    p = root / rel
+    p = root / rpath(rel)
     if not p.exists():
       return ""
     return p.read_text(encoding="utf-8", errors="replace")
@@ -3458,53 +3772,62 @@ def verify_patches(root: Path) -> None:
   gitee = main_repo_source_gitee()
   codeup = main_repo_source_codeup()
 
+  route_rel = rpath("system/cn_main_repo_route.py")
   route_tx = rt("system/cn_main_repo_route.py")
   if _CN_MAIN_REPO_ROUTE_SENTINEL not in route_tx:
-    errors.append("system/cn_main_repo_route.py: 缺少路由模块或 sentinel")
+    errors.append(f"{route_rel}: 缺少路由模块或 sentinel")
   else:
     for fn in ("ensure_codeup_ssh_key", "codeup_ssh_identity_file", "prepare_main_repo_git", "main_repo_ui_suffix"):
       if f"def {fn}" not in route_tx:
-        errors.append(f"system/cn_main_repo_route.py: 缺少 {fn}")
+        errors.append(f"{route_rel}: 缺少 {fn}")
     if codeup.ssh_url not in route_tx or gitee.https_url not in route_tx:
-      errors.append("system/cn_main_repo_route.py: 缺少 Gitee/Codeup 双地址常量")
+      errors.append(f"{route_rel}: 缺少 Gitee/Codeup 双地址常量")
     if "/root/.ssh" in route_tx or "ROOT_CODEUP_KEY" in route_tx:
-      errors.append("system/cn_main_repo_route.py: 仍引用 /root/.ssh（C4 只读会导致 OTA Permission denied）")
+      errors.append(f"{route_rel}: 仍引用 /root/.ssh（C4 只读会导致 OTA Permission denied）")
 
+  inst_rel = rpath("selfdrive/ui/installer/installer.cc")
   inst = rt("selfdrive/ui/installer/installer.cc")
   if not inst.strip():
-    errors.append("selfdrive/ui/installer/installer.cc: 文件缺失或为空")
+    errors.append(f"{inst_rel}: 文件缺失或为空")
   elif _CN_INSTALLER_ROUTE_SENTINEL not in inst:
     errors.append("installer.cc: 缺少 cn_main_repo_route_installer 运行时路由")
   elif gitee.https_url not in inst or codeup.ssh_url not in inst:
     errors.append("installer.cc: 缺少 Gitee/Codeup 双地址常量")
-  elif "std::string git_url = cn_main_repo_https_url()" not in inst:
-    errors.append("installer.cc: freshClone/cachedFetch 未使用 cn_main_repo_https_url 运行时选 URL")
-  elif "GIT_URL.c_str()" in inst:
-    errors.append("installer.cc: 仍使用编译期 GIT_URL，未切到运行时路由")
+  elif "std::string git_url = cn_main_repo_fetch_url()" not in inst:
+    errors.append("installer.cc: freshClone 未使用 cn_main_repo_fetch_url 运行时选 URL")
+  elif "return cn_is_author_device() ? CN_CODEUP_SSH : CN_GITEE_HTTPS;" not in inst:
+    errors.append("installer.cc: 作者设备 fetch 未使用 Codeup SSH（HTTPS 私仓会 401）")
+  elif "GIT_URL.c_str()" in inst or re.search(r"\bconst\s+std::string\s+GIT_URL\b", inst):
+    errors.append("installer.cc: 仍残留编译期 GIT_URL，未完全切到运行时路由")
 
+  ver_rel = rpath("system/version.py")
   ver = rt("system/version.py")
   if gitee.version_remote_key not in ver:
-    errors.append(f"system/version.py: sunnypilot_remote 元组中缺少 {gitee.label} URL")
+    errors.append(f"{ver_rel}: sunnypilot_remote 元组中缺少 {gitee.label} URL")
   if codeup.version_remote_key not in ver:
-    errors.append(f"system/version.py: sunnypilot_remote 元组中缺少 {codeup.label} URL")
+    errors.append(f"{ver_rel}: sunnypilot_remote 元组中缺少 {codeup.label} URL")
 
+  upd_rel = rpath("system/updated/updated.py")
   upd = rt("system/updated/updated.py")
   if "ensure_url_insteadof" not in upd:
-    errors.append("system/updated/updated.py: 缺少 ensure_url_insteadof 注入")
+    errors.append(f"{upd_rel}: 缺少 ensure_url_insteadof 注入")
   if "prepare_main_repo_git(cwd)" not in upd:
-    errors.append("system/updated/updated.py: 缺少 prepare_main_repo_git 注入")
+    errors.append(f"{upd_rel}: 缺少 prepare_main_repo_git 注入")
   if "inject_cn_check_for_update_order" not in upd:
-    errors.append("system/updated/updated.py: check_for_update 未在 ls-remote 前调用 setup_git_options")
+    errors.append(f"{upd_rel}: check_for_update 未在 ls-remote 前调用 setup_git_options")
   owner_needle = f"gitee.com/{GITEE_OWNER}"
   if "ensure_url_insteadof" in upd and owner_needle not in upd:
-    errors.append(f"system/updated/updated.py: ensure_url_insteadof 未指向 Gitee 组织 {GITEE_OWNER!r}")
+    errors.append(f"{upd_rel}: ensure_url_insteadof 未指向 Gitee 组织 {GITEE_OWNER!r}")
 
   if gitee.version_remote_key not in rt("tools/setup.sh"):
     errors.append(f"tools/setup.sh: 缺少主仓 URL（{gitee.label} 公开默认）")
+  if "openpilot.comma.ai" in rt("tools/setup.sh"):
+    errors.append("tools/setup.sh: 交互安装提示仍指向 openpilot.comma.ai")
 
-  home_py = root / "selfdrive/ui/mici/layouts/home.py"
+  home_rel = rpath("selfdrive/ui/mici/layouts/home.py")
+  home_py = root / home_rel
   if home_py.exists() and "main_repo_ui_suffix" not in rt("selfdrive/ui/mici/layouts/home.py"):
-    errors.append("selfdrive/ui/mici/layouts/home.py: 缺少 main_repo_ui_suffix（主页 commit 后缀）")
+    errors.append(f"{home_rel}: 缺少 main_repo_ui_suffix（主页 commit 后缀）")
 
   mirror_needles = gitee_mirror_needles()
   catch2_needle = next(n for n in mirror_needles if "Catch2" in n)
@@ -3514,35 +3837,48 @@ def verify_patches(root: Path) -> None:
     catch2_old = _with_git_url_variants("https://github.com/catchorg/Catch2.git")
     if any(o in msgq_setup_text for o in catch2_old) and catch2_needle not in msgq_setup_text:
       errors.append(f"msgq_repo/setup.sh: 缺少 Gitee Catch2 URL（期望含 {catch2_needle!r}）")
+  msgq_pyproject = root / "msgq_repo/pyproject.toml"
+  if msgq_pyproject.exists():
+    msgq_pyproject_text = rt("msgq_repo/pyproject.toml")
+    dep_needle = f"gitee.com/{GITEE_OWNER}/dependencies"
+    if "github.com/commaai/dependencies" in msgq_pyproject_text:
+      errors.append("msgq_repo/pyproject.toml: Catch2 依赖仍指向 GitHub")
+    if "catch2 @" in msgq_pyproject_text and dep_needle not in msgq_pyproject_text:
+      errors.append(f"msgq_repo/pyproject.toml: Catch2 缺少 Gitee dependencies URL（期望含 {dep_needle!r}）")
 
   if (root / "opendbc_repo/pyproject.toml").exists():
     dep_needle = f"gitee.com/{GITEE_OWNER}/dependencies"
     if dep_needle not in rt("opendbc_repo/pyproject.toml"):
       errors.append(f"opendbc_repo/pyproject.toml: 缺少 Gitee dependencies URL（期望含 {dep_needle!r}）")
 
+  fetcher_rel = rpath("sunnypilot/models/fetcher.py")
   models_needle = f"gitee.com/{GITEE_OWNER}/sunnypilot-models"
   if models_needle not in rt("sunnypilot/models/fetcher.py"):
-    errors.append(f"sunnypilot/models/fetcher.py: 缺少 Gitee models raw URL（期望含 {models_needle!r}）")
+    errors.append(f"{fetcher_rel}: 缺少 Gitee models raw URL（期望含 {models_needle!r}）")
   fetcher_url = _parse_models_json_url(root)
   if fetcher_url:
     fetcher_url = _fix_models_json_url_typos(fetcher_url)
   if fetcher_url and "raw/master/refs/heads/gh-pages" in fetcher_url:
     errors.append(
-      "sunnypilot/models/fetcher.py: MODEL_URL 仍为错误路径 raw/master/refs/heads/gh-pages（Gitee 404）；"
+      f"{fetcher_rel}: MODEL_URL 仍为错误路径 raw/master/refs/heads/gh-pages（Gitee 404）；"
       "请重新 pull 以应用 models_fetcher 补丁"
     )
   gh_pages_prefix = gitee_models_raw_gh_pages()
   if fetcher_url and models_needle in fetcher_url and gh_pages_prefix not in fetcher_url:
     errors.append(
-      f"sunnypilot/models/fetcher.py: MODEL_URL 应使用 gh-pages raw 前缀（期望含 {gh_pages_prefix!r}）"
+      f"{fetcher_rel}: MODEL_URL 应使用 gh-pages raw 前缀（期望含 {gh_pages_prefix!r}）"
     )
 
+  osm_rel = rpath("selfdrive/ui/sunnypilot/layouts/settings/osm.py")
+  mapd_rel = rpath("sunnypilot/mapd/mapd_installer.py")
   mapd_needle = f"gitee.com/{GITEE_OWNER}/openpilot-mapd"
   if mapd_needle not in rt("selfdrive/ui/sunnypilot/layouts/settings/osm.py"):
-    errors.append(f"selfdrive/ui/sunnypilot/layouts/settings/osm.py: 缺少 Gitee mapd raw URL（期望含 {mapd_needle!r}）")
+    errors.append(f"{osm_rel}: 缺少 Gitee mapd raw URL（期望含 {mapd_needle!r}）")
 
   if mapd_needle not in rt("sunnypilot/mapd/mapd_installer.py"):
-    errors.append(f"sunnypilot/mapd/mapd_installer.py: 缺少 Gitee mapd release URL（期望含 {mapd_needle!r}）")
+    errors.append(f"{mapd_rel}: 缺少 Gitee mapd release URL（期望含 {mapd_needle!r}）")
+  if 'os.getenv("MAPD_TAG"' not in rt("sunnypilot/mapd/mapd_installer.py"):
+    errors.append(f"{mapd_rel}: VERSION 未支持 MAPD_TAG 环境变量")
 
   if (root / ".gitmodules").exists():
     gm = rt(".gitmodules")
@@ -3556,18 +3892,24 @@ def verify_patches(root: Path) -> None:
         errors.append(f".gitmodules: 仍包含上游 GitHub URL（{label}），国内化未写完")
 
   for rel, label in (("system/ui/tici_setup.py", "tici_setup"), ("system/ui/mici_setup.py", "mici_setup")):
-    if (root / rel).exists():
+    resolved = rpath(rel)
+    if (root / resolved).exists():
       tx = rt(rel)
       sp_install = f"gitee.com/{GITEE_OWNER}/sp-cn_install"
       if "OPENPILOT_URL" in tx and sp_install not in tx:
         errors.append(f"{label}: 仍存在 OPENPILOT_URL 但未指向 Gitee sp-cn_install（期望含 {sp_install!r}）")
+      marker = "cn_wifi_ipv4_bypass" if label == "tici_setup" else "cn_wifi_connected_bypass"
+      if marker not in tx:
+        errors.append(f"{label}: 缺少 Wi-Fi 独立放行逻辑 {marker}")
+      if "CONNECTIVITY_CHECK_URLS" not in tx:
+        errors.append(f"{label}: 缺少国内网络多候选探测")
 
   dm_path = _dm_monitoring_path(root)
   if dm_path is None:
     errors.append("selfdrive/monitoring: 缺少 policy.py 与 helpers.py，无法校验 DM 补丁")
   else:
     rel = dm_path.relative_to(root).as_posix()
-    hm = rt(rel)
+    hm = rt(rel) if (root / rel).exists() else dm_path.read_text(encoding="utf-8", errors="replace")
     if _DM_SENTINEL_AWARENESS not in hm:
       errors.append(f"{rel}: 缺少 DM 补丁 sentinel（awareness 下限）")
     if _DM_SENTINEL_TERMINAL not in hm:
@@ -3578,8 +3920,16 @@ def verify_patches(root: Path) -> None:
       errors.append(f"{rel}: 缺少 red_recover_cnt 计数器（red 自动退出）")
     elif _dm_red_exit_is_misplaced(hm):
       errors.append(
-        f"{rel}: red_exit 补丁位置不正确（须在 alert 分级之后，不可嵌在 distracted 分支内）"
+        f"{rel}: red_exit 补丁位置/无人脸恢复不正确（须与 awareness 外层分支同级）"
       )
+    if _dm_is_policy_arch(hm) and "or (not self.face_detected and self.driver_interacting)" not in hm:
+      errors.append(f"{rel}: red_exit 缺少无人脸驾驶交互恢复")
+    if (
+      _dm_is_policy_arch(hm)
+      and "noResponseForceDecel" in hm
+      and _DM_SENTINEL_ESCALATION_TIMER not in hm
+    ):
+      errors.append(f"{rel}: 缺少原厂 no-response escalation 计时保留逻辑")
     if re.search(r"max\s*\(\s*self\.awareness\s*-\s*self\.step_change\s*,\s*-0\.1\s*\)", hm):
       errors.append(f"{rel}: 仍存在原版 -0.1 awareness 下限，DM 补丁未生效")
     if not re.search(
@@ -3600,6 +3950,18 @@ def verify_patches(root: Path) -> None:
         re.MULTILINE,
       ):
         errors.append(f"{rel}: 红线分支仍在累计 terminal_alert_cnt，DM 补丁未生效")
+      if re.search(
+        r"if self\.awareness <= 0\.:[^\n]*\n(?:.*\n)*?\s*self\.alert_level = AlertLevel\.three[^\n]*\n(?:.*\n)*?self\.alert_3_cnt\s*\+=\s*1",
+        hm,
+        re.MULTILINE,
+      ):
+        errors.append(f"{rel}: 红线分支仍在累计 alert_3_cnt，DM 补丁未生效")
+      if re.search(
+        r"if self\.awareness <= 0\.:[^\n]*\n(?:.*\n)*?\s*self\.alert_level = AlertLevel\.three[^\n]*\n(?:.*\n)*?self\.no_response_cnt\s*\+=\s*1",
+        hm,
+        re.MULTILINE,
+      ):
+        errors.append(f"{rel}: 红线分支仍在累计 no_response_cnt，DM 补丁未生效")
     else:
       if re.search(
         r"driverDistracted3[^\n]*\n\s*self\.terminal_time\s*\+=\s*1",
@@ -3614,14 +3976,26 @@ def verify_patches(root: Path) -> None:
       ):
         errors.append(f"{rel}: 红线分支仍在累计 terminal_alert_cnt，DM 补丁未生效")
 
-  controls_rel = "selfdrive/controls/controlsd.py"
+  controls_rel = rpath("selfdrive/controls/controlsd.py")
   if (root / controls_rel).is_file():
-    cs_tx = rt(controls_rel)
+    cs_tx = (root / controls_rel).read_text(encoding="utf-8", errors="replace")
     if _DM_SENTINEL_NO_FORCE_DECEL not in cs_tx:
       errors.append(f"{controls_rel}: 缺少 DM forceDecel 补丁 sentinel")
-    if _RE_CONTROLS_FORCE_DECEL_WITH_DM.search(cs_tx):
+    if (
+      _RE_CONTROLS_FORCE_DECEL_WITH_DM.search(cs_tx)
+      or _RE_CONTROLS_FORCE_DECEL_NO_RESPONSE.search(cs_tx)
+      or _RE_CONTROLS_FORCE_DECEL_AWARENESS.search(cs_tx)
+    ):
       errors.append(
-        f"{controls_rel}: 仍为 alertLevel.three → forceDecel（红屏会收纵向，国内化未生效）"
+        f"{controls_rel}: 仍为 DM → forceDecel（红屏会收纵向，国内化未生效）"
+      )
+    if (
+      "noResponseForceDecel" in cs_tx
+      and "cs.forceDecel" in cs_tx
+      and _DM_SENTINEL_NO_FORCE_DECEL not in cs_tx
+    ):
+      errors.append(
+        f"{controls_rel}: forceDecel 仍关联 noResponseForceDecel（需仅 softDisabling 置 forceDecel）"
       )
     if re.search(
       r"driverMonitoringState[^\n]*alertLevel[^\n]*three",
@@ -3630,19 +4004,29 @@ def verify_patches(root: Path) -> None:
       errors.append(
         f"{controls_rel}: forceDecel 仍可能关联 DM 红屏（需仅 softDisabling 置 forceDecel）"
       )
+    if "CC.driverMonitoringEscalation = cs.forceDecel" in cs_tx:
+      errors.append(f"{controls_rel}: 原厂 driverMonitoringEscalation 被误绑定到已削弱的 forceDecel")
+
+  dm_tests_rel = rpath("selfdrive/monitoring/test_monitoring.py")
+  if (root / dm_tests_rel).is_file():
+    dm_tests = (root / dm_tests_rel).read_text(encoding="utf-8", errors="replace")
+    for test_name in ("test_cn_red_recovery_with_face", "test_cn_red_recovery_without_face"):
+      if test_name not in dm_tests:
+        errors.append(f"{dm_tests_rel}: 缺少 {test_name} 语义测试")
 
   # 语法兜底（不验证逻辑正确性）
   py_verify = [
-    "system/cn_main_repo_route.py",
-    "system/version.py",
-    "system/updated/updated.py",
-    "system/ui/tici_setup.py",
-    "system/ui/mici_setup.py",
-    "selfdrive/ui/mici/layouts/home.py",
-    "sunnypilot/models/fetcher.py",
-    "selfdrive/ui/sunnypilot/layouts/settings/osm.py",
-    "sunnypilot/mapd/mapd_installer.py",
+    rpath("system/cn_main_repo_route.py"),
+    rpath("system/version.py"),
+    rpath("system/updated/updated.py"),
+    rpath("system/ui/tici_setup.py"),
+    rpath("system/ui/mici_setup.py"),
+    rpath("selfdrive/ui/mici/layouts/home.py"),
+    rpath("sunnypilot/models/fetcher.py"),
+    rpath("selfdrive/ui/sunnypilot/layouts/settings/osm.py"),
+    rpath("sunnypilot/mapd/mapd_installer.py"),
     controls_rel,
+    dm_tests_rel,
   ]
   dm_verify = _dm_monitoring_path(root)
   if dm_verify is not None:
@@ -3657,7 +4041,7 @@ def verify_patches(root: Path) -> None:
       except py_compile.PyCompileError as e:
         errors.append(f"{rel}: py_compile 失败: {e}")
 
-  for sub in ("system",):
+  for sub in ("openpilot/system", "system"):
     d = root / sub
     if d.is_dir():
       if not compileall.compile_dir(str(d), quiet=1):
