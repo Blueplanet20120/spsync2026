@@ -1231,8 +1231,15 @@ def write_if_changed(path: Path, new_text: str) -> bool:
 
 
 def _uses_openpilot_pkg_layout(root: Path) -> bool:
-  """上游将 system/selfdrive/sunnypilot 迁入 openpilot/ 包目录后的布局检测。"""
-  return (root / "openpilot" / "system").is_dir() and not (root / "system").is_dir()
+  """上游将 system/selfdrive/sunnypilot 迁入 openpilot/ 包目录后的布局检测。
+
+  注意：国内化可能在仓库根留下 OTA 兼容 shim（如 system/hardware/tici/agnos.json），
+  不能仅用「是否存在 system/」判断，否则会把新布局误判成旧布局。
+  """
+  if not (root / "openpilot" / "system").is_dir():
+    return False
+  # 旧布局根目录有完整 system/updated；仅有 hardware shim 仍算新布局
+  return not (root / "system" / "updated").is_dir()
 
 
 def cn_rel(root: Path, rel: str) -> str:
@@ -2157,7 +2164,101 @@ def patch_updated_insteadof(root: Path) -> PatchResult:
   s2 = inject_updated_insteadof_block_flex(s)
   s2 = inject_updated_cn_route_hook(s2)
   s2 = inject_updated_check_for_update_order(s2)
+  s2 = inject_agnos_manifest_compat(s2)
   _track_change(res, updated_py, write_if_changed(updated_py, s2))
+  return res
+
+
+_CN_AGNOS_MANIFEST_SENTINEL = "cn_agnos_manifest_compat"
+# 旧版车端 updated 在 OVERLAY_MERGED 上硬编码该相对路径；新布局文件在 openpilot/ 下。
+_CN_AGNOS_OTA_SHIM_REL = "system/hardware/tici/agnos.json"
+
+
+def _is_agnos_json_payload(data: bytes) -> bool:
+  s = data.lstrip()
+  return s.startswith(b"{") or s.startswith(b"[")
+
+
+def _read_agnos_json_payload(path: Path) -> bytes | None:
+  """读取 agnos.json 实体；兼容 git 把 symlink 存成相对路径文本的情况。"""
+  if not path.is_file():
+    return None
+  data = path.read_bytes()
+  if _is_agnos_json_payload(data):
+    return data
+  text = data.decode("utf-8", errors="replace").strip()
+  # symlink 文本：例如 ../../../common/hardware/tici/agnos.json
+  if len(data) < 512 and "/" in text and "\n" not in text and not _is_agnos_json_payload(data):
+    target = (path.parent / text).resolve()
+    if target.is_file():
+      return _read_agnos_json_payload(target)
+  return None
+
+
+def _resolve_agnos_json_bytes(root: Path) -> bytes:
+  candidates = [
+    root / "openpilot/common/hardware/tici/agnos.json",
+    root / "openpilot/system/hardware/tici/agnos.json",
+    root / "common/hardware/tici/agnos.json",
+    root / "system/hardware/tici/agnos.json",
+  ]
+  for p in candidates:
+    payload = _read_agnos_json_payload(p)
+    if payload is not None:
+      return payload
+  raise RuntimeError("找不到可用的 agnos.json（openpilot/common 或 system/hardware）")
+
+
+def inject_agnos_manifest_compat(s: str) -> str:
+  """handle_agnos_update：按候选路径解析 manifest，避免布局迁移后 OTA 半失败。"""
+  if _CN_AGNOS_MANIFEST_SENTINEL in s:
+    return s
+  pat = re.compile(
+    r'^([ \t]+)manifest_path = os\.path\.join\(OVERLAY_MERGED, "[^"]*agnos\.json"\)\s*$',
+    re.M,
+  )
+  m = pat.search(s)
+  if not m:
+    raise RuntimeError("updated.py: 未找到 manifest_path agnos.json 赋值，无法注入兼容逻辑")
+  ind = m.group(1)
+  block = (
+    f"{ind}# {_CN_AGNOS_MANIFEST_SENTINEL}: old OTA clients + openpilot/ layout\n"
+    f"{ind}_agnos_rels = (\n"
+    f'{ind}  "openpilot/system/hardware/tici/agnos.json",\n'
+    f'{ind}  "openpilot/common/hardware/tici/agnos.json",\n'
+    f'{ind}  "system/hardware/tici/agnos.json",\n'
+    f"{ind})\n"
+    f"{ind}manifest_path = next(\n"
+    f"{ind}  (os.path.join(OVERLAY_MERGED, rel) for rel in _agnos_rels\n"
+    f"{ind}   if os.path.isfile(os.path.join(OVERLAY_MERGED, rel))),\n"
+    f"{ind}  os.path.join(OVERLAY_MERGED, _agnos_rels[0]),\n"
+    f"{ind})\n"
+  )
+  return s[: m.start()] + block + s[m.end() :]
+
+
+def patch_agnos_ota_compat(root: Path) -> PatchResult:
+  """
+  让仍在跑旧 updated.py 的设备也能完成「拉新树 → 刷 AGNOS」。
+
+  旧客户端硬编码 OVERLAY_MERGED/system/hardware/tici/agnos.json；
+  上游迁到 openpilot/ 后该路径缺失，git fetch 成功但 AGNOS 阶段 FileNotFoundError。
+  在发布树根保留一份实体 JSON shim（车友 Gitee / 作者 Codeup 同样受益）。
+  """
+  res = PatchResult("agnos_ota_compat")
+  updated_py = cn_path(root, "system/updated/updated.py")
+  if updated_py.is_file():
+    s2 = inject_agnos_manifest_compat(updated_py.read_text(encoding="utf-8"))
+    _track_change(res, updated_py, write_if_changed(updated_py, s2))
+
+  payload = _resolve_agnos_json_bytes(root)
+  shim = root / _CN_AGNOS_OTA_SHIM_REL
+  # 必须写在仓库根 system/...，不能走 cn_path（那会进 openpilot/）
+  old = shim.read_bytes() if shim.is_file() else None
+  if old != payload:
+    shim.parent.mkdir(parents=True, exist_ok=True)
+    shim.write_bytes(payload)
+    _track_change(res, shim, True)
   return res
 
 
@@ -3387,6 +3488,7 @@ def patch_all(root: Path) -> list[PatchResult]:
     patch_main_repo_cn_routing,
     patch_version_py,
     patch_updated_insteadof,
+    patch_agnos_ota_compat,
     patch_mici_home_repo_suffix,
     patch_tici_setup,
     patch_mici_setup,
@@ -3815,9 +3917,22 @@ def verify_patches(root: Path) -> None:
     errors.append(f"{upd_rel}: 缺少 prepare_main_repo_git 注入")
   if "inject_cn_check_for_update_order" not in upd:
     errors.append(f"{upd_rel}: check_for_update 未在 ls-remote 前调用 setup_git_options")
+  if _CN_AGNOS_MANIFEST_SENTINEL not in upd:
+    errors.append(f"{upd_rel}: 缺少 {_CN_AGNOS_MANIFEST_SENTINEL}（AGNOS manifest 多路径，旧客户端 OTA 会死锁）")
   owner_needle = f"gitee.com/{GITEE_OWNER}"
   if "ensure_url_insteadof" in upd and owner_needle not in upd:
     errors.append(f"{upd_rel}: ensure_url_insteadof 未指向 Gitee 组织 {GITEE_OWNER!r}")
+
+  # 旧 updated 硬编码 system/hardware/tici/agnos.json；新布局必须在发布树根保留 shim
+  if (root / "openpilot/common/hardware/tici/agnos.json").is_file() or (
+    root / "openpilot/system/hardware/tici/agnos.json"
+  ).is_file():
+    shim = root / _CN_AGNOS_OTA_SHIM_REL
+    shim_payload = _read_agnos_json_payload(shim) if shim.is_file() else None
+    if shim_payload is None or not _is_agnos_json_payload(shim_payload):
+      errors.append(
+        f"{_CN_AGNOS_OTA_SHIM_REL}: 缺少实体 JSON shim（旧车端 OTA 刷 AGNOS 会 FileNotFoundError）"
+      )
 
   if gitee.version_remote_key not in rt("tools/setup.sh"):
     errors.append(f"tools/setup.sh: 缺少主仓 URL（{gitee.label} 公开默认）")
