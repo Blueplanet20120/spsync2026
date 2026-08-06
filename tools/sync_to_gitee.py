@@ -2624,6 +2624,7 @@ def patch_models_fetcher(root: Path) -> PatchResult:
     return res
 
   s = fetcher.read_text(encoding="utf-8")
+  s = inject_models_fetcher_stale_cache_guard(s)
   m = re.search(r'MODEL_URL\s*=\s*"([^"]+)"', s)
   if not m:
     raise RuntimeError(f"{fetcher}: 找不到 MODEL_URL 赋值")
@@ -2631,14 +2632,68 @@ def patch_models_fetcher(root: Path) -> PatchResult:
   json_name = _extract_model_json_basename(m.group(1))
   new_url = _expected_models_json_url(json_name)
   current = _fix_models_json_url_typos(m.group(1).strip())
-  if current == new_url:
-    return res
-
-  s2, n = re.subn(r'(MODEL_URL\s*=\s*")[^"]+(")', rf'\1{new_url}\2', s, count=1)
-  if n != 1:
-    raise RuntimeError(f"{fetcher}: MODEL_URL 替换未生效（请检查 upstream 是否改了字段写法）")
-  _track_change(res, fetcher, write_if_changed(fetcher, s2))
+  if current != new_url:
+    s2, n = re.subn(r'(MODEL_URL\s*=\s*")[^"]+(")', rf'\1{new_url}\2', s, count=1)
+    if n != 1:
+      raise RuntimeError(f"{fetcher}: MODEL_URL 替换未生效（请检查 upstream 是否改了字段写法）")
+    s = s2
+  _track_change(res, fetcher, write_if_changed(fetcher, s))
   return res
+
+
+_CN_MODELS_CACHE_GUARD = "cn_models_cache_selector_guard"
+
+
+def inject_models_fetcher_stale_cache_guard(s: str) -> str:
+  """
+  OTA 后 Params 里可能仍留着旧 driving_models_*.json 缓存（minimum_selector_version 与
+  helpers.REQUIRED_JSON_VERSION 不一致），parse 后 bundles 为空 → UI 只剩 CD210 默认项。
+  """
+  if _CN_MODELS_CACHE_GUARD in s:
+    return s
+  needle = (
+    "  def get_available_bundles(self) -> list[custom.ModelManagerSP.ModelBundle]:\n"
+    '    """Gets the list of available models, with smart cache handling"""\n'
+    "    cached_data, is_expired = self.model_cache.get()\n"
+  )
+  if needle not in s:
+    raise RuntimeError("fetcher.py: 未找到 get_available_bundles，无法注入模型缓存兼容逻辑")
+  block = (
+    "  def _parse_cached_bundles(self, cached_data: dict) -> list[custom.ModelManagerSP.ModelBundle] | None:\n"
+    f"    # {_CN_MODELS_CACHE_GUARD}: drop stale JSON cache after OTA / selector version bump\n"
+    "    if not cached_data:\n"
+    "      return None\n"
+    "    bundles = self.model_parser.parse_models(cached_data)\n"
+    '    if cached_data.get("bundles") and not bundles:\n'
+    '      cloudlog.warning("Model cache incompatible with selector version; refetching")\n'
+    "      return None\n"
+    "    return bundles\n\n"
+    "  def get_available_bundles(self) -> list[custom.ModelManagerSP.ModelBundle]:\n"
+    '    """Gets the list of available models, with smart cache handling"""\n'
+    "    cached_data, is_expired = self.model_cache.get()\n"
+  )
+  s = s.replace(needle, block, 1)
+  s = s.replace(
+    "    if cached_data and not is_expired:\n"
+    "      cloudlog.debug(\"Using valid cached models data\")\n"
+    "      return self.model_parser.parse_models(cached_data)\n",
+    "    if cached_data and not is_expired:\n"
+    "      cached_bundles = self._parse_cached_bundles(cached_data)\n"
+    "      if cached_bundles is not None:\n"
+    '        cloudlog.debug("Using valid cached models data")\n'
+    "        return cached_bundles\n"
+    "      is_expired = True\n",
+    1,
+  )
+  s = s.replace(
+    '    cloudlog.warning("Failed to fetch fresh data. Using expired cache as fallback")\n'
+    "    return self.model_parser.parse_models(cached_data)\n",
+    '    cloudlog.warning("Failed to fetch fresh data. Using expired cache as fallback")\n'
+    "    fallback = self._parse_cached_bundles(cached_data)\n"
+    "    return fallback if fallback is not None else []\n",
+    1,
+  )
+  return s
 
 
 def _tinygrad_fetch_remotes() -> list[str]:
@@ -3982,6 +4037,10 @@ def verify_patches(root: Path) -> None:
   if fetcher_url and models_needle in fetcher_url and gh_pages_prefix not in fetcher_url:
     errors.append(
       f"{fetcher_rel}: MODEL_URL 应使用 gh-pages raw 前缀（期望含 {gh_pages_prefix!r}）"
+    )
+  if _CN_MODELS_CACHE_GUARD not in rt("sunnypilot/models/fetcher.py"):
+    errors.append(
+      f"{fetcher_rel}: 缺少 {_CN_MODELS_CACHE_GUARD}（OTA 后旧模型缓存会导致列表只剩 CD210）"
     )
 
   osm_rel = rpath("selfdrive/ui/sunnypilot/layouts/settings/osm.py")
