@@ -452,7 +452,8 @@ def _build_sync_context_section(state: dict[str, object]) -> str:
     line_note = "说明：本次为手动 Force 强制重同步（上游 superproject 提交相对上次写入 Gitee 的记录一致，仍重跑补丁并推送）。"
   elif variant == "upstream_only":
     line_note = (
-      "说明：本次检测到上游 sunnypilot 主仓库（superproject）提交与上次写入 Gitee 提交信息里的 upstream-* 行不一致，因而同步推送；"
+      "说明：本次检测到上游 sunnypilot 主仓库（superproject）提交与上次镜像提交信息里的 upstream-* 行不一致，因而同步推送；"
+      "比较优先读 Gitee，若无记录则回退 Codeup（半成功时避免误触发）。"
       "比较的是完整 Git 对象 ID（短哈希与全哈希视为同一提交）。"
       "子模块指针变化会体现在主仓库树或 .gitmodules 的差异里；若你只看网页上的「某个依赖版本」而主仓库 commit 未变，脚本仍会认为无同步必要。"
     )
@@ -1578,6 +1579,70 @@ def parse_recorded_upstream_sha(commit_body: str, branch: str) -> str | None:
   """
   m = re.search(rf"(?m)^upstream-{re.escape(branch)}:\s*([0-9a-f]{{7,40}})\s*$", commit_body or "")
   return m.group(1) if m else None
+
+
+def fetch_mirror_recorded_upstream(
+  root: Path,
+  env: dict[str, str],
+  remote: str,
+  branch: str,
+) -> tuple[str | None, str | None]:
+  """
+  从镜像远端最新提交读取 upstream-<branch> 记录。
+  返回 (recorded_sha, remote_head_sha)；fetch 失败则 (None, None)。
+  """
+  try:
+    fetch_env = env
+    if remote == "aliyun":
+      if aliyun_push_via_https(env):
+        fetch_env = aliyun_git_https_push_env(env)
+      elif aliyun_ssh_key_path().exists():
+        fetch_env = aliyun_git_push_env(env)
+    run(["git", "fetch", "--depth=1", remote, branch], str(root), env=fetch_env)
+    head = run(["git", "rev-parse", "FETCH_HEAD"], str(root), env=env).strip().lower()
+    body = run(["git", "log", "-1", "--format=%B", "FETCH_HEAD"], str(root), env=env)
+    return parse_recorded_upstream_sha(body, branch), head
+  except Exception:
+    return None, None
+
+
+def resolve_recorded_upstream_sha(
+  root: Path,
+  env: dict[str, str],
+  branch: str,
+) -> tuple[str | None, str | None, str, str | None]:
+  """
+  解析「上次已同步的上游 SHA」。
+  优先 Gitee(origin)；无记录时回退 Codeup(aliyun)——半成功（仅 Codeup 推上）时避免误判上游有更新。
+  返回 (recorded_sha, recorded_canon, source_label, tip_head_for_note)。
+  """
+  recorded_sha, gitee_head = fetch_mirror_recorded_upstream(root, env, "origin", branch)
+  recorded_canon = canonical_commit_sha(recorded_sha, root, env)
+  if recorded_canon is not None:
+    return recorded_sha, recorded_canon, "Gitee", gitee_head
+
+  # 确保 aliyun remote 存在（即使本次未启用 Codeup 推送，也可读已成功推送的记录）
+  try:
+    remotes = run(["git", "remote"], str(root), env=env).splitlines()
+    codeup_url = (env.get("ALIYUN_REPO_SSH") or main_repo_source_codeup().ssh_url).strip()
+    if "aliyun" not in remotes:
+      run(["git", "remote", "add", "aliyun", codeup_url], str(root), env=env)
+    else:
+      run(["git", "remote", "set-url", "aliyun", codeup_url], str(root), env=env)
+  except Exception:
+    pass
+
+  codeup_sha, codeup_head = fetch_mirror_recorded_upstream(root, env, "aliyun", branch)
+  codeup_canon = canonical_commit_sha(codeup_sha, root, env)
+  if codeup_canon is not None:
+    print(
+      f"[info] {branch}: Gitee 无 upstream-{branch} 记录，改用 Codeup 记录 "
+      f"({short_sha(codeup_canon) or codeup_canon[:EMAIL_SHA_LEN]})"
+    )
+    return codeup_sha, codeup_canon, "Codeup", codeup_head or gitee_head
+
+  # 两边都没有 upstream-*：保留 Gitee tip 供邮件展示（与旧行为一致）
+  return recorded_sha, None, "Gitee", gitee_head or codeup_head
 
 
 def canonical_commit_sha(sha: str | None, root: Path, env: dict[str, str]) -> str | None:
@@ -4716,19 +4781,9 @@ def main() -> None:
       # 若上游分支 HEAD 未变化，直接跳过（避免每小时重复跑一遍补丁/推送）
       upstream_sha = run(["git", "rev-parse", f"upstream/{branch}"], str(root), env=env).strip().lower()
 
-      recorded_sha: str | None = None
-      gitee_head_sha: str | None = None
-      try:
-        # 只取远端最新一条提交即可（不依赖本地历史）
-        run(["git", "fetch", "--depth=1", "origin", branch], str(root), env=env)
-        gitee_head_sha = run(["git", "rev-parse", "FETCH_HEAD"], str(root), env=env).strip().lower()
-        body = run(["git", "log", "-1", "--format=%B", "FETCH_HEAD"], str(root), env=env)
-        recorded_sha = parse_recorded_upstream_sha(body, branch)
-      except Exception:
-        recorded_sha = None
-        gitee_head_sha = None
-
-      recorded_canon = canonical_commit_sha(recorded_sha, root, env)
+      recorded_sha, recorded_canon, recorded_source, tip_head_sha = resolve_recorded_upstream_sha(
+        root, env, branch
+      )
 
       if (not force_sync) and (recorded_canon is not None) and (recorded_canon == upstream_sha):
         print(f"[skip] {branch}: upstream sha unchanged ({upstream_sha[:7]})")
@@ -4741,7 +4796,7 @@ def main() -> None:
       if force_sync:
         ci_sync_state["force_sync"] = True
       ci_sync_state.setdefault("branches", []).append(branch)
-      # 邮件区分「上游有新提交」vs「仅手动 Force」：Force 且无 Gitee 记录 / SHA 未变 → force_same
+      # 邮件区分「上游有新提交」vs「仅手动 Force」：Force 且无记录 / SHA 未变 → force_same
       if force_sync and (recorded_canon is None or recorded_canon == upstream_sha):
         ci_sync_state.setdefault("sync_reason_tags", []).append("force_same")
       else:
@@ -4753,14 +4808,15 @@ def main() -> None:
         rec_note = short_sha(recorded_canon) or recorded_canon[:EMAIL_SHA_LEN]
       elif recorded_sha:
         rec_note = short_sha(recorded_sha) or recorded_sha[:EMAIL_SHA_LEN]
-      elif gitee_head_sha:
-        # 提交正文无 upstream-* 行时，用 Gitee 该分支最新提交短哈希（与旧版成功邮件一致，避免长段说明）
-        rec_note = short_sha(gitee_head_sha) or gitee_head_sha[:EMAIL_SHA_LEN]
+      elif tip_head_sha:
+        # 提交正文无 upstream-* 行时，用镜像 tip 短哈希（与旧版成功邮件一致）
+        rec_note = short_sha(tip_head_sha) or tip_head_sha[:EMAIL_SHA_LEN]
       else:
         rec_note = "—"
       up_note = short_sha(upstream_sha) or upstream_sha[:EMAIL_SHA_LEN]
       ci_sync_state.setdefault("notify_branch_notes", []).append(
-        f"- {branch}: 上次 Gitee 记录 upstream-{branch}={rec_note} → 当前 upstream/{branch}={up_note}"
+        f"- {branch}: 上次记录 upstream-{branch}={rec_note}（{recorded_source}）"
+        f" → 当前 upstream/{branch}={up_note}"
       )
 
       reason_tag = (
