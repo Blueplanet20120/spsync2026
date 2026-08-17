@@ -2682,6 +2682,23 @@ def patch_opendbc_pyproject(root: Path) -> PatchResult:
   return res
 
 
+def _rewrite_models_url_attr(s: str, attr: str, *, required: bool, path: Path) -> str:
+  m = re.search(rf'{attr}\s*=\s*"([^"]+)"', s)
+  if not m:
+    if required:
+      raise RuntimeError(f"{path}: 找不到 {attr} 赋值")
+    return s
+  json_name = _extract_model_json_basename(m.group(1))
+  new_url = _expected_models_json_url(json_name)
+  current = _fix_models_json_url_typos(m.group(1).strip())
+  if current == new_url:
+    return s
+  s2, n = re.subn(rf'({attr}\s*=\s*")[^"]+(")', rf'\1{new_url}\2', s, count=1)
+  if n != 1:
+    raise RuntimeError(f"{path}: {attr} 替换未生效（请检查 upstream 是否改了字段写法）")
+  return s2
+
+
 def patch_models_fetcher(root: Path) -> PatchResult:
   res = PatchResult("models_fetcher")
   fetcher = cn_path(root, "sunnypilot/models/fetcher.py")
@@ -2690,18 +2707,8 @@ def patch_models_fetcher(root: Path) -> PatchResult:
 
   s = fetcher.read_text(encoding="utf-8")
   s = inject_models_fetcher_stale_cache_guard(s)
-  m = re.search(r'MODEL_URL\s*=\s*"([^"]+)"', s)
-  if not m:
-    raise RuntimeError(f"{fetcher}: 找不到 MODEL_URL 赋值")
-
-  json_name = _extract_model_json_basename(m.group(1))
-  new_url = _expected_models_json_url(json_name)
-  current = _fix_models_json_url_typos(m.group(1).strip())
-  if current != new_url:
-    s2, n = re.subn(r'(MODEL_URL\s*=\s*")[^"]+(")', rf'\1{new_url}\2', s, count=1)
-    if n != 1:
-      raise RuntimeError(f"{fetcher}: MODEL_URL 替换未生效（请检查 upstream 是否改了字段写法）")
-    s = s2
+  s = _rewrite_models_url_attr(s, "MODEL_URL", required=True, path=fetcher)
+  s = _rewrite_models_url_attr(s, "MODEL_URL_USBGPU", required=False, path=fetcher)
   _track_change(res, fetcher, write_if_changed(fetcher, s))
   return res
 
@@ -2713,16 +2720,20 @@ def inject_models_fetcher_stale_cache_guard(s: str) -> str:
   """
   OTA 后 Params 里可能仍留着旧 driving_models_*.json 缓存（minimum_selector_version 与
   helpers.REQUIRED_JSON_VERSION 不一致），parse 后 bundles 为空 → UI 只剩 CD210 默认项。
+  兼容旧版（直接 cache.get）与 staging（先 _update_model_source）。
   """
   if _CN_MODELS_CACHE_GUARD in s:
     return s
-  needle = (
-    "  def get_available_bundles(self) -> list[custom.ModelManagerSP.ModelBundle]:\n"
-    '    """Gets the list of available models, with smart cache handling"""\n'
-    "    cached_data, is_expired = self.model_cache.get()\n"
+  m = re.search(
+    r"(?m)^  def get_available_bundles\(self\) -> list\[custom\.ModelManagerSP\.ModelBundle\]:\n"
+    r'    """Gets the list of available models, with smart cache handling"""\n'
+    r"(?:    self\._update_model_source\(\)\n)?"
+    r"    cached_data, is_expired = self\.model_cache\.get\(\)\n",
+    s,
   )
-  if needle not in s:
+  if not m:
     raise RuntimeError("fetcher.py: 未找到 get_available_bundles，无法注入模型缓存兼容逻辑")
+  prelude = "    self._update_model_source()\n" if "self._update_model_source()" in m.group(0) else ""
   block = (
     "  def _parse_cached_bundles(self, cached_data: dict) -> list[custom.ModelManagerSP.ModelBundle] | None:\n"
     f"    # {_CN_MODELS_CACHE_GUARD}: drop stale JSON cache after OTA / selector version bump\n"
@@ -2735,30 +2746,38 @@ def inject_models_fetcher_stale_cache_guard(s: str) -> str:
     "    return bundles\n\n"
     "  def get_available_bundles(self) -> list[custom.ModelManagerSP.ModelBundle]:\n"
     '    """Gets the list of available models, with smart cache handling"""\n'
+    f"{prelude}"
     "    cached_data, is_expired = self.model_cache.get()\n"
   )
-  s = s.replace(needle, block, 1)
-  s = s.replace(
+  s = s[: m.start()] + block + s[m.end() :]
+  old_hit = (
     "    if cached_data and not is_expired:\n"
     "      cloudlog.debug(\"Using valid cached models data\")\n"
-    "      return self.model_parser.parse_models(cached_data)\n",
+    "      return self.model_parser.parse_models(cached_data)\n"
+  )
+  new_hit = (
     "    if cached_data and not is_expired:\n"
     "      cached_bundles = self._parse_cached_bundles(cached_data)\n"
     "      if cached_bundles is not None:\n"
     '        cloudlog.debug("Using valid cached models data")\n'
     "        return cached_bundles\n"
-    "      is_expired = True\n",
-    1,
+    "      is_expired = True\n"
   )
-  s = s.replace(
+  if old_hit not in s:
+    raise RuntimeError("fetcher.py: 未找到有效缓存返回路径，无法注入模型缓存兼容逻辑")
+  s = s.replace(old_hit, new_hit, 1)
+  old_fb = (
     '    cloudlog.warning("Failed to fetch fresh data. Using expired cache as fallback")\n'
-    "    return self.model_parser.parse_models(cached_data)\n",
+    "    return self.model_parser.parse_models(cached_data)\n"
+  )
+  new_fb = (
     '    cloudlog.warning("Failed to fetch fresh data. Using expired cache as fallback")\n'
     "    fallback = self._parse_cached_bundles(cached_data)\n"
-    "    return fallback if fallback is not None else []\n",
-    1,
+    "    return fallback if fallback is not None else []\n"
   )
-  return s
+  if old_fb not in s:
+    raise RuntimeError("fetcher.py: 未找到过期缓存回退路径，无法注入模型缓存兼容逻辑")
+  return s.replace(old_fb, new_fb, 1)
 
 
 def _tinygrad_fetch_remotes() -> list[str]:
@@ -3687,6 +3706,7 @@ def _models_json_url_candidates(primary: str | None) -> list[str]:
       out.append(u)
 
   add(primary)
+  add(f"{gitee_models_raw_gh_pages()}docs/driving_models_v19.json")
   add(f"{gitee_models_raw_gh_pages()}docs/driving_models_v17.json")
   allow_gh = (os.environ.get("VERIFY_TINYGRAD_ALLOW_GITHUB_MODELS") or "").strip().lower()
   if allow_gh in ("1", "true", "yes", "on"):
@@ -4107,6 +4127,9 @@ def verify_patches(root: Path) -> None:
     errors.append(
       f"{fetcher_rel}: 缺少 {_CN_MODELS_CACHE_GUARD}（OTA 后旧模型缓存会导致列表只剩 CD210）"
     )
+  fetcher_tx = rt("sunnypilot/models/fetcher.py")
+  if "MODEL_URL_USBGPU" in fetcher_tx and "raw.githubusercontent.com/sunnypilot/sunnypilot-models" in fetcher_tx:
+    errors.append(f"{fetcher_rel}: MODEL_URL_USBGPU 或 MODEL_URL 仍指向 GitHub raw，未改 Gitee")
 
   osm_rel = rpath("selfdrive/ui/sunnypilot/layouts/settings/osm.py")
   mapd_rel = rpath("sunnypilot/mapd/mapd_installer.py")
