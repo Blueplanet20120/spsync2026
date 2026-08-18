@@ -22,3 +22,4 @@ tools/setup_local_venv.sh
 tools/sync_to_gitee_local.py
 .cursor/
 .ci-cache/
+.cursor/
