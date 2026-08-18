@@ -26,6 +26,7 @@ import os
 import py_compile
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -2707,6 +2708,7 @@ def patch_models_fetcher(root: Path) -> PatchResult:
 
   s = fetcher.read_text(encoding="utf-8")
   s = inject_models_fetcher_stale_cache_guard(s)
+  s = inject_sunnylink_activejson_cors_guard(s)
   s = _rewrite_models_url_attr(s, "MODEL_URL", required=True, path=fetcher)
   s = _rewrite_models_url_attr(s, "MODEL_URL_USBGPU", required=False, path=fetcher)
   _track_change(res, fetcher, write_if_changed(fetcher, s))
@@ -2714,6 +2716,48 @@ def patch_models_fetcher(root: Path) -> PatchResult:
 
 
 _CN_MODELS_CACHE_GUARD = "cn_models_cache_selector_guard"
+_CN_SUNNYLINK_ACTIVEJSON = "cn_sunnylink_activejson"
+
+
+_SUNNYLINK_ACTIVEJSON_GITHUB_PREFIX = (
+  "https://raw.githubusercontent.com/sunnypilot/sunnypilot-models/gh-pages/docs/"
+)
+
+
+def _sunnylink_activejson_put_block() -> str:
+  return (
+    f"      # {_CN_SUNNYLINK_ACTIVEJSON}: sunnylink.ai fetches this URL in the browser; "
+    "Gitee raw has no CORS. Device still uses MODEL_URL (Gitee).\n"
+    "      # Empty ActiveJson falls back to ModelsCache (~100KB) which sunnylink often drops.\n"
+    '      self.params.put(\n'
+    '        "ModelManager_ActiveJson",\n'
+    f'        "{_SUNNYLINK_ACTIVEJSON_GITHUB_PREFIX}"\n'
+    '        + self.model_url.rsplit("/", 1)[-1],\n'
+    "        block=True,\n"
+    "      )"
+  )
+
+
+def inject_sunnylink_activejson_cors_guard(s: str) -> str:
+  """
+  sunnylink.ai/dashboard/models 用浏览器 fetch ModelManager_ActiveJson 里的 URL。
+  设备拉清单走 Gitee；Gitee raw 无 CORS。留空则前端回退 ModelsCache，但 ~100KB JSON
+  经常传不出 sunnylink，网页仍然空白。改为把官方 GitHub raw（有 CORS *）写给网页。
+  """
+  new = _sunnylink_activejson_put_block()
+  if _CN_SUNNYLINK_ACTIVEJSON in s and _SUNNYLINK_ACTIVEJSON_GITHUB_PREFIX in s:
+    return s
+  empty = (
+    f"      # {_CN_SUNNYLINK_ACTIVEJSON}: do not publish Gitee URL to sunnylink.ai "
+    "(no CORS; frontend will not fall back to ModelsCache)\n"
+    '      self.params.put("ModelManager_ActiveJson", "", block=True)'
+  )
+  orig = '      self.params.put("ModelManager_ActiveJson", self.model_url, block=True)'
+  if empty in s:
+    return s.replace(empty, new, 1)
+  if orig in s:
+    return s.replace(orig, new, 1)
+  raise RuntimeError("fetcher.py: 未找到 ModelManager_ActiveJson 写入点，无法注入 sunnylink CORS 规避")
 
 
 def inject_models_fetcher_stale_cache_guard(s: str) -> str:
@@ -2787,6 +2831,65 @@ def _tinygrad_fetch_remotes() -> list[str]:
   ]
 
 
+def _rmtree_force(path: Path) -> None:
+  """删除目录。Windows 上 git 工作区常带只读位，且杀毒/索引会短时占用，默认 rmtree 会 WinError 5。"""
+  def _clear_readonly(p: str) -> None:
+    try:
+      os.chmod(p, stat.S_IWRITE | stat.S_IREAD | stat.S_IEXEC)
+    except OSError:
+      pass
+
+  def _onerror(func, p, _exc) -> None:
+    _clear_readonly(p)
+    try:
+      func(p)
+    except FileNotFoundError:
+      pass
+
+  last: BaseException | None = None
+  for i in range(8):
+    if not path.exists() and not path.is_symlink():
+      return
+    try:
+      shutil.rmtree(path, onerror=_onerror)
+      if not path.exists() and not path.is_symlink():
+        return
+    except OSError as e:
+      last = e
+    time.sleep(0.2 * (i + 1))
+  if path.exists() or path.is_symlink():
+    raise PermissionError(f"无法删除 {path}: {last}") from last
+
+
+def _replace_dir(src: Path, dest: Path) -> None:
+  """用 src 目录替换 dest。Windows 上 os.rename 不能覆盖已有目录，rmtree 后路径常处于 DELETE_PENDING。"""
+  backup = dest.with_name(f"{dest.name}.__sp_sync_old__")
+  _rmtree_force(backup)
+  last: BaseException | None = None
+  for i in range(8):
+    try:
+      if dest.exists() or dest.is_symlink():
+        try:
+          dest.rename(backup)
+        except OSError:
+          _rmtree_force(dest)
+      src.rename(dest)
+      _rmtree_force(backup)
+      return
+    except OSError as e:
+      last = e
+      time.sleep(0.25 * (i + 1))
+      _rmtree_force(backup)
+  try:
+    _rmtree_force(dest)
+    shutil.copytree(src, dest, symlinks=True)
+    _rmtree_force(src)
+    return
+  except OSError as e:
+    last = e
+  raise PermissionError(f"无法将 {src} 替换到 {dest}: {last}") from last
+
+
 def _materialize_tinygrad_commit(commit: str, dest: Path) -> None:
   """将 tinygrad 某 commit 导出为 vendored 目录（不含 .git）。"""
   raw = commit
@@ -2796,7 +2899,7 @@ def _materialize_tinygrad_commit(commit: str, dest: Path) -> None:
 
   staging = dest.with_name(f"{dest.name}.__sp_sync_staging__")
   if staging.exists():
-    shutil.rmtree(staging, ignore_errors=True)
+    _rmtree_force(staging)
 
   with tempfile.TemporaryDirectory() as td:
     src = Path(td) / "repo"
@@ -2834,15 +2937,13 @@ def _materialize_tinygrad_commit(commit: str, dest: Path) -> None:
 
   marker = _read_vendored_tinygrad_marker(staging)
   if marker != commit:
-    shutil.rmtree(staging, ignore_errors=True)
+    _rmtree_force(staging)
     raise RuntimeError(f"{dest}: tinygrad 导出后标记文件校验失败")
 
   try:
-    if dest.exists():
-      shutil.rmtree(dest)
-    staging.rename(dest)
+    _replace_dir(staging, dest)
   except Exception:
-    shutil.rmtree(staging, ignore_errors=True)
+    _rmtree_force(staging)
     raise
 
 
@@ -2967,6 +3068,165 @@ def patch_mapd_installer(root: Path) -> PatchResult:
       require_all=True,
     )
   _track_change(res, mapd_installer, write_if_changed(mapd_installer, s2))
+  return res
+
+
+_CN_SOFTWARE_UPDATE_CONFIRM = "cn_confirm_software_update"
+
+
+def inject_tici_software_update_confirm(s: str) -> str:
+  """tici/tizi Software 菜单：有更新时先英文确认，Yes 才下载/安装。"""
+  if _CN_SOFTWARE_UPDATE_CONFIRM in s:
+    return s
+  old_dl = (
+    "  def _on_download_update(self):\n"
+    "    # Check if we should start checking or start downloading\n"
+    "    self._download_btn.action_item.set_enabled(False)\n"
+    "    if self._download_btn.action_item.text == tr(\"CHECK\"):\n"
+    "      # Start checking for updates\n"
+    "      self._waiting_for_updater = True\n"
+    "      self._waiting_start_ts = time.monotonic()\n"
+    "      subprocess.run(\"pkill -SIGUSR1 -f openpilot.system.updated.updated\", shell=True)\n"
+    "    else:\n"
+    "      # Start downloading\n"
+    "      self._waiting_for_updater = True\n"
+    "      self._waiting_start_ts = time.monotonic()\n"
+    "      subprocess.run(\"pkill -SIGHUP -f openpilot.system.updated.updated\", shell=True)\n"
+  )
+  new_dl = (
+    "  def _on_download_update(self):\n"
+    f"    # {_CN_SOFTWARE_UPDATE_CONFIRM}\n"
+    "    if self._download_btn.action_item.text == tr(\"CHECK\"):\n"
+    "      self._cn_start_software_update(check_only=True)\n"
+    "      return\n"
+    "    def handle_confirm(result: DialogResult):\n"
+    "      if result == DialogResult.CONFIRM:\n"
+    "        self._cn_start_software_update(check_only=False)\n"
+    "      else:\n"
+    "        self._download_btn.action_item.set_enabled(True)\n"
+    "    gui_app.push_widget(ConfirmDialog(\"Confirm update?\", \"Yes\", callback=handle_confirm))\n"
+    "\n"
+    "  def _cn_start_software_update(self, check_only: bool):\n"
+    "    self._download_btn.action_item.set_enabled(False)\n"
+    "    self._waiting_for_updater = True\n"
+    "    self._waiting_start_ts = time.monotonic()\n"
+    "    sig = \"-SIGUSR1\" if check_only else \"-SIGHUP\"\n"
+    "    subprocess.run(f\"pkill {sig} -f openpilot.system.updated.updated\", shell=True)\n"
+  )
+  if old_dl not in s:
+    raise RuntimeError("layouts/settings/software.py: 未找到 _on_download_update，无法注入更新确认")
+  s = s.replace(old_dl, new_dl, 1)
+  old_inst = (
+    "  def _on_install_update(self):\n"
+    "    # Trigger reboot to install update\n"
+    "    self._install_btn.action_item.set_enabled(False)\n"
+    "    ui_state.params.put_bool(\"DoReboot\", True, block=True)\n"
+  )
+  new_inst = (
+    "  def _on_install_update(self):\n"
+    f"    # {_CN_SOFTWARE_UPDATE_CONFIRM}\n"
+    "    def handle_confirm(result: DialogResult):\n"
+    "      if result == DialogResult.CONFIRM:\n"
+    "        self._install_btn.action_item.set_enabled(False)\n"
+    "        ui_state.params.put_bool(\"DoReboot\", True, block=True)\n"
+    "    gui_app.push_widget(ConfirmDialog(\"Confirm update?\", \"Yes\", callback=handle_confirm))\n"
+  )
+  if old_inst not in s:
+    raise RuntimeError("layouts/settings/software.py: 未找到 _on_install_update，无法注入更新确认")
+  return s.replace(old_inst, new_inst, 1)
+
+
+def inject_mici_software_update_confirm(s: str) -> str:
+  """C4/mici Software 菜单：有更新时滑动确认（小屏无法用 tici 的 Yes/Cancel 弹窗）。"""
+  if _CN_SOFTWARE_UPDATE_CONFIRM in s:
+    return s
+  old_imp = "from openpilot.selfdrive.ui.mici.widgets.dialog import BigDialog\n"
+  new_imp = "from openpilot.selfdrive.ui.mici.widgets.dialog import BigDialog, BigConfirmationDialog\n"
+  if old_imp not in s:
+    raise RuntimeError("mici/layouts/settings/software.py: 未找到 BigDialog import")
+  s = s.replace(old_imp, new_imp, 1)
+  old_check = (
+    "    self.set_enabled(False)\n"
+    "    self._state = UpdaterState.WAITING_FOR_UPDATER\n"
+    "    self.set_icon(self._txt_update_icon)\n"
+    "\n"
+    "    def run():\n"
+    "      if self.get_value() == \"download update\":\n"
+    "        subprocess.run(\"pkill -SIGHUP -f openpilot.system.updated.updated\", shell=True)\n"
+    "      else:\n"
+    "        subprocess.run(\"pkill -SIGUSR1 -f openpilot.system.updated.updated\", shell=True)\n"
+    "\n"
+    "    threading.Thread(target=run, daemon=True).start()\n"
+  )
+  new_check = (
+    f"    # {_CN_SOFTWARE_UPDATE_CONFIRM}\n"
+    "    if self.get_value() == \"download update\":\n"
+    "      gui_app.push_widget(BigConfirmationDialog(\n"
+    "        \"slide to\\nconfirm update\",\n"
+    "        self._txt_update_icon,\n"
+    "        lambda: self._cn_start_updater(download=True),\n"
+    "      ))\n"
+    "      return\n"
+    "    self._cn_start_updater(download=False)\n"
+    "\n"
+    "  def _cn_start_updater(self, download: bool):\n"
+    "    self.set_enabled(False)\n"
+    "    self._state = UpdaterState.WAITING_FOR_UPDATER\n"
+    "    self.set_icon(self._txt_update_icon)\n"
+    "\n"
+    "    def run():\n"
+    "      if download:\n"
+    "        subprocess.run(\"pkill -SIGHUP -f openpilot.system.updated.updated\", shell=True)\n"
+    "      else:\n"
+    "        subprocess.run(\"pkill -SIGUSR1 -f openpilot.system.updated.updated\", shell=True)\n"
+    "\n"
+    "    threading.Thread(target=run, daemon=True).start()\n"
+  )
+  if old_check not in s:
+    raise RuntimeError("mici/layouts/settings/software.py: 未找到 CheckUpdateButton 下载分支，无法注入更新确认")
+  s = s.replace(old_check, new_check, 1)
+  old_inst = (
+    "  def _handle_mouse_release(self, mouse_pos: MousePos):\n"
+    "    super()._handle_mouse_release(mouse_pos)\n"
+    "\n"
+    "    self.set_enabled(False)\n"
+    "\n"
+    "    def run():\n"
+    "      ui_state.params.put_bool(\"DoReboot\", True, block=True)\n"
+    "\n"
+    "    threading.Thread(target=run, daemon=True).start()\n"
+  )
+  new_inst = (
+    "  def _handle_mouse_release(self, mouse_pos: MousePos):\n"
+    "    super()._handle_mouse_release(mouse_pos)\n"
+    f"    # {_CN_SOFTWARE_UPDATE_CONFIRM}\n"
+    "    icon = gui_app.texture(\"icons_mici/settings/device/reboot.png\", 64, 70)\n"
+    "\n"
+    "    def do_reboot():\n"
+    "      self.set_enabled(False)\n"
+    "      def run():\n"
+    "        ui_state.params.put_bool(\"DoReboot\", True, block=True)\n"
+    "      threading.Thread(target=run, daemon=True).start()\n"
+    "\n"
+    "    gui_app.push_widget(BigConfirmationDialog(\"slide to\\nconfirm update\", icon, do_reboot))\n"
+  )
+  if old_inst not in s:
+    raise RuntimeError("mici/layouts/settings/software.py: 未找到 InstallUpdateButton，无法注入更新确认")
+  return s.replace(old_inst, new_inst, 1)
+
+
+def patch_software_update_confirm(root: Path) -> PatchResult:
+  res = PatchResult("software_update_confirm")
+  tici = cn_path(root, "selfdrive/ui/layouts/settings/software.py")
+  if tici.is_file():
+    s2 = inject_tici_software_update_confirm(tici.read_text(encoding="utf-8"))
+    _track_change(res, tici, write_if_changed(tici, s2))
+  mici = cn_path(root, "selfdrive/ui/mici/layouts/settings/software.py")
+  if mici.is_file():
+    s2 = inject_mici_software_update_confirm(mici.read_text(encoding="utf-8"))
+    _track_change(res, mici, write_if_changed(mici, s2))
+  if not tici.is_file() and not mici.is_file():
+    raise RuntimeError("未找到 Software 菜单 software.py（tici/mici），无法注入更新确认")
   return res
 
 
@@ -3638,6 +3898,7 @@ def patch_all(root: Path) -> list[PatchResult]:
     patch_tinygrad_vendored_align,
     patch_osm,
     patch_mapd_installer,
+    patch_software_update_confirm,
     patch_dm_relaxed_terminal,
     patch_dm_relaxed_tests,
     patch_gitmodules,
@@ -4128,8 +4389,26 @@ def verify_patches(root: Path) -> None:
       f"{fetcher_rel}: 缺少 {_CN_MODELS_CACHE_GUARD}（OTA 后旧模型缓存会导致列表只剩 CD210）"
     )
   fetcher_tx = rt("sunnypilot/models/fetcher.py")
-  if "MODEL_URL_USBGPU" in fetcher_tx and "raw.githubusercontent.com/sunnypilot/sunnypilot-models" in fetcher_tx:
-    errors.append(f"{fetcher_rel}: MODEL_URL_USBGPU 或 MODEL_URL 仍指向 GitHub raw，未改 Gitee")
+  if _CN_SUNNYLINK_ACTIVEJSON not in fetcher_tx:
+    errors.append(
+      f"{fetcher_rel}: 缺少 {_CN_SUNNYLINK_ACTIVEJSON}（Gitee ActiveJson 会导致 sunnylink.ai 模型列表空白）"
+    )
+  if 'put("ModelManager_ActiveJson", self.model_url' in fetcher_tx:
+    errors.append(
+      f"{fetcher_rel}: 仍把 MODEL_URL 写入 ModelManager_ActiveJson（sunnylink.ai 浏览器无法 CORS 访问 Gitee raw）"
+    )
+  if 'put("ModelManager_ActiveJson", ""' in fetcher_tx:
+    errors.append(
+      f"{fetcher_rel}: ActiveJson 不能留空（ModelsCache ~100KB 常传不出 sunnylink，网页仍空白）"
+    )
+  if _CN_SUNNYLINK_ACTIVEJSON in fetcher_tx and _SUNNYLINK_ACTIVEJSON_GITHUB_PREFIX not in fetcher_tx:
+    errors.append(
+      f"{fetcher_rel}: ActiveJson 应写入 GitHub raw（CORS *），供 sunnylink.ai 浏览器拉取"
+    )
+  for attr in ("MODEL_URL", "MODEL_URL_USBGPU"):
+    m_url = re.search(rf'{attr}\s*=\s*"([^"]+)"', fetcher_tx)
+    if m_url and "raw.githubusercontent.com/sunnypilot/sunnypilot-models" in m_url.group(1):
+      errors.append(f"{fetcher_rel}: {attr} 仍指向 GitHub raw，未改 Gitee")
 
   osm_rel = rpath("selfdrive/ui/sunnypilot/layouts/settings/osm.py")
   mapd_rel = rpath("sunnypilot/mapd/mapd_installer.py")
@@ -4141,6 +4420,15 @@ def verify_patches(root: Path) -> None:
     errors.append(f"{mapd_rel}: 缺少 Gitee mapd release URL（期望含 {mapd_needle!r}）")
   if 'os.getenv("MAPD_TAG"' not in rt("sunnypilot/mapd/mapd_installer.py"):
     errors.append(f"{mapd_rel}: VERSION 未支持 MAPD_TAG 环境变量")
+
+  sw_tici_rel = rpath("selfdrive/ui/layouts/settings/software.py")
+  sw_mici_rel = rpath("selfdrive/ui/mici/layouts/settings/software.py")
+  sw_tici = rt("selfdrive/ui/layouts/settings/software.py")
+  sw_mici = rt("selfdrive/ui/mici/layouts/settings/software.py")
+  if sw_tici and _CN_SOFTWARE_UPDATE_CONFIRM not in sw_tici:
+    errors.append(f"{sw_tici_rel}: 缺少 {_CN_SOFTWARE_UPDATE_CONFIRM}（有更新时需英文确认）")
+  if sw_mici and _CN_SOFTWARE_UPDATE_CONFIRM not in sw_mici:
+    errors.append(f"{sw_mici_rel}: 缺少 {_CN_SOFTWARE_UPDATE_CONFIRM}（有更新时需确认）")
 
   if (root / ".gitmodules").exists():
     gm = rt(".gitmodules")
@@ -4287,6 +4575,8 @@ def verify_patches(root: Path) -> None:
     rpath("sunnypilot/models/fetcher.py"),
     rpath("selfdrive/ui/sunnypilot/layouts/settings/osm.py"),
     rpath("sunnypilot/mapd/mapd_installer.py"),
+    rpath("selfdrive/ui/layouts/settings/software.py"),
+    rpath("selfdrive/ui/mici/layouts/settings/software.py"),
     controls_rel,
     dm_tests_rel,
   ]
@@ -4486,28 +4776,77 @@ def gitee_api_url(path: str, token: str) -> str:
   return f"https://gitee.com/api/v5{path}{sep}access_token={token}"
 
 
-def gitee_get_release_by_tag(token: str, tag: str) -> dict | None:
-  url = gitee_api_url(f"/repos/{GITEE_OWNER}/{MAPD_REPO}/releases/tags/{tag}", token)
+def _gitee_http_error_body(e: urllib.error.HTTPError) -> str:
   try:
-    return http_json(url)
+    return (e.read() or b"").decode("utf-8", errors="replace").strip()
+  except Exception:
+    return ""
+
+
+def gitee_branch_exists(token: str, owner: str, repo: str, branch: str) -> bool:
+  if not branch:
+    return False
+  url = gitee_api_url(f"/repos/{owner}/{repo}/branches/{quote(branch, safe='')}", token)
+  try:
+    data = http_json(url, headers={"User-Agent": "sync-to-gitee"})
+    return isinstance(data, dict) and bool(data.get("name") or data.get("commit"))
   except urllib.error.HTTPError as e:
     if e.code == 404:
+      return False
+    raise
+
+
+def gitee_release_target_commitish(token: str, owner: str, repo: str) -> str:
+  """Gitee 创建 Release 必须指向已存在的分支；mapd 镜像没有 master，默认分支还可能是 docs-update。"""
+  info = http_json(gitee_api_url(f"/repos/{owner}/{repo}", token), headers={"User-Agent": "sync-to-gitee"})
+  default_branch = str((info or {}).get("default_branch") or "").strip()
+  for cand in ("main", "master", default_branch):
+    if gitee_branch_exists(token, owner, repo, cand):
+      return cand
+  raise RuntimeError(f"Gitee {owner}/{repo} 无可用分支作为 release target_commitish（default={default_branch!r}）")
+
+
+def gitee_get_release_by_tag(token: str, tag: str) -> dict | None:
+  url = gitee_api_url(f"/repos/{GITEE_OWNER}/{MAPD_REPO}/releases/tags/{quote(tag, safe='')}", token)
+  try:
+    rel = http_json(url, headers={"User-Agent": "sync-to-gitee"})
+    if not isinstance(rel, dict) or "id" not in rel:
+      return None
+    return rel
+  except urllib.error.HTTPError as e:
+    if e.code in (400, 404):
       return None
     raise
 
 
 def gitee_create_release(token: str, tag: str) -> dict:
+  target = gitee_release_target_commitish(token, GITEE_OWNER, MAPD_REPO)
+  print(f"[mapd] create Gitee release tag={tag} target_commitish={target}")
   url = gitee_api_url(f"/repos/{GITEE_OWNER}/{MAPD_REPO}/releases", token)
   payload = json.dumps({
     "tag_name": tag,
     "name": tag,
     "body": f"Auto-synced mapd binary for {tag}",
     "prerelease": False,
-    "target_commitish": "master",
+    "target_commitish": target,
   }).encode("utf-8")
-  req = urllib.request.Request(url, data=payload, method="POST", headers={"Content-Type": "application/json"})
-  with urllib.request.urlopen(req, timeout=30) as resp:
-    return json.loads(resp.read().decode("utf-8"))
+  req = urllib.request.Request(
+    url,
+    data=payload,
+    method="POST",
+    headers={"Content-Type": "application/json", "User-Agent": "sync-to-gitee"},
+  )
+  try:
+    with urllib.request.urlopen(req, timeout=30) as resp:
+      rel = json.loads(resp.read().decode("utf-8"))
+  except urllib.error.HTTPError as e:
+    detail = _gitee_http_error_body(e)
+    raise RuntimeError(
+      f"Gitee 创建 release 失败 HTTP {e.code} tag={tag} target_commitish={target}: {detail or e.reason}"
+    ) from e
+  if not isinstance(rel, dict) or "id" not in rel:
+    raise RuntimeError(f"Gitee release 创建返回异常（tag={tag}）：{rel!r}")
+  return rel
 
 
 def gitee_upload_release_asset(token: str, release_id: int, asset_name: str, file_path: Path) -> None:
