@@ -2709,6 +2709,7 @@ def patch_models_fetcher(root: Path) -> PatchResult:
   s = fetcher.read_text(encoding="utf-8")
   s = inject_models_fetcher_stale_cache_guard(s)
   s = inject_sunnylink_activejson_cors_guard(s)
+  s = inject_models_hf_mirror(s)
   s = _rewrite_models_url_attr(s, "MODEL_URL", required=True, path=fetcher)
   s = _rewrite_models_url_attr(s, "MODEL_URL_USBGPU", required=False, path=fetcher)
   _track_change(res, fetcher, write_if_changed(fetcher, s))
@@ -2717,6 +2718,9 @@ def patch_models_fetcher(root: Path) -> PatchResult:
 
 _CN_MODELS_CACHE_GUARD = "cn_models_cache_selector_guard"
 _CN_SUNNYLINK_ACTIVEJSON = "cn_sunnylink_activejson"
+_CN_HF_MIRROR = "cn_hf_mirror"
+_HF_MIRROR_HOST = "https://hf-mirror.com"
+_HF_UPSTREAM_HOST = "https://huggingface.co"
 
 
 _SUNNYLINK_ACTIVEJSON_GITHUB_PREFIX = (
@@ -2758,6 +2762,44 @@ def inject_sunnylink_activejson_cors_guard(s: str) -> str:
   if orig in s:
     return s.replace(orig, new, 1)
   raise RuntimeError("fetcher.py: 未找到 ModelManager_ActiveJson 写入点，无法注入 sunnylink CORS 规避")
+
+
+def _hf_mirror_parse_download_uri_block() -> str:
+  return (
+    "  @staticmethod\n"
+    "  def _parse_download_uri(download_uri_data) -> custom.ModelManagerSP.DownloadUri:\n"
+    "    download_uri = custom.ModelManagerSP.DownloadUri()\n"
+    f"    # {_CN_HF_MIRROR}: JSON keeps HF URLs; rewrite host so device downloads via CN mirror\n"
+    '    url = download_uri_data.get("url")\n'
+    f'    if isinstance(url, str) and url.startswith("{_HF_UPSTREAM_HOST}"):\n'
+    f'      url = "{_HF_MIRROR_HOST}" + url[len("{_HF_UPSTREAM_HOST}"):]\n'
+    "    download_uri.uri = url\n"
+    '    download_uri.sha256 = download_uri_data.get("sha256")\n'
+    "    return download_uri\n"
+  )
+
+
+def inject_models_hf_mirror(s: str) -> str:
+  """
+  模型清单里的权重仍是 huggingface.co；国内设备直连失败。
+  解析 download_uri 时改写为 hf-mirror.com（反向代理，不改 JSON / sha256）。
+  """
+  if _CN_HF_MIRROR in s and _HF_MIRROR_HOST in s:
+    return s
+  new = _hf_mirror_parse_download_uri_block()
+  orig = (
+    "  @staticmethod\n"
+    "  def _parse_download_uri(download_uri_data) -> custom.ModelManagerSP.DownloadUri:\n"
+    "    download_uri = custom.ModelManagerSP.DownloadUri()\n"
+    '    download_uri.uri = download_uri_data.get("url")\n'
+    '    download_uri.sha256 = download_uri_data.get("sha256")\n'
+    "    return download_uri\n"
+  )
+  if orig not in s:
+    raise RuntimeError(
+      "fetcher.py: 未找到 _parse_download_uri 原文，无法注入 hf-mirror 改写"
+    )
+  return s.replace(orig, new, 1)
 
 
 def inject_models_fetcher_stale_cache_guard(s: str) -> str:
@@ -4409,6 +4451,17 @@ def verify_patches(root: Path) -> None:
     m_url = re.search(rf'{attr}\s*=\s*"([^"]+)"', fetcher_tx)
     if m_url and "raw.githubusercontent.com/sunnypilot/sunnypilot-models" in m_url.group(1):
       errors.append(f"{fetcher_rel}: {attr} 仍指向 GitHub raw，未改 Gitee")
+  if _CN_HF_MIRROR not in fetcher_tx or _HF_MIRROR_HOST not in fetcher_tx:
+    errors.append(
+      f"{fetcher_rel}: 缺少 {_CN_HF_MIRROR}（权重下载应改写 huggingface.co → hf-mirror.com）"
+    )
+  if (
+    'download_uri.uri = download_uri_data.get("url")' in fetcher_tx
+    and _CN_HF_MIRROR not in fetcher_tx
+  ):
+    errors.append(
+      f"{fetcher_rel}: _parse_download_uri 仍直写 HF URL，未注入镜像改写"
+    )
 
   osm_rel = rpath("selfdrive/ui/sunnypilot/layouts/settings/osm.py")
   mapd_rel = rpath("sunnypilot/mapd/mapd_installer.py")
