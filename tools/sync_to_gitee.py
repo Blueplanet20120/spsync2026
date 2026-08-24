@@ -2806,20 +2806,30 @@ def inject_models_fetcher_stale_cache_guard(s: str) -> str:
   """
   OTA 后 Params 里可能仍留着旧 driving_models_*.json 缓存（minimum_selector_version 与
   helpers.REQUIRED_JSON_VERSION 不一致），parse 后 bundles 为空 → UI 只剩 CD210 默认项。
-  兼容旧版（直接 cache.get）与 staging（先 _update_model_source）。
+  兼容：
+  - 旧：get_available_bundles(self) + 可选 _update_model_source()
+  - 新：get_available_bundles(self, chestnut_present=...) + _update_model_source(chestnut_present)
   """
   if _CN_MODELS_CACHE_GUARD in s:
     return s
   m = re.search(
-    r"(?m)^  def get_available_bundles\(self\) -> list\[custom\.ModelManagerSP\.ModelBundle\]:\n"
+    r"(?m)^  def get_available_bundles\(self(?P<sig>, chestnut_present: bool = False)?\)"
+    r" -> list\[custom\.ModelManagerSP\.ModelBundle\]:\n"
     r'    """Gets the list of available models, with smart cache handling"""\n'
-    r"(?:    self\._update_model_source\(\)\n)?"
+    r"(?:    self\._update_model_source\((?P<upd>chestnut_present)?\)\n)?"
     r"    cached_data, is_expired = self\.model_cache\.get\(\)\n",
     s,
   )
   if not m:
     raise RuntimeError("fetcher.py: 未找到 get_available_bundles，无法注入模型缓存兼容逻辑")
-  prelude = "    self._update_model_source()\n" if "self._update_model_source()" in m.group(0) else ""
+  # Preserve upstream signature / source-update call (chestnut_present landed on staging).
+  sig = m.group("sig") or ""
+  if m.group("upd") is not None:
+    prelude = "    self._update_model_source(chestnut_present)\n"
+  elif "self._update_model_source()" in m.group(0):
+    prelude = "    self._update_model_source()\n"
+  else:
+    prelude = ""
   block = (
     "  def _parse_cached_bundles(self, cached_data: dict) -> list[custom.ModelManagerSP.ModelBundle] | None:\n"
     f"    # {_CN_MODELS_CACHE_GUARD}: drop stale JSON cache after OTA / selector version bump\n"
@@ -2830,7 +2840,7 @@ def inject_models_fetcher_stale_cache_guard(s: str) -> str:
     '      cloudlog.warning("Model cache incompatible with selector version; refetching")\n'
     "      return None\n"
     "    return bundles\n\n"
-    "  def get_available_bundles(self) -> list[custom.ModelManagerSP.ModelBundle]:\n"
+    f"  def get_available_bundles(self{sig}) -> list[custom.ModelManagerSP.ModelBundle]:\n"
     '    """Gets the list of available models, with smart cache handling"""\n'
     f"{prelude}"
     "    cached_data, is_expired = self.model_cache.get()\n"
