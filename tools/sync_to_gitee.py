@@ -2742,15 +2742,41 @@ def _sunnylink_activejson_put_block() -> str:
   )
 
 
+def _sunnylink_activejson_dict_put_block() -> str:
+  """New fetcher: ActiveJson is a {qcom, usbgpu} map written once in __init__."""
+  return (
+    f"    # {_CN_SUNNYLINK_ACTIVEJSON}: sunnylink.ai fetches these URLs in the browser; "
+    "Gitee raw has no CORS.\n"
+    "    # Device still downloads manifests via MODEL_URL / MODEL_URL_USBGPU "
+    "(rewritten to Gitee).\n"
+    f'    _cn_active_json_gh = "{_SUNNYLINK_ACTIVEJSON_GITHUB_PREFIX}"\n'
+    '    self.params.put("ModelManager_ActiveJson", {\n'
+    '      "qcom": _cn_active_json_gh + self.MODEL_URL.rsplit("/", 1)[-1],\n'
+    '      "usbgpu": _cn_active_json_gh + self.MODEL_URL_USBGPU.rsplit("/", 1)[-1],\n'
+    "    }, block=True)\n"
+  )
+
+
 def inject_sunnylink_activejson_cors_guard(s: str) -> str:
   """
   sunnylink.ai/dashboard/models 用浏览器 fetch ModelManager_ActiveJson 里的 URL。
   设备拉清单走 Gitee；Gitee raw 无 CORS。留空则前端回退 ModelsCache，但 ~100KB JSON
   经常传不出 sunnylink，网页仍然空白。改为把官方 GitHub raw（有 CORS *）写给网页。
   """
-  new = _sunnylink_activejson_put_block()
   if _CN_SUNNYLINK_ACTIVEJSON in s and _SUNNYLINK_ACTIVEJSON_GITHUB_PREFIX in s:
     return s
+
+  # New API: dict ActiveJson in ModelFetcher.__init__
+  orig_dict = (
+    '    self.params.put("ModelManager_ActiveJson", {\n'
+    '      "qcom": self.MODEL_URL,\n'
+    '      "usbgpu": self.MODEL_URL_USBGPU,\n'
+    "    }, block=True)\n"
+  )
+  if orig_dict in s:
+    return s.replace(orig_dict, _sunnylink_activejson_dict_put_block(), 1)
+
+  new = _sunnylink_activejson_put_block()
   empty = (
     f"      # {_CN_SUNNYLINK_ACTIVEJSON}: do not publish Gitee URL to sunnylink.ai "
     "(no CORS; frontend will not fall back to ModelsCache)\n"
@@ -2806,12 +2832,29 @@ def inject_models_fetcher_stale_cache_guard(s: str) -> str:
   """
   OTA 后 Params 里可能仍留着旧 driving_models_*.json 缓存（minimum_selector_version 与
   helpers.REQUIRED_JSON_VERSION 不一致），parse 后 bundles 为空 → UI 只剩 CD210 默认项。
-  兼容：
-  - 旧：get_available_bundles(self) + 可选 _update_model_source()
-  - 新：get_available_bundles(self, chestnut_present=...) + _update_model_source(chestnut_present)
+
+  新上游（get_bundles_for_source）已在「parsed 为空则 refetch」；仅打标记注释。
+  旧上游仍注入 _parse_cached_bundles 包装。
   """
   if _CN_MODELS_CACHE_GUARD in s:
     return s
+
+  # New ModelFetcher (qcom/usbgpu sources): upstream already refetches empty parses.
+  if "def get_bundles_for_source(self, source: str)" in s:
+    needle = (
+      '          cloudlog.warning(f"Cached models for {source} have no valid bundles; refetching")\n'
+    )
+    if needle not in s:
+      raise RuntimeError(
+        "fetcher.py: 新版 get_bundles_for_source 未找到 empty-bundles refetch，"
+        "无法标记 cn_models_cache_selector_guard"
+      )
+    mark = (
+      f"          # {_CN_MODELS_CACHE_GUARD}: upstream refetches when parse yields no bundles\n"
+      + needle
+    )
+    return s.replace(needle, mark, 1)
+
   m = re.search(
     r"(?m)^  def get_available_bundles\(self(?P<sig>, chestnut_present: bool = False)?\)"
     r" -> list\[custom\.ModelManagerSP\.ModelBundle\]:\n"
@@ -4448,6 +4491,10 @@ def verify_patches(root: Path) -> None:
   if 'put("ModelManager_ActiveJson", self.model_url' in fetcher_tx:
     errors.append(
       f"{fetcher_rel}: 仍把 MODEL_URL 写入 ModelManager_ActiveJson（sunnylink.ai 浏览器无法 CORS 访问 Gitee raw）"
+    )
+  if '"qcom": self.MODEL_URL' in fetcher_tx or '"usbgpu": self.MODEL_URL_USBGPU' in fetcher_tx:
+    errors.append(
+      f"{fetcher_rel}: ActiveJson dict 仍直接写入 Gitee/本地 MODEL_URL（应改写为 GitHub raw 供 sunnylink）"
     )
   if 'put("ModelManager_ActiveJson", ""' in fetcher_tx:
     errors.append(
