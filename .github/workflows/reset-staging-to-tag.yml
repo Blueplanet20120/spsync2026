@@ -11,7 +11,7 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "list-tags=只列出 Gitee 上的 tag；reset-staging=把 staging 强推到指定 tag"
+        description: "① 先选做什么（list-tags=只看有哪些 tag，不会改车；reset-staging=真的回退）"
         required: true
         type: choice
         options:
@@ -19,17 +19,17 @@ on:
           - reset-staging
         default: list-tags
       tag:
-        description: "reset-staging 时填写：从 list-tags 日志/Summary 复制完整 tag 名"
+        description: "② 回退才填：复制完整 tag 名，例如 cn/staging-45515f7-20260830-1152（list 时留空）"
         required: false
         type: string
         default: ""
       confirm:
-        description: "reset-staging 时必须填 RESET；list-tags 可留空"
+        description: "③ 回退才填：三个字母 RESET（list 时留空；填错不会改 staging）"
         required: false
         type: string
         default: ""
       push_codeup:
-        description: "reset-staging 时同时强推 Codeup 的 staging"
+        description: "④ 回退时连阿里云效一起拨（建议保持勾选）"
         required: false
         type: boolean
         default: true
@@ -83,7 +83,7 @@ jobs:
             ssh-keyscan -T 15 -t rsa,ecdsa,ed25519 codeup.aliyun.com >> ~/.ssh/known_hosts 2>/dev/null || true
           fi
 
-      - name: List tags (no push)
+      - name: 列出 tag（未改 staging）
         if: github.event.inputs.mode == 'list-tags'
         shell: bash
         env:
@@ -94,22 +94,37 @@ jobs:
             echo "::error::缺少 secret GITEE_REPO_SSH"
             exit 1
           fi
-          echo "## Gitee tags (cn/* 优先)" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo '选好名字后：再 Run workflow → mode=reset-staging → 粘贴 tag → confirm=RESET' >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          git ls-remote --tags --refs "$GITEE_REPO_SSH" \
-            | awk '{print $2}' | sed 's#^refs/tags/##' \
-            | tee /tmp/all-tags.txt \
-            | tee -a "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "### 当前 origin/staging" >> "$GITHUB_STEP_SUMMARY"
-          git ls-remote "$GITEE_REPO_SSH" refs/heads/staging | tee -a "$GITHUB_STEP_SUMMARY" || true
-          echo "[ok] 共 $(wc -l < /tmp/all-tags.txt) 个 tag；完整列表见上方 Summary / 本步日志"
+          echo "============================================================"
+          echo "下面每一行是一个可回退的 tag（复制整行，不要带空格）"
+          echo "排序：新的在上、旧的在下（与 Gitee 标签页一致）"
+          echo "回退方法：再点一次 Run workflow"
+          echo "  ① mode = reset-staging"
+          echo "  ② tag  = 粘贴下面某一行"
+          echo "  ③ confirm = RESET"
+          echo "  ④ Codeup 建议保持勾选"
+          echo "============================================================"
+          WORK="$RUNNER_TEMP/taglist.git"
+          git init --bare "$WORK"
+          git --git-dir="$WORK" remote add origin "$GITEE_REPO_SSH"
+          git --git-dir="$WORK" fetch --no-tags origin "refs/tags/*:refs/tags/*"
+          git --git-dir="$WORK" for-each-ref --sort=-creatordate --format='%(refname:short)' refs/tags \
+            | tee /tmp/all-tags.txt
+          echo "============================================================"
+          echo "当前 Gitee staging 指向的提交："
+          git ls-remote "$GITEE_REPO_SSH" refs/heads/staging || true
+          echo "============================================================"
+          echo "[ok] 共 $(wc -l < /tmp/all-tags.txt) 个 tag。本次没有推送、车上不会变。"
+          {
+            echo "## 可选 tag（复制整行）"
+            echo ""
+            echo '```'
+            cat /tmp/all-tags.txt
+            echo '```'
+            echo ""
+            echo "下一步：Run workflow → ① reset-staging → ② 粘贴 tag → ③ RESET"
+          } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Force-push staging to tag
+      - name: 强推 staging 到指定 tag
         if: github.event.inputs.mode == 'reset-staging'
         shell: bash
         env:
