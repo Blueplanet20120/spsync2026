@@ -1,0 +1,163 @@
+name: reset-staging-to-tag
+run-name: >-
+  ${{ github.event.inputs.mode == 'list-tags' && 'list Gitee tags (no push)'
+      || format('reset staging → {0}', github.event.inputs.tag) }}
+
+# GitHub 的 Run workflow 无法动态下拉远端 tag（choice 选项必须写死在 YAML 里）。
+# 因此分两步：先 list-tags 看列表，再 reset-staging 填上选中的 tag 名。
+# 手机：Actions → 本 workflow → Run workflow。
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "list-tags=只列出 Gitee 上的 tag；reset-staging=把 staging 强推到指定 tag"
+        required: true
+        type: choice
+        options:
+          - list-tags
+          - reset-staging
+        default: list-tags
+      tag:
+        description: "reset-staging 时填写：从 list-tags 日志/Summary 复制完整 tag 名"
+        required: false
+        type: string
+        default: ""
+      confirm:
+        description: "reset-staging 时必须填 RESET；list-tags 可留空"
+        required: false
+        type: string
+        default: ""
+      push_codeup:
+        description: "reset-staging 时同时强推 Codeup 的 staging"
+        required: false
+        type: boolean
+        default: true
+
+concurrency:
+  group: reset-staging-to-tag
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Guard (reset only)
+        if: github.event.inputs.mode == 'reset-staging'
+        shell: bash
+        env:
+          CONFIRM: ${{ github.event.inputs.confirm }}
+          TAG_IN: ${{ github.event.inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TAG_IN// /}" ]; then
+            echo "::error::reset-staging 需要填写 tag（先用 list-tags 查出名字再粘贴）"
+            exit 1
+          fi
+          if [ "${CONFIRM}" != "RESET" ]; then
+            echo "::error::confirm 必须为 RESET，已中止（不会改 staging）"
+            exit 1
+          fi
+
+      - name: Setup SSH agent (Gitee)
+        uses: webfactory/ssh-agent@v0.10.0
+        with:
+          ssh-private-key: ${{ secrets.GITEE_SSH_PRIVATE_KEY }}
+
+      - name: known_hosts + Codeup key
+        shell: bash
+        env:
+          ALIYUN_SSH_PRIVATE_KEY: ${{ secrets.ALIYUN_SSH_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          ssh-keyscan -T 15 -t rsa,ecdsa,ed25519 gitee.com >> ~/.ssh/known_hosts 2>/dev/null || true
+          if [ -n "${ALIYUN_SSH_PRIVATE_KEY:-}" ]; then
+            printf '%s\n' "$ALIYUN_SSH_PRIVATE_KEY" > ~/.ssh/sp-cn
+            chmod 600 ~/.ssh/sp-cn
+            ssh-keyscan -T 15 -t rsa,ecdsa,ed25519 codeup.aliyun.com >> ~/.ssh/known_hosts 2>/dev/null || true
+          fi
+
+      - name: List tags (no push)
+        if: github.event.inputs.mode == 'list-tags'
+        shell: bash
+        env:
+          GITEE_REPO_SSH: ${{ secrets.GITEE_REPO_SSH }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GITEE_REPO_SSH:-}" ]; then
+            echo "::error::缺少 secret GITEE_REPO_SSH"
+            exit 1
+          fi
+          echo "## Gitee tags (cn/* 优先)" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo '选好名字后：再 Run workflow → mode=reset-staging → 粘贴 tag → confirm=RESET' >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          git ls-remote --tags --refs "$GITEE_REPO_SSH" \
+            | awk '{print $2}' | sed 's#^refs/tags/##' \
+            | tee /tmp/all-tags.txt \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### 当前 origin/staging" >> "$GITHUB_STEP_SUMMARY"
+          git ls-remote "$GITEE_REPO_SSH" refs/heads/staging | tee -a "$GITHUB_STEP_SUMMARY" || true
+          echo "[ok] 共 $(wc -l < /tmp/all-tags.txt) 个 tag；完整列表见上方 Summary / 本步日志"
+
+      - name: Force-push staging to tag
+        if: github.event.inputs.mode == 'reset-staging'
+        shell: bash
+        env:
+          GITEE_REPO_SSH: ${{ secrets.GITEE_REPO_SSH }}
+          TAG_IN: ${{ github.event.inputs.tag }}
+          PUSH_CODEUP: ${{ github.event.inputs.push_codeup }}
+        run: |
+          set -euo pipefail
+          TAG="${TAG_IN#"${TAG_IN%%[![:space:]]*}"}"
+          TAG="${TAG%"${TAG##*[![:space:]]}"}"
+          TAG="${TAG#refs/tags/}"
+          if [ -z "$TAG" ]; then
+            echo "::error::tag 为空"
+            exit 1
+          fi
+          if [ -z "${GITEE_REPO_SSH:-}" ]; then
+            echo "::error::缺少 secret GITEE_REPO_SSH"
+            exit 1
+          fi
+
+          CODEUP_SSH="git@codeup.aliyun.com:6a0b0c8d706afd34aa607161/sunnypilot_cn.git"
+          WORK="$RUNNER_TEMP/sunnypilot_cn.git"
+          git init --bare "$WORK"
+          git --git-dir="$WORK" remote add origin "$GITEE_REPO_SSH"
+
+          echo "[fetch] origin refs/tags/${TAG}"
+          git --git-dir="$WORK" fetch --no-tags origin "refs/tags/${TAG}:refs/tags/${TAG}"
+          SHA="$(git --git-dir="$WORK" rev-parse "${TAG}^{commit}")"
+          echo "[ok] tag=${TAG} → ${SHA}"
+
+          echo "[push] Gitee staging = ${SHA:0:12}"
+          git --git-dir="$WORK" push --force origin "${SHA}:refs/heads/staging"
+
+          if [ "${PUSH_CODEUP}" = "true" ]; then
+            if [ ! -f ~/.ssh/sp-cn ]; then
+              echo "::warning::无 ALIYUN_SSH_PRIVATE_KEY，跳过 Codeup"
+            else
+              echo "[push] Codeup staging = ${SHA:0:12}"
+              GIT_SSH_COMMAND='ssh -i ~/.ssh/sp-cn -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes' \
+                git --git-dir="$WORK" push --force "$CODEUP_SSH" "${SHA}:refs/heads/staging"
+            fi
+          fi
+
+          echo "[done] 车上目标分支保持 staging；下次检查更新会拉到 ${SHA:0:12}"
+          echo "[done] 之后若再跑 sync-to-gitee 菜单 3 / Actions pull+push，会把 staging 推回上游 tip"
+          {
+            echo "## reset staging → \`${TAG}\`"
+            echo ""
+            echo "- commit: \`${SHA}\`"
+            echo "- 车上仍跟踪 **staging**，下次检查更新会拉到上述提交"
+          } >> "$GITHUB_STEP_SUMMARY"

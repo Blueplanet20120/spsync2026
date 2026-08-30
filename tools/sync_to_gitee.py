@@ -2712,6 +2712,7 @@ def patch_models_fetcher(root: Path) -> PatchResult:
   s = inject_models_hf_mirror(s)
   s = _rewrite_models_url_attr(s, "MODEL_URL", required=True, path=fetcher)
   s = _rewrite_models_url_attr(s, "MODEL_URL_USBGPU", required=False, path=fetcher)
+  s = _rewrite_models_url_attr(s, "MODEL_URL_CHESTNUT", required=False, path=fetcher)
   _track_change(res, fetcher, write_if_changed(fetcher, s))
   return res
 
@@ -2742,19 +2743,26 @@ def _sunnylink_activejson_put_block() -> str:
   )
 
 
-def _sunnylink_activejson_dict_put_block() -> str:
-  """New fetcher: ActiveJson is a {qcom, usbgpu} map written once in __init__."""
-  return (
+def _sunnylink_activejson_dict_put_block(entries: list[tuple[str, str]]) -> str:
+  """ActiveJson map in ModelFetcher.__init__ (keys vary: usbgpu / chestnut)."""
+  lines = [
     f"    # {_CN_SUNNYLINK_ACTIVEJSON}: sunnylink.ai fetches these URLs in the browser; "
-    "Gitee raw has no CORS.\n"
-    "    # Device still downloads manifests via MODEL_URL / MODEL_URL_USBGPU "
-    "(rewritten to Gitee).\n"
-    f'    _cn_active_json_gh = "{_SUNNYLINK_ACTIVEJSON_GITHUB_PREFIX}"\n'
-    '    self.params.put("ModelManager_ActiveJson", {\n'
-    '      "qcom": _cn_active_json_gh + self.MODEL_URL.rsplit("/", 1)[-1],\n'
-    '      "usbgpu": _cn_active_json_gh + self.MODEL_URL_USBGPU.rsplit("/", 1)[-1],\n'
-    "    }, block=True)\n"
-  )
+    "Gitee raw has no CORS.",
+    "    # Device still downloads manifests via MODEL_URL* (rewritten to Gitee).",
+    f'    _cn_active_json_gh = "{_SUNNYLINK_ACTIVEJSON_GITHUB_PREFIX}"',
+    '    self.params.put("ModelManager_ActiveJson", {',
+  ]
+  for key, attr in entries:
+    lines.append(f'      "{key}": _cn_active_json_gh + self.{attr}.rsplit("/", 1)[-1],')
+  lines.append("    }, block=True)")
+  return "\n".join(lines) + "\n"
+
+
+_ACTIVEJSON_DICT_PUT_RE = re.compile(
+  r'(?m)^    self\.params\.put\("ModelManager_ActiveJson", \{\n'
+  r'(?:      "[^"]+": self\.[A-Z0-9_]+,\n)+'
+  r'    \}, block=True\)\n'
+)
 
 
 def inject_sunnylink_activejson_cors_guard(s: str) -> str:
@@ -2766,15 +2774,12 @@ def inject_sunnylink_activejson_cors_guard(s: str) -> str:
   if _CN_SUNNYLINK_ACTIVEJSON in s and _SUNNYLINK_ACTIVEJSON_GITHUB_PREFIX in s:
     return s
 
-  # New API: dict ActiveJson in ModelFetcher.__init__
-  orig_dict = (
-    '    self.params.put("ModelManager_ActiveJson", {\n'
-    '      "qcom": self.MODEL_URL,\n'
-    '      "usbgpu": self.MODEL_URL_USBGPU,\n'
-    "    }, block=True)\n"
-  )
-  if orig_dict in s:
-    return s.replace(orig_dict, _sunnylink_activejson_dict_put_block(), 1)
+  m_dict = _ACTIVEJSON_DICT_PUT_RE.search(s)
+  if m_dict:
+    entries = re.findall(r'"([^"]+)": self\.([A-Z0-9_]+)', m_dict.group(0))
+    if not entries:
+      raise RuntimeError("fetcher.py: ActiveJson dict 无法解析源键，无法注入 sunnylink CORS 规避")
+    return s[: m_dict.start()] + _sunnylink_activejson_dict_put_block(entries) + s[m_dict.end() :]
 
   new = _sunnylink_activejson_put_block()
   empty = (
@@ -4492,7 +4497,10 @@ def verify_patches(root: Path) -> None:
     errors.append(
       f"{fetcher_rel}: 仍把 MODEL_URL 写入 ModelManager_ActiveJson（sunnylink.ai 浏览器无法 CORS 访问 Gitee raw）"
     )
-  if '"qcom": self.MODEL_URL' in fetcher_tx or '"usbgpu": self.MODEL_URL_USBGPU' in fetcher_tx:
+  if re.search(
+    r'"(?:qcom|usbgpu|chestnut)": self\.MODEL_URL(?:_USBGPU|_CHESTNUT)?,',
+    fetcher_tx,
+  ):
     errors.append(
       f"{fetcher_rel}: ActiveJson dict 仍直接写入 Gitee/本地 MODEL_URL（应改写为 GitHub raw 供 sunnylink）"
     )
@@ -4504,7 +4512,7 @@ def verify_patches(root: Path) -> None:
     errors.append(
       f"{fetcher_rel}: ActiveJson 应写入 GitHub raw（CORS *），供 sunnylink.ai 浏览器拉取"
     )
-  for attr in ("MODEL_URL", "MODEL_URL_USBGPU"):
+  for attr in ("MODEL_URL", "MODEL_URL_USBGPU", "MODEL_URL_CHESTNUT"):
     m_url = re.search(rf'{attr}\s*=\s*"([^"]+)"', fetcher_tx)
     if m_url and "raw.githubusercontent.com/sunnypilot/sunnypilot-models" in m_url.group(1):
       errors.append(f"{fetcher_rel}: {attr} 仍指向 GitHub raw，未改 Gitee")
