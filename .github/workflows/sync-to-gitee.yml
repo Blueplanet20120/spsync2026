@@ -319,7 +319,7 @@ jobs:
 
             Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
-      - name: Cleanup old workflow runs (keep latest 20)
+      - name: Cleanup old workflow runs (keep latest 5)
         if: always()
         continue-on-error: true
         uses: actions/github-script@v8
@@ -328,7 +328,7 @@ jobs:
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const workflow_id = "sync-to-gitee.yml";
-            const keep = 20;
+            const keep = 5;
 
             // List runs (newest first)
             const runs = await github.paginate(github.rest.actions.listWorkflowRuns, {

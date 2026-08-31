@@ -40,6 +40,7 @@ concurrency:
 
 permissions:
   contents: read
+  actions: write
 
 jobs:
   run:
@@ -176,3 +177,45 @@ jobs:
             echo "- commit: \`${SHA}\`"
             echo "- 车上仍跟踪 **staging**，下次检查更新会拉到上述提交"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Cleanup old workflow runs (keep latest 5)
+        if: always()
+        continue-on-error: true
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const workflow_id = "reset-staging-to-tag.yml";
+            const keep = 5;
+
+            const runs = await github.paginate(github.rest.actions.listWorkflowRuns, {
+              owner,
+              repo,
+              workflow_id,
+              per_page: 100,
+              exclude_pull_requests: true,
+            });
+
+            const filtered = runs.filter(r =>
+              r.id !== context.runId &&
+              r.status !== "in_progress" &&
+              r.status !== "queued"
+            );
+
+            if (filtered.length <= keep) {
+              core.info(`No cleanup needed. Runs=${filtered.length}, keep=${keep}`);
+              return;
+            }
+
+            const toDelete = filtered.slice(keep);
+            core.info(`Deleting ${toDelete.length} old workflow runs (keeping latest ${keep})`);
+
+            for (const r of toDelete) {
+              try {
+                await github.rest.actions.deleteWorkflowRun({ owner, repo, run_id: r.id });
+                core.info(`Deleted run_id=${r.id} created_at=${r.created_at} status=${r.status}`);
+              } catch (e) {
+                core.warning(`Failed to delete run_id=${r.id}: ${e.message}`);
+              }
+            }
