@@ -19,7 +19,7 @@ on:
           - reset-staging
         default: list-tags
       tag:
-        description: "② 回退才填：复制完整 tag 名，例如 cn/staging-45515f7-20260830-1152（list 时留空）"
+        description: "② 回退才填：复制最近列表里的完整 tag 名（不要带序号）；list 时留空"
         required: false
         type: string
         default: ""
@@ -96,11 +96,10 @@ jobs:
             exit 1
           fi
           echo "============================================================"
-          echo "下面每一行是一个可回退的 tag（复制整行，不要带空格）"
-          echo "排序：新的在上、旧的在下（与 Gitee 标签页一致）"
-          echo "回退方法：再点一次 Run workflow"
+          echo "只列出最近 10 个 tag（按创建时间，新的在上）"
+          echo "复制 tag 全名（不要带序号），再点一次 Run workflow 回退"
           echo "  ① mode = reset-staging"
-          echo "  ② tag  = 粘贴下面某一行"
+          echo "  ② tag  = 粘贴下面某一行的全名"
           echo "  ③ confirm = RESET"
           echo "  ④ Codeup 建议保持勾选"
           echo "============================================================"
@@ -109,20 +108,30 @@ jobs:
           git --git-dir="$WORK" remote add origin "$GITEE_REPO_SSH"
           git --git-dir="$WORK" fetch --no-tags origin "refs/tags/*:refs/tags/*"
           git --git-dir="$WORK" for-each-ref --sort=-creatordate --format='%(refname:short)' refs/tags \
-            | tee /tmp/all-tags.txt
+            > /tmp/all-tags.txt
+          TOTAL=$(wc -l < /tmp/all-tags.txt | tr -d ' ')
+          head -n 10 /tmp/all-tags.txt > /tmp/recent-tags.txt
+          i=1
+          while IFS= read -r t; do
+            [ -z "$t" ] && continue
+            printf '(%d) %s\n' "$i" "$t"
+            i=$((i + 1))
+          done < /tmp/recent-tags.txt
           echo "============================================================"
           echo "当前 Gitee staging 指向的提交："
           git ls-remote "$GITEE_REPO_SSH" refs/heads/staging || true
           echo "============================================================"
-          echo "[ok] 共 $(wc -l < /tmp/all-tags.txt) 个 tag。本次没有推送、车上不会变。"
+          SHOWN=$(wc -l < /tmp/recent-tags.txt | tr -d ' ')
+          echo "[ok] 列出最近 ${SHOWN} 个（远端共 ${TOTAL} 个）。本次没有推送、车上不会变。"
           {
-            echo "## 可选 tag（复制整行）"
+            echo "## 最近 10 个可回退 tag（复制全名，不要带序号）"
             echo ""
             echo '```'
-            cat /tmp/all-tags.txt
+            cat /tmp/recent-tags.txt
             echo '```'
             echo ""
-            echo "下一步：Run workflow → ① reset-staging → ② 粘贴 tag → ③ RESET"
+            echo "远端共 ${TOTAL} 个 tag，此处只列最近 10 个。"
+            echo "下一步：Run workflow → ① reset-staging → ② 粘贴 tag 全名 → ③ RESET"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: 强推 staging 到指定 tag
