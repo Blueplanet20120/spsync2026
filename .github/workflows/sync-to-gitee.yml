@@ -268,6 +268,24 @@ jobs:
             exit "$ec"
           fi
 
+      - name: Archive cn/staging tag
+        id: archive_tag
+        if: steps.sync_pull.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        env:
+          GITEE_REPO_SSH: ${{ secrets.GITEE_REPO_SSH }}
+          GIT_LFS_SKIP_PUSH: "1"
+          SP_CN_TOKEN: ${{ secrets.SP_CN_TOKEN }}
+        run: |
+          set -euo pipefail
+          WORKDIR="$GITHUB_WORKSPACE/sunnypilot"
+          python3 "$GITHUB_WORKSPACE/tools/sync_to_gitee.py" \
+            --action archive-tag \
+            --workdir "$WORKDIR" \
+            --origin "$GITEE_REPO_SSH" \
+            --upstream "https://github.com/sunnypilot/sunnypilot.git"
+
       - name: Finalize sync outputs (mail)
         id: sync_outputs
         if: always() && steps.sync_pull.outcome == 'success'

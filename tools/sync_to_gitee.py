@@ -9,6 +9,7 @@
 - 可选（CLI 开关；云端 Actions 不使用）：``--build-installer``、``--sync-mapd-release``（需 GITEE_TOKEN）。
   mapd / 远端 installer 交互更适合在本机用 ``tools/sync_to_gitee_local.py``；本脚本内菜单不含这两项。
 - 提交并推送到你的 Gitee：staging
+- GitHub Actions 推送成功后默认打附注 tag（``cn/staging-{上游短SHA}-{UTC时间}``），说明为上游 staging 包装提交里的 ``master commit`` 主题（如 ``chestnut: alert when big model ready``）。``SYNC_SKIP_ARCHIVE_TAG=1`` 可关闭。
 
 用法示例：
   python3 tools/sync_to_gitee.py --action all                  # CI / 一键同步（常用）
@@ -1582,6 +1583,179 @@ def parse_recorded_upstream_sha(commit_body: str, branch: str) -> str | None:
   return m.group(1) if m else None
 
 
+_MASTER_COMMIT_RE = re.compile(r"(?im)master commit:?\s*([0-9a-f]{7,40})")
+
+
+def _strip_github_pr_suffix(subject: str) -> str:
+  return re.sub(r"\s*\(#\d+\)\s*$", "", (subject or "").strip()).strip()
+
+
+def _git_commit_exists(root: Path, env: dict[str, str], spec: str) -> bool:
+  try:
+    run(["git", "rev-parse", "--verify", f"{spec}^{{commit}}"], str(root), env=env)
+    return True
+  except RuntimeError:
+    return False
+
+
+def _ensure_git_commit(root: Path, env: dict[str, str], spec: str) -> bool:
+  if _git_commit_exists(root, env, spec):
+    return True
+  try:
+    run(["git", "fetch", "--depth", "1", "upstream", spec], str(root), env=env)
+  except RuntimeError:
+    try:
+      run(["git", "fetch", "upstream", spec], str(root), env=env)
+    except RuntimeError:
+      return False
+  return _git_commit_exists(root, env, spec)
+
+
+def subject_from_upstream_packaging(root: Path, env: dict[str, str], upstream_sha: str) -> str | None:
+  """上游 staging 包装提交正文里的 master commit 主题（去掉 (#PR)）。"""
+  if not _ensure_git_commit(root, env, upstream_sha):
+    return None
+  try:
+    body = run(["git", "log", "-1", "--format=%B", upstream_sha], str(root), env=env)
+  except RuntimeError:
+    return None
+  m = _MASTER_COMMIT_RE.search(body or "")
+  if m and _ensure_git_commit(root, env, m.group(1)):
+    try:
+      subj = run(["git", "log", "-1", "--format=%s", m.group(1)], str(root), env=env).strip()
+    except RuntimeError:
+      subj = ""
+    if subj:
+      return _strip_github_pr_suffix(subj)
+  first = next((ln.strip() for ln in (body or "").splitlines() if ln.strip()), "")
+  return _strip_github_pr_suffix(first) if first else None
+
+
+def _unique_cn_archive_tag_name(root: Path, env: dict[str, str], base: str) -> str:
+  name = base
+  n = 0
+  while True:
+    try:
+      run(["git", "rev-parse", "--verify", f"refs/tags/{name}"], str(root), env=env)
+    except RuntimeError:
+      return name
+    n += 1
+    name = f"{base}-{n}"
+
+
+def _archive_tag_push_targets_from_state(state: dict[str, object] | None) -> set[str]:
+  targets: set[str] = set()
+  if not state:
+    return set(enabled_push_target_ids())
+  if state.get("pushed_gitee"):
+    targets.add("gitee")
+  if state.get("pushed_codeup"):
+    targets.add("codeup")
+  pr = state.get("push_results") if isinstance(state.get("push_results"), dict) else {}
+  if isinstance(pr, dict):
+    for tid in ("gitee", "codeup"):
+      entry = pr.get(tid)
+      if isinstance(entry, dict) and entry.get("overall") in ("ok", "partial"):
+        targets.add(tid)
+  return targets
+
+
+def create_and_push_cn_archive_tag(
+  root: Path,
+  env: dict[str, str],
+  *,
+  branch: str | None = None,
+  targets: set[str] | None = None,
+) -> str | None:
+  """
+  在当前 HEAD 打一枚 ``cn/staging-…`` 附注 tag，并推到已成功的远端。
+  说明优先用上游 staging 的 master commit 主题。
+  """
+  branch = (branch or (SYNC_BRANCHES[0] if SYNC_BRANCHES else "staging")).strip()
+  want = targets if targets is not None else set(enabled_push_target_ids())
+  if not want:
+    print("[skip] archive-tag: 无推送目标")
+    return None
+  try:
+    run(["git", "rev-parse", "--verify", f"refs/heads/{branch}"], str(root), env=env)
+    run(["git", "checkout", branch], str(root), env=env)
+  except RuntimeError as e:
+    log("warn", f"archive-tag: 无法检出 {branch}: {e}")
+    return None
+  try:
+    head = run(["git", "rev-parse", "--verify", "HEAD"], str(root), env=env).strip()
+    body = run(["git", "log", "-1", "--format=%B"], str(root), env=env)
+  except RuntimeError as e:
+    log("warn", f"archive-tag: 无法读取 HEAD: {e}")
+    return None
+  recorded = parse_recorded_upstream_sha(body, branch)
+  upstream_short = (canonical_commit_sha(recorded, root, env) or recorded or "unknown")[:7]
+  subject = None
+  if recorded:
+    subject = subject_from_upstream_packaging(root, env, recorded)
+  if not subject:
+    subject = f"国内化快照：upstream={upstream_short} HEAD={head[:12]}"
+  ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M")
+  tag = _unique_cn_archive_tag_name(root, env, f"cn/staging-{upstream_short}-{ts}")
+  msg = subject if "upstream=" in subject else f"{subject}\n\nupstream={upstream_short}"
+  try:
+    run(
+      [
+        "git",
+        "-c", "user.name=sunnypilot-cn-bot",
+        "-c", "user.email=sunnypilot-cn-bot@local",
+        "tag", "-a", tag, head, "-m", msg,
+      ],
+      str(root),
+      env=env,
+    )
+  except RuntimeError as e:
+    log("warn", f"archive-tag: 本地打 tag 失败: {e}")
+    return None
+  log("tag", f"{tag} → {head[:12]}  {subject}")
+  push_env = dict(env)
+  push_env["GIT_LFS_SKIP_PUSH"] = "1"
+  failed = False
+  if "gitee" in want:
+    ge = dict(push_env)
+    ge["GIT_SSH_COMMAND"] = _gitee_git_ssh_env()["GIT_SSH_COMMAND"]
+    try:
+      run(["git", "push", "origin", f"refs/tags/{tag}"], str(root), env=ge)
+      log("tag", f"已推 Gitee {tag}")
+    except RuntimeError as e:
+      log("warn", f"archive-tag: 推 Gitee 失败: {e}")
+      failed = True
+  if "codeup" in want:
+    try:
+      run(["git", "push", "aliyun", f"refs/tags/{tag}"], str(root), env=aliyun_git_push_env(push_env))
+      log("tag", f"已推 Codeup {tag}")
+    except RuntimeError as e:
+      log("warn", f"archive-tag: 推 Codeup 失败: {e}")
+      failed = True
+  if failed:
+    log("warn", "archive-tag: 至少一端推 tag 失败（分支推送不受影响）")
+  return tag
+
+
+def maybe_archive_cn_tag_after_ci_push(root: Path, env: dict[str, str], state: dict[str, object] | None) -> None:
+  """CI / --action all：有成功推送时默认打 tag。本地 SP_SYNC_SOURCE=local 不打（由 local 菜单处理）。"""
+  if _env_truthy("SYNC_SKIP_ARCHIVE_TAG"):
+    print("[skip] archive-tag: SYNC_SKIP_ARCHIVE_TAG=1")
+    return
+  if (os.environ.get("SP_SYNC_SOURCE") or "").strip().lower() == "local":
+    return
+  if os.environ.get("GITHUB_ACTIONS") != "true" and not _env_truthy("SYNC_ARCHIVE_TAG"):
+    return
+  if not state or not state.get("to_push"):
+    print("[skip] archive-tag: 本轮无待推送分支")
+    return
+  if not state.get("pushed"):
+    print("[skip] archive-tag: 本轮无成功推送")
+    return
+  want = _archive_tag_push_targets_from_state(state)
+  create_and_push_cn_archive_tag(root, env, targets=want)
+
+
 def fetch_mirror_recorded_upstream(
   root: Path,
   env: dict[str, str],
@@ -2925,10 +3099,32 @@ def inject_models_fetcher_stale_cache_guard(s: str) -> str:
 
 
 def _tinygrad_fetch_remotes() -> list[str]:
+  """tinygrad 对齐用的远端。Gitee 走 SSH，避免 Windows Git Credential Manager 弹 https://gitee.com 登录框。"""
   return [
-    gitee_https_repo("tinygrad") + ".git",
+    gitee_git_ssh_repo("tinygrad"),
     TINYGRAD_UPSTREAM_URL,
   ]
+
+
+def _git_env_no_credential_prompt() -> dict[str, str]:
+  env = os.environ.copy()
+  env["GIT_TERMINAL_PROMPT"] = "0"
+  env["GCM_INTERACTIVE"] = "never"
+  return env
+
+
+def _git_cmd_no_credential_prompt(cmd: list[str]) -> list[str]:
+  if not cmd or cmd[0] != "git":
+    return cmd
+  return ["git", "-c", "credential.helper=", "-c", "credential.interactive=never", *cmd[1:]]
+
+
+def _tinygrad_git(cmd: list[str], cwd: str | Path) -> str:
+  return run(
+    _git_cmd_no_credential_prompt(cmd),
+    str(cwd),
+    env=_git_env_no_credential_prompt(),
+  )
 
 
 def _rmtree_force(path: Path) -> None:
@@ -3009,14 +3205,14 @@ def _materialize_tinygrad_commit(commit: str, dest: Path) -> None:
     last_err: str | None = None
     for url in _tinygrad_fetch_remotes():
       try:
-        run(["git", "remote", "add", "origin", url], str(src))
-        run(["git", "fetch", "--depth", "1", "origin", commit], str(src))
+        _tinygrad_git(["git", "remote", "add", "origin", url], src)
+        _tinygrad_git(["git", "fetch", "--depth", "1", "origin", commit], src)
         fetched = True
         break
       except RuntimeError as e:
         last_err = str(e)
         try:
-          run(["git", "remote", "remove", "origin"], str(src))
+          _tinygrad_git(["git", "remote", "remove", "origin"], src)
         except RuntimeError:
           pass
     if not fetched:
@@ -4186,13 +4382,13 @@ def _tinygrad_commit_root_tree(commit: str) -> str | None:
     run(["git", "init"], td)
     for url in _tinygrad_fetch_remotes():
       try:
-        run(["git", "remote", "remove", "origin"], td)
+        _tinygrad_git(["git", "remote", "remove", "origin"], td)
       except RuntimeError:
         pass
       try:
-        run(["git", "remote", "add", "origin", url], td)
-        run(["git", "fetch", "--depth", "1", "origin", commit], td)
-        got = run(["git", "rev-parse", "FETCH_HEAD^{tree}"], td).strip().lower()
+        _tinygrad_git(["git", "remote", "add", "origin", url], td)
+        _tinygrad_git(["git", "fetch", "--depth", "1", "origin", commit], td)
+        got = _tinygrad_git(["git", "rev-parse", "FETCH_HEAD^{tree}"], td).strip().lower()
         if re.fullmatch(r"[0-9a-f]{40}", got):
           tree = got
           break
@@ -5140,13 +5336,14 @@ def main() -> None:
   ap.add_argument("--action",
                   choices=[
                     "menu", "pull", "push", "push-gitee", "push-codeup", "emit-outputs",
-                    "print-ci-push-targets", "verify-tinygrad-models", "all",
+                    "print-ci-push-targets", "verify-tinygrad-models", "all", "archive-tag",
                   ],
                   default="menu",
                   help=(
                     "执行模式：menu=交互菜单；pull=拉取+补丁；push=推全部启用源；"
                     "push-gitee/push-codeup=仅推一端（CI 分步）；emit-outputs=写 GITHUB_OUTPUT；"
                     "print-ci-push-targets=输出 workflow 条件变量；"
+                    "archive-tag=推送成功后打 cn/staging 留档 tag；"
                     "verify-tinygrad-models=仅校验 tinygrad_repo 与 models JSON ref；all=pull+push"
                   ))
   ap.add_argument("--build-installer", action="store_true", default=False, help="在 larch64 设备上构建 installer（需要 extras=on）")
@@ -5566,6 +5763,7 @@ def main() -> None:
         push_all(to_push, squash_first=True, sync_state=ci_sync_state)
         assert ci_sync_state is not None
         update_pushed_flags_from_push_results(ci_sync_state)
+        maybe_archive_cn_tag_after_ci_push(root, env, ci_sync_state)
       if args.force_staging:
         log("warn", "--force-staging 已废弃：当前仅同步 staging，不再执行 master→staging 强推。")
       maybe_sync_mapd_release()
@@ -5625,6 +5823,7 @@ def main() -> None:
       push_all(branches, squash_first=True, sync_state=st)
       update_pushed_flags_from_push_results(st)
       save_ci_sync_state(st)
+      maybe_archive_cn_tag_after_ci_push(root, env, st)
       if args.force_staging:
         log("warn", "--force-staging 已废弃：当前仅同步 staging，不再执行 master→staging 强推。")
       maybe_sync_mapd_release()
@@ -5673,6 +5872,19 @@ def main() -> None:
             raise SystemExit(1)
     elif args.action == "emit-outputs":
       write_ci_github_output(load_ci_sync_state())
+    elif args.action == "archive-tag":
+      if _env_truthy("SYNC_SKIP_ARCHIVE_TAG"):
+        print("[skip] archive-tag: SYNC_SKIP_ARCHIVE_TAG=1")
+      else:
+        st = load_ci_sync_state()
+        update_pushed_flags_from_push_results(st)
+        if not st.get("to_push"):
+          print("[skip] archive-tag: pull 阶段未产生待推送分支")
+        elif not st.get("pushed"):
+          print("[skip] archive-tag: 本轮无成功推送")
+        else:
+          want = _archive_tag_push_targets_from_state(st)
+          create_and_push_cn_archive_tag(root, env, targets=want)
     elif args.action == "verify-tinygrad-models":
       verify_tinygrad_models_alignment(root)
       print("[ok] tinygrad_repo 与 models JSON tinygrad_ref 一致")
