@@ -142,6 +142,80 @@ def _expected_models_json_url(json_name: str | None = None) -> str:
   return f"{gitee_models_raw_gh_pages()}docs/{name}"
 
 
+_MODELS_JSON_VER_RE = re.compile(
+  r"^(driving_models(?:_chestnut|_usbgpu)?)_v(\d+)\.json$",
+  re.IGNORECASE,
+)
+
+
+def _models_json_version_fallbacks(json_name: str) -> list[str]:
+  """同前缀、版本号递减（含自身），供 Gitee 镜像尚未跟上 GitHub 时回退。"""
+  name = (json_name or "").strip()
+  out: list[str] = []
+  if name:
+    out.append(name)
+  m = _MODELS_JSON_VER_RE.match(name)
+  if m:
+    prefix, ver = m.group(1), int(m.group(2))
+    for v in range(ver - 1, 16, -1):
+      out.append(f"{prefix}_v{v}.json")
+  seen: set[str] = set()
+  uniq: list[str] = []
+  for n in out:
+    k = n.lower()
+    if k not in seen:
+      seen.add(k)
+      uniq.append(n)
+  return uniq
+
+
+_HTTP_OK_CACHE: dict[str, int] = {}
+
+
+def _http_url_status(url: str) -> int | None:
+  """HEAD 状态码。仅缓存 2xx；404 不缓存，避免菜单 6 同步后同进程仍当成缺失。"""
+  hit = _HTTP_OK_CACHE.get(url)
+  if hit is not None:
+    return hit
+  try:
+    req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": "spsync-models-json/1"})
+    with urllib.request.urlopen(req, timeout=12) as resp:
+      st = int(getattr(resp, "status", 200) or 200)
+  except urllib.error.HTTPError as e:
+    st = int(e.code)
+  except (urllib.error.URLError, TimeoutError, OSError):
+    return None
+  if 200 <= st < 300:
+    _HTTP_OK_CACHE[url] = st
+  return st
+
+
+def _resolve_gitee_models_json_url(json_name: str) -> str:
+  """
+  把上游 JSON 文件名映射到 Gitee raw。
+  若 Gitee 还没有该版本（404），改用同系列已有的较低版本，避免车上清单 404。
+  """
+  names = _models_json_version_fallbacks(json_name)
+  if not names:
+    return _expected_models_json_url(json_name)
+  wanted = _expected_models_json_url(names[0])
+  st = _http_url_status(wanted)
+  if st is None or (st is not None and 200 <= st < 300):
+    return wanted
+  if st != 404:
+    return wanted
+  for alt in names[1:]:
+    url = _expected_models_json_url(alt)
+    alt_st = _http_url_status(url)
+    if alt_st is not None and 200 <= alt_st < 300:
+      log(
+        "warn",
+        f"Gitee 尚无 {names[0]}（HTTP {st}），清单暂用 {alt}；请菜单 6 同步 sunnypilot-models 后再 pull",
+      )
+      return url
+  return wanted
+
+
 def _fix_models_json_url_typos(url: str) -> str:
   """修正 Gitee models JSON 的已知错误 raw 路径（幂等）。"""
   gh = gitee_models_raw_gh_pages()
@@ -650,6 +724,11 @@ def _should_inherit_stdio_for_long_git(cmd: list[str]) -> bool:
   return False
 
 
+def _subprocess_text_kwargs() -> dict[str, str]:
+  """Windows 默认 GBK；git 输出常含 UTF-8/CP1252 字节，text=True 会 UnicodeDecodeError。"""
+  return {"encoding": "utf-8", "errors": "replace"}
+
+
 def run(
   cmd: list[str],
   cwd: str | None = None,
@@ -666,6 +745,7 @@ def run(
   - timeout_s：仅非 stream 模式生效（Gitee push 限时）
   """
   cmd = _maybe_git_fetch_progress(list(cmd))
+  text_kw = _subprocess_text_kwargs()
 
   if stream is None:
     stream = sys.stdout.isatty()
@@ -681,8 +761,8 @@ def run(
         env=env,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        text=True,
         timeout=timeout_s,
+        **text_kw,
       )
     except subprocess.TimeoutExpired as e:
       raise _timeout_expired() from e
@@ -699,7 +779,15 @@ def run(
       raise RuntimeError(f"命令失败: {' '.join(cmd)}")
     return ""
 
-  p2 = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+  p2 = subprocess.Popen(
+    cmd,
+    cwd=cwd,
+    env=env,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.STDOUT,
+    bufsize=1,
+    **text_kw,
+  )
   assert p2.stdout is not None
   out_lines: list[str] = []
   try:
@@ -2864,7 +2952,7 @@ def _rewrite_models_url_attr(s: str, attr: str, *, required: bool, path: Path) -
       raise RuntimeError(f"{path}: 找不到 {attr} 赋值")
     return s
   json_name = _extract_model_json_basename(m.group(1))
-  new_url = _expected_models_json_url(json_name)
+  new_url = _resolve_gitee_models_json_url(json_name)
   current = _fix_models_json_url_typos(m.group(1).strip())
   if current == new_url:
     return s
@@ -3441,6 +3529,30 @@ def inject_mici_software_update_confirm(s: str) -> str:
   if old_imp not in s:
     raise RuntimeError("mici/layouts/settings/software.py: 未找到 BigDialog import")
   s = s.replace(old_imp, new_imp, 1)
+  old_check_signal = (
+    "    if not system_time_valid():\n"
+    "      dlg = BigDialog(\"\", tr(\"Please connect to Wi-Fi to update.\"))\n"
+    "      gui_app.push_widget(dlg)\n"
+    "      return\n"
+    "\n"
+    "    self._signal_updater(self.DOWNLOAD_UPDATE if self.get_value() == \"download update\" else self.CHECK_FOR_UPDATE)\n"
+  )
+  new_check_signal = (
+    "    if not system_time_valid():\n"
+    "      dlg = BigDialog(\"\", tr(\"Please connect to Wi-Fi to update.\"))\n"
+    "      gui_app.push_widget(dlg)\n"
+    "      return\n"
+    "\n"
+    f"    # {_CN_SOFTWARE_UPDATE_CONFIRM}\n"
+    "    if self.get_value() == \"download update\":\n"
+    "      gui_app.push_widget(BigConfirmationDialog(\n"
+    "        \"slide to\\nconfirm update\",\n"
+    "        self._txt_update_icon,\n"
+    "        lambda: self._signal_updater(self.DOWNLOAD_UPDATE),\n"
+    "      ))\n"
+    "      return\n"
+    "    self._signal_updater(self.CHECK_FOR_UPDATE)\n"
+  )
   old_check = (
     "    self.set_enabled(False)\n"
     "    self._state = UpdaterState.WAITING_FOR_UPDATER\n"
@@ -3478,9 +3590,12 @@ def inject_mici_software_update_confirm(s: str) -> str:
     "\n"
     "    threading.Thread(target=run, daemon=True).start()\n"
   )
-  if old_check not in s:
+  if old_check_signal in s:
+    s = s.replace(old_check_signal, new_check_signal, 1)
+  elif old_check in s:
+    s = s.replace(old_check, new_check, 1)
+  else:
     raise RuntimeError("mici/layouts/settings/software.py: 未找到 CheckUpdateButton 下载分支，无法注入更新确认")
-  s = s.replace(old_check, new_check, 1)
   old_inst = (
     "  def _handle_mouse_release(self, mouse_pos: MousePos):\n"
     "    super()._handle_mouse_release(mouse_pos)\n"
@@ -4178,6 +4293,46 @@ def patch_gitmodules(root: Path) -> PatchResult:
   return res
 
 
+_CN_MANAGER_RESTART_DEAD = "cn_manager_restart_dead"
+
+
+def patch_manager_restart_dead(root: Path) -> PatchResult:
+  """
+  manager 发现应运行进程已退出时自动 stop + start。
+  上游 start() 在 proc 对象仍在时直接 return，micd/soundd 等 get_stream 失败后
+  会一直 Process Not Running，直到 offroad。幂等：sentinel 已在则跳过。
+  """
+  res = PatchResult("manager_restart_dead")
+  path = cn_path(root, "system/manager/process.py")
+  if not path.is_file():
+    raise RuntimeError(f"{path}: 缺少 system/manager/process.py，无法注入进程死后重启")
+  s = path.read_text(encoding="utf-8")
+  if _CN_MANAGER_RESTART_DEAD in s:
+    return res
+  old = (
+    "  for p in running:\n"
+    "    p.start()\n"
+    "\n"
+    "  return running\n"
+  )
+  new = (
+    "  for p in running:\n"
+    f"    # {_CN_MANAGER_RESTART_DEAD}: crashed procs stay in proc= until offroad; restart them\n"
+    "    if p.proc is not None and not p.proc.is_alive():\n"
+    "      cloudlog.error(f\"restarting dead process {p.name} (exit {p.proc.exitcode})\")\n"
+    "      p.stop()\n"
+    "    p.start()\n"
+    "\n"
+    "  return running\n"
+  )
+  if old not in s:
+    raise RuntimeError(
+      f"{path}: 未找到 ensure_running 的 start 循环，无法注入 {_CN_MANAGER_RESTART_DEAD}"
+    )
+  _track_change(res, path, write_if_changed(path, s.replace(old, new, 1)))
+  return res
+
+
 def patch_all(root: Path) -> list[PatchResult]:
   patches = [
     patch_main_repo_cn_routing,
@@ -4197,6 +4352,7 @@ def patch_all(root: Path) -> list[PatchResult]:
     patch_software_update_confirm,
     patch_dm_relaxed_terminal,
     patch_dm_relaxed_tests,
+    patch_manager_restart_dead,
     patch_gitmodules,
   ]
   results: list[PatchResult] = []
@@ -4263,6 +4419,9 @@ def _models_json_url_candidates(primary: str | None) -> list[str]:
       out.append(u)
 
   add(primary)
+  primary_name = _extract_model_json_basename(primary) if primary else ""
+  for name in _models_json_version_fallbacks(primary_name)[1:]:
+    add(_expected_models_json_url(name))
   add(f"{gitee_models_raw_gh_pages()}docs/driving_models_v19.json")
   add(f"{gitee_models_raw_gh_pages()}docs/driving_models_v17.json")
   allow_gh = (os.environ.get("VERIFY_TINYGRAD_ALLOW_GITHUB_MODELS") or "").strip().lower()
@@ -4284,6 +4443,10 @@ def _fetch_models_tinygrad_ref(url: str, *, timeout_s: int = 25) -> str | None:
       return None
     ref_s = str(ref).strip().lower()
     return _git_sha40(ref_s)
+  except urllib.error.HTTPError as e:
+    if e.code != 404:
+      log("verify-tinygrad", f"拉取 models JSON 失败 ({url}): {e}")
+    return None
   except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as e:
     log("verify-tinygrad", f"拉取 models JSON 失败 ({url}): {e}")
     return None
@@ -4878,6 +5041,28 @@ def verify_patches(root: Path) -> None:
       if test_name not in dm_tests:
         errors.append(f"{dm_tests_rel}: 缺少 {test_name} 语义测试")
 
+  mgr_rel = rpath("system/manager/process.py")
+  mgr_tx = rt("system/manager/process.py")
+  if not mgr_tx.strip():
+    errors.append(f"{mgr_rel}: 文件缺失或为空")
+  elif _CN_MANAGER_RESTART_DEAD not in mgr_tx:
+    errors.append(f"{mgr_rel}: 缺少 {_CN_MANAGER_RESTART_DEAD}（进程死后不会自动重启）")
+  else:
+    if "restarting dead process" not in mgr_tx:
+      errors.append(f"{mgr_rel}: 缺少 dead process 重启日志")
+    if "not p.proc.is_alive()" not in mgr_tx:
+      errors.append(f"{mgr_rel}: ensure_running 未检查 proc.is_alive()")
+    # start 循环须先清掉已死进程再 start，避免 PythonProcess.start 直接 return
+    if not re.search(
+      r"for p in running:\s*"
+      r".*not p\.proc\.is_alive\(\).*"
+      r"p\.stop\(\)\s*"
+      r"p\.start\(\)",
+      mgr_tx,
+      re.MULTILINE | re.DOTALL,
+    ):
+      errors.append(f"{mgr_rel}: ensure_running 未在 start 前 stop 已死进程")
+
   # 语法兜底（不验证逻辑正确性）
   py_verify = [
     rpath("system/cn_main_repo_route.py"),
@@ -4893,6 +5078,7 @@ def verify_patches(root: Path) -> None:
     rpath("selfdrive/ui/mici/layouts/settings/software.py"),
     controls_rel,
     dm_tests_rel,
+    mgr_rel,
   ]
   dm_verify = _dm_monitoring_path(root)
   if dm_verify is not None:
