@@ -4293,6 +4293,87 @@ def patch_gitmodules(root: Path) -> PatchResult:
   return res
 
 
+_CN_DM_WARP_COMPILE_MISSING = "cn_dm_warp_compile_missing"
+
+_CN_ENSURE_DM_WARP_FN = '''
+def _cn_ensure_dm_warp(cam_w: int, cam_h: int):
+  # {sentinel}: git OTA has no SCons dm_warp pkl; compile once on device
+  warp_path = MODELS_DIR / f'dm_warp_{{cam_w}}x{{cam_h}}_tinygrad.pkl'
+  if warp_path.is_file() and warp_path.stat().st_size > 0:
+    with open(warp_path, "rb") as f:
+      return pickle.load(f)
+  cloudlog.warning(f"compiling missing DM warp {{warp_path.name}} (first onroad after git OTA)")
+  from openpilot.common.transformations.model import DM_INPUT_SIZE
+  from openpilot.selfdrive.modeld.compile_dm_warp import compile_dm_warp
+  from openpilot.selfdrive.modeld.compile_modeld import NV12Frame
+  nv12 = NV12Frame(cam_w, cam_h, *get_nv12_info(cam_w, cam_h))
+  tmp_path = warp_path.with_name(warp_path.name + ".tmp")
+  try:
+    compile_dm_warp(nv12, DM_INPUT_SIZE[0], DM_INPUT_SIZE[1], str(tmp_path))
+    os.replace(tmp_path, warp_path)
+  finally:
+    try:
+      os.unlink(tmp_path)
+    except FileNotFoundError:
+      pass
+  with open(warp_path, "rb") as f:
+    return pickle.load(f)
+
+'''
+
+
+def patch_dm_warp_compile_missing(root: Path) -> PatchResult:
+  """
+  上游 dmonitoringmodeld 改为加载 SCons/CI 编好的 dm_warp_WxH_tinygrad.pkl。
+  官方刷机有该文件；Gitee git OTA 没有。缺失时在设备上调用 compile_dm_warp 编一次。
+  旧树尚未读该 pkl 时跳过。幂等：sentinel 已在则跳过。
+  """
+  res = PatchResult("dm_warp_compile_missing")
+  path = cn_path(root, "selfdrive/modeld/dmonitoringmodeld.py")
+  if not path.is_file():
+    return res
+  s = path.read_text(encoding="utf-8")
+  if _CN_DM_WARP_COMPILE_MISSING in s:
+    return res
+  if "dm_warp_" not in s:
+    return res
+  compile_py = cn_path(root, "selfdrive/modeld/compile_dm_warp.py")
+  if not compile_py.is_file():
+    raise RuntimeError(
+      f"{path}: 已引用 dm_warp_*.pkl 但缺少 {compile_py}，无法注入 {_CN_DM_WARP_COMPILE_MISSING}"
+    )
+  m = re.search(
+    r"METADATA_PATH = MODELS_DIR / ['\"]dmonitoring_model_metadata\.pkl['\"]\n",
+    s,
+  )
+  if not m:
+    raise RuntimeError(f"{path}: 未找到 METADATA_PATH，无法注入 {_CN_DM_WARP_COMPILE_MISSING}")
+  helper = _CN_ENSURE_DM_WARP_FN.format(sentinel=_CN_DM_WARP_COMPILE_MISSING)
+  s = s[: m.end()] + helper + s[m.end() :]
+  s2, n = re.subn(
+    r"(?P<ind>[ \t]*)with open\(MODELS_DIR / f['\"]dm_warp_\{(?P<w>[^}]+)\}x\{(?P<h>[^}]+)\}_tinygrad\.pkl['\"], ['\"]rb['\"]\) as f:\n"
+    r"(?P=ind)  self\.image_warp = pickle\.load\(f\)",
+    r"\g<ind>self.image_warp = _cn_ensure_dm_warp(\g<w>, \g<h>)",
+    s,
+    count=1,
+  )
+  if n == 0:
+    s2, n = re.subn(
+      r"(?P<ind>[ \t]*)warp_path = MODELS_DIR / f['\"]dm_warp_\{(?P<w>[^}]+)\}x\{(?P<h>[^}]+)\}_tinygrad\.pkl['\"]\n"
+      r"(?P=ind)with open\(warp_path, ['\"]rb['\"]\) as f:\n"
+      r"(?P=ind)  self\.image_warp = pickle\.load\(f\)",
+      r"\g<ind>self.image_warp = _cn_ensure_dm_warp(\g<w>, \g<h>)",
+      s,
+      count=1,
+    )
+  if n == 0:
+    raise RuntimeError(
+      f"{path}: 未找到 dm_warp pickle.load，无法注入 {_CN_DM_WARP_COMPILE_MISSING}"
+    )
+  _track_change(res, path, write_if_changed(path, s2))
+  return res
+
+
 _CN_MANAGER_RESTART_DEAD = "cn_manager_restart_dead"
 
 
@@ -4352,6 +4433,7 @@ def patch_all(root: Path) -> list[PatchResult]:
     patch_software_update_confirm,
     patch_dm_relaxed_terminal,
     patch_dm_relaxed_tests,
+    patch_dm_warp_compile_missing,
     patch_manager_restart_dead,
     patch_gitmodules,
   ]
@@ -5063,6 +5145,29 @@ def verify_patches(root: Path) -> None:
     ):
       errors.append(f"{mgr_rel}: ensure_running 未在 start 前 stop 已死进程")
 
+  dm_warp_rel = rpath("selfdrive/modeld/dmonitoringmodeld.py")
+  dm_warp_tx = rt("selfdrive/modeld/dmonitoringmodeld.py")
+  if "dm_warp_" in dm_warp_tx:
+    if _CN_DM_WARP_COMPILE_MISSING not in dm_warp_tx:
+      errors.append(
+        f"{dm_warp_rel}: 缺少 {_CN_DM_WARP_COMPILE_MISSING}（git OTA 无 dm_warp pkl 会 commIssue）"
+      )
+    else:
+      if "def _cn_ensure_dm_warp(" not in dm_warp_tx:
+        errors.append(f"{dm_warp_rel}: 缺少 _cn_ensure_dm_warp")
+      if "compile_dm_warp(" not in dm_warp_tx:
+        errors.append(f"{dm_warp_rel}: _cn_ensure_dm_warp 未调用 compile_dm_warp")
+      if "warp_path.is_file()" not in dm_warp_tx:
+        errors.append(f"{dm_warp_rel}: 未在缺失时才编译 dm_warp pkl")
+      if re.search(
+        r"with open\(MODELS_DIR / f['\"]dm_warp_",
+        dm_warp_tx,
+      ):
+        errors.append(f"{dm_warp_rel}: 仍直接 open dm_warp pkl，未走缺失编译")
+      compile_rel = rpath("selfdrive/modeld/compile_dm_warp.py")
+      if not (root / compile_rel).is_file():
+        errors.append(f"{compile_rel}: 缺少 compile_dm_warp.py")
+
   # 语法兜底（不验证逻辑正确性）
   py_verify = [
     rpath("system/cn_main_repo_route.py"),
@@ -5079,6 +5184,7 @@ def verify_patches(root: Path) -> None:
     controls_rel,
     dm_tests_rel,
     mgr_rel,
+    dm_warp_rel,
   ]
   dm_verify = _dm_monitoring_path(root)
   if dm_verify is not None:
