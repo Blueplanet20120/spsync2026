@@ -9,7 +9,7 @@
 - 可选（CLI 开关；云端 Actions 不使用）：``--build-installer``、``--sync-mapd-release``（需 GITEE_TOKEN）。
   mapd / 远端 installer 交互更适合在本机用 ``tools/sync_to_gitee_local.py``；本脚本内菜单不含这两项。
 - 提交并推送到你的 Gitee：staging
-- GitHub Actions 推送成功后默认打附注 tag（``cn/staging-{上游短SHA}-{UTC时间}``），说明为上游 staging 包装提交里的 ``master commit`` 主题（如 ``chestnut: alert when big model ready``）。``SYNC_SKIP_ARCHIVE_TAG=1`` 可关闭。
+- GitHub Actions 推送成功后默认打附注 tag ``Beta-{上游短SHA}-{北京时间 YYYYMMDD-HHMMSS}``，可选 ``stable-…``。说明（tag message）仍为上游 staging 包装提交里的 ``master commit`` 主题。``SYNC_SKIP_ARCHIVE_TAG=1`` 可关闭；``SYNC_ARCHIVE_TAG_KIND`` / ``--archive-tag-kind`` 指定种类。
 
 用法示例：
   python3 tools/sync_to_gitee.py --action all                  # CI / 一键同步（常用）
@@ -1719,6 +1719,61 @@ def subject_from_upstream_packaging(root: Path, env: dict[str, str], upstream_sh
   return _strip_github_pr_suffix(first) if first else None
 
 
+_ARCHIVE_TAG_KIND_DEFAULT = "Beta"
+_ARCHIVE_TAG_KIND_STABLE = "stable"
+_ARCHIVE_TAG_KIND_BETA = "Beta"
+
+
+def _cn_archive_tz() -> datetime.tzinfo:
+  try:
+    return ZoneInfo("Asia/Shanghai")
+  except Exception:
+    return datetime.timezone(datetime.timedelta(hours=8))
+
+
+def cn_archive_tag_stamp(now: datetime.datetime | None = None) -> str:
+  """北京时间 YYYYMMDD-HHMMSS，例如 20260906-223022。"""
+  dt = now
+  if dt is None:
+    dt = datetime.datetime.now(_cn_archive_tz())
+  elif dt.tzinfo is None:
+    dt = dt.replace(tzinfo=_cn_archive_tz())
+  else:
+    dt = dt.astimezone(_cn_archive_tz())
+  return dt.strftime("%Y%m%d-%H%M%S")
+
+
+def normalize_archive_tag_kind(raw: str | None) -> str:
+  """stable / Beta。空、default、cn 均视为 Beta。"""
+  s = (raw or "").strip()
+  if s.lower() == "stable":
+    return _ARCHIVE_TAG_KIND_STABLE
+  return _ARCHIVE_TAG_KIND_BETA
+
+
+def archive_tag_kind_from_env() -> str:
+  return normalize_archive_tag_kind(
+    os.environ.get("SYNC_ARCHIVE_TAG_KIND") or os.environ.get("ARCHIVE_TAG_KIND")
+  )
+
+
+def cn_archive_tag_base(
+  kind: str,
+  upstream_short: str,
+  *,
+  rollback: bool = False,
+  now: datetime.datetime | None = None,
+) -> str:
+  """
+  Beta / stable: {前缀}-{sha}-{北京 YYYYMMDD-HHMMSS}
+  未指定或 default 一律 Beta（不再使用 cn/staging-）。
+  """
+  ts = cn_archive_tag_stamp(now)
+  k = normalize_archive_tag_kind(kind)
+  prefix = "stable" if k == _ARCHIVE_TAG_KIND_STABLE else "Beta"
+  return f"{prefix}-{upstream_short}-{ts}"
+
+
 def _unique_cn_archive_tag_name(root: Path, env: dict[str, str], base: str) -> str:
   name = base
   n = 0
@@ -1754,9 +1809,11 @@ def create_and_push_cn_archive_tag(
   *,
   branch: str | None = None,
   targets: set[str] | None = None,
+  tag_kind: str | None = None,
 ) -> str | None:
   """
-  在当前 HEAD 打一枚 ``cn/staging-…`` 附注 tag，并推到已成功的远端。
+  在当前 HEAD 打一枚附注 tag，并推到已成功的远端。
+  默认 ``Beta-{短SHA}-{北京时间到秒}``；``tag_kind=stable`` 时为 ``stable-…``。
   说明优先用上游 staging 的 master commit 主题。
   """
   branch = (branch or (SYNC_BRANCHES[0] if SYNC_BRANCHES else "staging")).strip()
@@ -1783,8 +1840,8 @@ def create_and_push_cn_archive_tag(
     subject = subject_from_upstream_packaging(root, env, recorded)
   if not subject:
     subject = f"国内化快照：upstream={upstream_short} HEAD={head[:12]}"
-  ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M")
-  tag = _unique_cn_archive_tag_name(root, env, f"cn/staging-{upstream_short}-{ts}")
+  kind = normalize_archive_tag_kind(tag_kind if tag_kind is not None else archive_tag_kind_from_env())
+  tag = _unique_cn_archive_tag_name(root, env, cn_archive_tag_base(kind, upstream_short))
   msg = subject if "upstream=" in subject else f"{subject}\n\nupstream={upstream_short}"
   try:
     run(
@@ -1841,7 +1898,7 @@ def maybe_archive_cn_tag_after_ci_push(root: Path, env: dict[str, str], state: d
     print("[skip] archive-tag: 本轮无成功推送")
     return
   want = _archive_tag_push_targets_from_state(state)
-  create_and_push_cn_archive_tag(root, env, targets=want)
+  create_and_push_cn_archive_tag(root, env, targets=want, tag_kind=archive_tag_kind_from_env())
 
 
 def fetch_mirror_recorded_upstream(
@@ -5635,7 +5692,7 @@ def main() -> None:
                     "执行模式：menu=交互菜单；pull=拉取+补丁；push=推全部启用源；"
                     "push-gitee/push-codeup=仅推一端（CI 分步）；emit-outputs=写 GITHUB_OUTPUT；"
                     "print-ci-push-targets=输出 workflow 条件变量；"
-                    "archive-tag=推送成功后打 cn/staging 留档 tag；"
+                    "archive-tag=推送成功后打留档 tag（默认 Beta-短SHA-北京时间到秒，可选 stable）；"
                     "verify-tinygrad-models=仅校验 tinygrad_repo 与 models JSON ref；all=pull+push"
                   ))
   ap.add_argument("--build-installer", action="store_true", default=False, help="在 larch64 设备上构建 installer（需要 extras=on）")
@@ -5647,7 +5704,15 @@ def main() -> None:
   ap.add_argument("--installer-repo", default=INSTALLER_REPO_DEFAULT, help="用于发布 installer 的仓库（默认 sp-cn_install）")
   ap.add_argument("--installer-repo-branch", default="master", help="发布 installer 的分支")
   ap.add_argument("--publish-installer-release", action="store_true", default=True, help="发布 installer 后自动创建 Gitee Release（tag=YYYYMMDDHHMM）")
+  ap.add_argument(
+      "--archive-tag-kind",
+      default=None,
+      metavar="KIND",
+      help="留档 tag：Beta（默认，Beta-SHA-北京时间到秒）或 stable。也可用 SYNC_ARCHIVE_TAG_KIND。",
+  )
   args = ap.parse_args()
+  if getattr(args, "archive_tag_kind", None):
+    os.environ["SYNC_ARCHIVE_TAG_KIND"] = str(args.archive_tag_kind).strip()
 
   if args.action == "print-ci-push-targets":
     write_push_targets_github_output()
@@ -6176,7 +6241,9 @@ def main() -> None:
           print("[skip] archive-tag: 本轮无成功推送")
         else:
           want = _archive_tag_push_targets_from_state(st)
-          create_and_push_cn_archive_tag(root, env, targets=want)
+          create_and_push_cn_archive_tag(
+            root, env, targets=want, tag_kind=archive_tag_kind_from_env(),
+          )
     elif args.action == "verify-tinygrad-models":
       verify_tinygrad_models_alignment(root)
       print("[ok] tinygrad_repo 与 models JSON tinygrad_ref 一致")

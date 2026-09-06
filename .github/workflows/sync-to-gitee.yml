@@ -3,8 +3,8 @@ run-name: >-
   ${{
     github.event_name == 'schedule' && format('sync-to-gitee (scheduled) @ {0}', github.ref_name)
     || github.event_name == 'workflow_dispatch' && (
-      (github.event.inputs.force_sync == 'true' && format('sync-to-gitee (manual,force) @ {0}', github.ref_name))
-      || format('sync-to-gitee (manual) @ {0}', github.ref_name)
+      (github.event.inputs.force_sync == 'true' && format('sync-to-gitee (manual,force,{1}) @ {0}', github.ref_name, github.event.inputs.archive_tag_kind || 'Beta'))
+      || format('sync-to-gitee (manual,{1}) @ {0}', github.ref_name, github.event.inputs.archive_tag_kind || 'Beta')
     )
     || format('sync-to-gitee ({0}) @ {1}', github.event_name, github.ref_name)
   }}
@@ -21,6 +21,14 @@ on:
         required: false
         type: boolean
         default: false
+      archive_tag_kind:
+        description: "推送成功后的 tag 名：Beta=Beta-短SHA-北京时间到秒（默认）；stable=stable-短SHA-北京时间"
+        required: false
+        type: choice
+        options:
+          - Beta
+          - stable
+        default: Beta
 
 concurrency:
   group: sync-to-gitee
@@ -277,11 +285,13 @@ jobs:
           GITEE_REPO_SSH: ${{ secrets.GITEE_REPO_SSH }}
           GIT_LFS_SKIP_PUSH: "1"
           SP_CN_TOKEN: ${{ secrets.SP_CN_TOKEN }}
+          SYNC_ARCHIVE_TAG_KIND: ${{ github.event.inputs.archive_tag_kind || 'Beta' }}
         run: |
           set -euo pipefail
           WORKDIR="$GITHUB_WORKSPACE/sunnypilot"
           python3 "$GITHUB_WORKSPACE/tools/sync_to_gitee.py" \
             --action archive-tag \
+            --archive-tag-kind "${SYNC_ARCHIVE_TAG_KIND}" \
             --workdir "$WORKDIR" \
             --origin "$GITEE_REPO_SSH" \
             --upstream "https://github.com/sunnypilot/sunnypilot.git"
