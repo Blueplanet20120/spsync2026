@@ -541,9 +541,7 @@ def _build_sync_context_section(state: dict[str, object]) -> str:
     parts.append("分支核对：\n" + "\n".join(str(x) for x in notes))
   commit_blocks = state.get("upstream_commit_blocks") or []
   if commit_blocks:
-    sec_title = (
-      "上游 master 提交说明（以 staging 已同步的 master 锚点为界，不含尚未进入 staging 的更新提交）"
-    )
+    sec_title = "上游提交说明"
     parts.append(f"---\n{sec_title}：\n\n" + "\n\n".join(str(b) for b in commit_blocks))
   return "\n\n".join(parts)
 
@@ -2318,10 +2316,10 @@ def _collect_staging_synced_master_commits(
   staging_head_sha: str,
 ) -> str:
   """
-  邮件用：只列 staging 已经同步到的 master（包装提交里的 master commit 锚点），
-  不含比该锚点更新、尚未进入 staging 的 master tip。
-  - 锚点提交时间距现在 ≤ 窗口小时：以锚点时刻为基准，向下取窗口内全部（first-parent）。
-  - 超过窗口：从锚点起最多向下 N 条（含锚点）。
+  邮件用：时间锚点是 staging 包装提交（如 40d6afd 进 staging 的时刻），不是 master 那笔的时间。
+  列出从包装说明里的 master commit 起向更旧（不含尚未进入 staging 的 master tip）。
+  - staging 提交时间距现在 ≤ 窗口小时：以该 staging 时刻为基准，窗口内 master 全部列出。
+  - 超过窗口：从 master 指针起最多向下 N 条（含指针自身）。
   """
   hours = _email_staging_master_window_hours()
   max_old = _email_staging_master_max_old()
@@ -2335,6 +2333,10 @@ def _collect_staging_synced_master_commits(
     run(["git", "rev-parse", "--verify", f"{sha}^{{commit}}"], str(root), env=env)
   except Exception:
     return f"（无法读取 staging HEAD {short_sha(sha) or sha[:EMAIL_SHA_LEN]}。）"
+
+  staging_dt = _git_commit_committer_dt(root, env, sha)
+  if staging_dt is None:
+    return f"（无法读取 staging 锚点 {short_sha(sha) or sha[:EMAIL_SHA_LEN]} 的提交时间。）"
 
   try:
     body = run(["git", "log", "-1", "--format=%B", sha], str(root), env=env)
@@ -2360,16 +2362,12 @@ def _collect_staging_synced_master_commits(
   if not master_full:
     return f"（无法解析 staging 钉住的 master commit {master_raw}。）"
 
-  anchor_dt = _git_commit_committer_dt(root, env, master_full)
-  if anchor_dt is None:
-    return f"（无法读取 master 锚点 {short_sha(master_full)} 的提交时间。）"
-
   now = datetime.datetime.now(datetime.timezone.utc)
-  age = now - anchor_dt
+  age = now - staging_dt
   window = datetime.timedelta(hours=hours)
   shas: list[str] = []
   if age <= window:
-    cutoff = anchor_dt - window
+    cutoff = staging_dt - window
     try:
       raw = run(
         [
@@ -2384,8 +2382,8 @@ def _collect_staging_synced_master_commits(
         env=env,
       )
     except Exception:
-      return f"（无法列出 master 锚点 {short_sha(master_full)} 向下的提交。）"
-    for line in raw.splitlines():
+      return "（无法列出已同步 master 向下的提交。）"
+    for i, line in enumerate(raw.splitlines()):
       parts = line.strip().split(None, 1)
       if len(parts) != 2:
         continue
@@ -2393,13 +2391,10 @@ def _collect_staging_synced_master_commits(
       dt = _parse_git_iso_dt(iso)
       if dt is None:
         continue
-      if dt < cutoff:
+      # 指针自身始终列出；更旧的用 staging 时刻往下的时间窗裁剪（staging 合并晚于 master）
+      if i > 0 and dt < cutoff:
         break
       shas.append(h)
-    mode = (
-      f"锚点距现在未超过 {hours} 小时，列出锚点时刻起向下 {hours} 小时内全部提交"
-      f"（{len(shas)} 条）。"
-    )
   else:
     try:
       raw = run(
@@ -2415,21 +2410,13 @@ def _collect_staging_synced_master_commits(
         env=env,
       )
     except Exception:
-      return f"（无法列出 master 锚点 {short_sha(master_full)} 向下的提交。）"
+      return "（无法列出已同步 master 向下的提交。）"
     shas = [ln.strip().lower() for ln in raw.splitlines() if len(ln.strip()) >= 7]
-    mode = (
-      f"锚点距现在已超过 {hours} 小时，最多向下 {max_old} 条（含锚点，实际 {len(shas)} 条）。"
-    )
 
-  hdr = (
-    f"staging 已同步的 master 锚点：{short_sha(master_full)}"
-    f"（提交时间 {anchor_dt.isoformat()}）。"
-    f"不含比该锚点更新、尚未进入 staging 的 master 提交。{mode}\n"
-  )
   if not shas:
-    return hdr + "（无提交可列出。）"
+    return "（无提交可列出。）"
   entries = [_plain_commit_email_block(root, env, h) for h in shas]
-  return hdr + _bullet_prefix_entries(entries)
+  return _bullet_prefix_entries(entries)
 
 
 def collect_upstream_commits_for_email(
@@ -2443,8 +2430,7 @@ def collect_upstream_commits_for_email(
   max_commits: int | None = None,
 ) -> str:
   """
-  所有通知邮件共用：以当前拉取的 staging HEAD 包装提交中的 master commit 为锚点，
-  只列该锚点及更旧的 master 提交（不含尚未进入 staging 的 master tip）。
+  所有通知邮件共用：时间看 staging 包装提交，列表从其中 master commit 指针向更旧走。
   branch / base_sha / reason_tag / max_commits 保留兼容调用方。
   """
   _ = (branch, base_sha, reason_tag, max_commits)
