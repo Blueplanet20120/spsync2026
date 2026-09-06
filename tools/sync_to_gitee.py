@@ -541,18 +541,15 @@ def _build_sync_context_section(state: dict[str, object]) -> str:
     parts.append("分支核对：\n" + "\n".join(str(x) for x in notes))
   commit_blocks = state.get("upstream_commit_blocks") or []
   if commit_blocks:
-    if variant == "force_only":
-      sec_title = "上游提交说明（Force 重同步；下列为最近若干小时，不是相对 Gitee 的新增区间）"
-    elif variant == "mixed":
-      sec_title = "上游提交摘要（主仓库 subject，与 GitHub 一致；可能含 Force 分支的说明行）"
-    else:
-      sec_title = "上游新提交摘要（sunnypilot 主仓库，与 GitHub 提交列表 subject 一致）"
+    sec_title = (
+      "上游 master 提交说明（以 staging 已同步的 master 锚点为界，不含尚未进入 staging 的更新提交）"
+    )
     parts.append(f"---\n{sec_title}：\n\n" + "\n\n".join(str(b) for b in commit_blocks))
   return "\n\n".join(parts)
 
 
 def _build_push_results_section(state: dict[str, object]) -> str:
-  lines = ["推送结果："]
+  lines = ["推送结果：", f"· 推送版本: {_mail_channel_label(state)}"]
   for row in ci_push_targets_report():
     tid = str(row["id"])
     label = str(row["label"])
@@ -644,14 +641,17 @@ def build_ci_notify(
   ):
     body_parts.append(_build_sync_context_section(state))
   elif mail_kind == "fail" and (
-    state.get("sync_reason_tags") or state.get("notify_branch_notes")
+    state.get("sync_reason_tags")
+    or state.get("upstream_commit_blocks")
+    or state.get("notify_branch_notes")
   ):
     body_parts.append(_build_sync_context_section(state))
 
+  ch = _mail_channel_slug(state)
   subject_map = {
-    "full_ok": "[OK] sp_cn_sync-bot",
-    "partial_ok": "[Partially OK] sp_cn_sync-bot",
-    "fail": "[FAIL] sp_cn_sync-bot",
+    "full_ok": f"[OK] sp_cn_{ch}_sync-bot",
+    "partial_ok": f"[Partially OK] sp_cn_{ch}_sync-bot",
+    "fail": f"[FAIL] sp_cn_{ch}_sync-bot",
   }
   subject = subject_map.get(mail_kind, "")
   body = "\n\n".join(p for p in body_parts if p)
@@ -2098,6 +2098,62 @@ def _email_log_max_shown() -> int:
     return 6
 
 
+def _email_staging_master_window_hours() -> int:
+  """锚点提交时刻起向下回溯的小时数（锚点距现在仍在该窗口内时用）。"""
+  raw = (os.environ.get("SYNC_EMAIL_STAGING_MASTER_HOURS") or "6").strip()
+  try:
+    return max(1, min(int(raw), 72))
+  except ValueError:
+    return 6
+
+
+def _email_staging_master_max_old() -> int:
+  """锚点距现在已超过窗口时，最多向下列出的 master 提交条数（含锚点）。"""
+  raw = (os.environ.get("SYNC_EMAIL_STAGING_MASTER_MAX") or "3").strip()
+  try:
+    return max(1, min(int(raw), 20))
+  except ValueError:
+    return 3
+
+
+def _mail_channel_from_state(state: dict[str, object] | None = None) -> str:
+  raw = ""
+  if state:
+    raw = str(state.get("archive_tag_kind") or "")
+  if not raw.strip():
+    raw = os.environ.get("SYNC_ARCHIVE_TAG_KIND") or os.environ.get("ARCHIVE_TAG_KIND") or ""
+  return normalize_archive_tag_kind(raw)
+
+
+def _mail_channel_slug(state: dict[str, object] | None = None) -> str:
+  return "stable" if _mail_channel_from_state(state) == _ARCHIVE_TAG_KIND_STABLE else "beta"
+
+
+def _mail_channel_label(state: dict[str, object] | None = None) -> str:
+  return "Stable" if _mail_channel_slug(state) == "stable" else "Beta"
+
+
+def _parse_git_iso_dt(raw: str) -> datetime.datetime | None:
+  s = (raw or "").strip()
+  if not s:
+    return None
+  try:
+    dt = datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
+  except ValueError:
+    return None
+  if dt.tzinfo is None:
+    return dt.replace(tzinfo=datetime.timezone.utc)
+  return dt.astimezone(datetime.timezone.utc)
+
+
+def _git_commit_committer_dt(root: Path, env: dict[str, str], sha: str) -> datetime.datetime | None:
+  try:
+    raw = run(["git", "log", "-1", "--format=%cI", sha], str(root), env=env).strip()
+  except Exception:
+    return None
+  return _parse_git_iso_dt(raw)
+
+
 def _email_master_body_max_lines() -> int:
   """
   master 提交除 subject 外，额外附带正文（%b）的行数上限。
@@ -2256,40 +2312,124 @@ def _plain_commit_email_block(root: Path, env: dict[str, str], sha: str) -> str:
   return "\n".join(parts)
 
 
-def _collect_force_lookback_commits(
+def _collect_staging_synced_master_commits(
   root: Path,
   env: dict[str, str],
-  branch: str,
-  max_n: int,
+  staging_head_sha: str,
 ) -> str:
-  """手动 Force：没有新增同步区间，改列最近 N 小时上游 master（及 staging 包装）提交说明。"""
-  hours = _email_lookback_hours()
-  since_iso, tz_label = _email_log_since_hours_iso(hours)
-  hint = f"（最近 {hours} 小时，时区 {tz_label}）"
-  parts = [
-    "手动 Force：上游 HEAD 相对上次 Gitee 记录未变，无「新增提交」同步区间。"
-    f"下列为最近 {hours} 小时上游提交说明，便于对照。{hint}"
-  ]
+  """
+  邮件用：只列 staging 已经同步到的 master（包装提交里的 master commit 锚点），
+  不含比该锚点更新、尚未进入 staging 的 master tip。
+  - 锚点提交时间距现在 ≤ 窗口小时：以锚点时刻为基准，向下取窗口内全部（first-parent）。
+  - 超过窗口：从锚点起最多向下 N 条（含锚点）。
+  """
+  hours = _email_staging_master_window_hours()
+  max_old = _email_staging_master_max_old()
+  walk_cap = 80
+  sha = (staging_head_sha or "").strip().lower()
+  if len(sha) < 7:
+    return "（无有效 staging HEAD，无法列出已同步的 master 提交。）"
+
   ensure_upstream_master_for_staging_email(root, env)
+  try:
+    run(["git", "rev-parse", "--verify", f"{sha}^{{commit}}"], str(root), env=env)
+  except Exception:
+    return f"（无法读取 staging HEAD {short_sha(sha) or sha[:EMAIL_SHA_LEN]}。）"
 
-  master_shas = _git_log_shas_since(root, env, "upstream/master", since_iso, max_n)
-  if master_shas:
-    entries = [_plain_commit_email_block(root, env, sha) for sha in master_shas]
-    extra = ""
-    if len(master_shas) >= max_n:
-      extra = f"\n… 最多展示 {max_n} 条（SYNC_EMAIL_LOG_MAX）。"
-    parts.append("upstream/master：\n" + _bullet_prefix_entries(entries) + extra)
-  else:
-    parts.append("upstream/master：该窗口内无提交。")
+  try:
+    body = run(["git", "log", "-1", "--format=%B", sha], str(root), env=env)
+  except Exception:
+    return "（无法读取 staging 包装提交说明。）"
 
-  staging_rev = f"upstream/{branch}"
-  staging_shas = _git_log_shas_since(root, env, staging_rev, since_iso, max_n)
-  if staging_shas:
-    entries = [_staging_commit_display_block(root, env, sha) for sha in staging_shas]
-    parts.append(f"{staging_rev}（包装提交，含 master 指针展开）：\n" + _bullet_prefix_entries(entries))
+  master_raw = parse_master_commit_from_message(body)
+  if not master_raw:
+    return "（staging 包装提交无 master commit 指针，无法列出已同步的 master 说明。）"
+
+  try:
+    run(["git", "fetch", "upstream", "master", "--deepen=40"], str(root), env=env)
+  except Exception:
+    pass
+
+  master_full = canonical_commit_sha(master_raw, root, env)
+  if not master_full:
+    try:
+      run(["git", "fetch", "upstream", "master"], str(root), env=env)
+    except Exception:
+      pass
+    master_full = canonical_commit_sha(master_raw, root, env)
+  if not master_full:
+    return f"（无法解析 staging 钉住的 master commit {master_raw}。）"
+
+  anchor_dt = _git_commit_committer_dt(root, env, master_full)
+  if anchor_dt is None:
+    return f"（无法读取 master 锚点 {short_sha(master_full)} 的提交时间。）"
+
+  now = datetime.datetime.now(datetime.timezone.utc)
+  age = now - anchor_dt
+  window = datetime.timedelta(hours=hours)
+  shas: list[str] = []
+  if age <= window:
+    cutoff = anchor_dt - window
+    try:
+      raw = run(
+        [
+          "git",
+          "log",
+          "--first-parent",
+          f"-n{walk_cap}",
+          "--format=%H %cI",
+          master_full,
+        ],
+        str(root),
+        env=env,
+      )
+    except Exception:
+      return f"（无法列出 master 锚点 {short_sha(master_full)} 向下的提交。）"
+    for line in raw.splitlines():
+      parts = line.strip().split(None, 1)
+      if len(parts) != 2:
+        continue
+      h, iso = parts[0].strip().lower(), parts[1].strip()
+      dt = _parse_git_iso_dt(iso)
+      if dt is None:
+        continue
+      if dt < cutoff:
+        break
+      shas.append(h)
+    mode = (
+      f"锚点距现在未超过 {hours} 小时，列出锚点时刻起向下 {hours} 小时内全部提交"
+      f"（{len(shas)} 条）。"
+    )
   else:
-    parts.append(f"{staging_rev}：该窗口内无包装提交。")
-  return "\n\n".join(parts)
+    try:
+      raw = run(
+        [
+          "git",
+          "log",
+          "--first-parent",
+          f"-n{max_old}",
+          "--format=%H",
+          master_full,
+        ],
+        str(root),
+        env=env,
+      )
+    except Exception:
+      return f"（无法列出 master 锚点 {short_sha(master_full)} 向下的提交。）"
+    shas = [ln.strip().lower() for ln in raw.splitlines() if len(ln.strip()) >= 7]
+    mode = (
+      f"锚点距现在已超过 {hours} 小时，最多向下 {max_old} 条（含锚点，实际 {len(shas)} 条）。"
+    )
+
+  hdr = (
+    f"staging 已同步的 master 锚点：{short_sha(master_full)}"
+    f"（提交时间 {anchor_dt.isoformat()}）。"
+    f"不含比该锚点更新、尚未进入 staging 的 master 提交。{mode}\n"
+  )
+  if not shas:
+    return hdr + "（无提交可列出。）"
+  entries = [_plain_commit_email_block(root, env, h) for h in shas]
+  return hdr + _bullet_prefix_entries(entries)
 
 
 def collect_upstream_commits_for_email(
@@ -2303,136 +2443,13 @@ def collect_upstream_commits_for_email(
   max_commits: int | None = None,
 ) -> str:
   """
-  抓取上游新增提交的摘要行（与 GitHub Commits 的 subject 一致）。
-
-  对 upstream/staging：包装提交的 subject 常为版本号，正文中的 master commit 指针会展开为 master 的
-  subject（及可选若干行正文，见 SYNC_EMAIL_MASTER_BODY_MAX_LINES），与上游 master 一致。
-
-  规则（与设计一致）：
-  - 仅收录「当天」自然日内的提交：默认按 SYNC_EMAIL_LOG_TZ（未设则为 UTC）当日 0 点起。
-  - 同一同步区间内若仍过多，只展示「最新」若干条（默认 6 条），其余省略说明。
-  - max_commits 参数若传入则覆盖环境变量（仅供测试）；CI 通常不传。
+  所有通知邮件共用：以当前拉取的 staging HEAD 包装提交中的 master commit 为锚点，
+  只列该锚点及更旧的 master 提交（不含尚未进入 staging 的 master tip）。
+  branch / base_sha / reason_tag / max_commits 保留兼容调用方。
   """
-  head_sha = head_sha.strip().lower()
-  since_iso, tz_label = _email_log_day_start_iso()
-  max_n = max_commits if max_commits is not None else _email_log_max_shown()
-  day_hint = f"（自然日按 {tz_label}，自当日 0:00 起）"
-
-  if reason_tag == "force_same":
-    return _collect_force_lookback_commits(root, env, branch, max_n)
-
-  def _log_today_in_range(range_spec: str) -> tuple[list[str], int, int]:
-    """返回 (展示行, 今日区间内总数, 区间内全部提交数（不限今日）)。"""
-    total_all = -1
-    try:
-      ta = run(["git", "rev-list", "--count", range_spec], str(root), env=env).strip()
-      if ta.isdigit():
-        total_all = int(ta)
-    except Exception:
-      pass
-
-    total_today = -1
-    try:
-      tt = run(
-        ["git", "rev-list", "--count", "--since", since_iso, range_spec],
-        str(root),
-        env=env,
-      ).strip()
-      if tt.isdigit():
-        total_today = int(tt)
-    except Exception:
-      pass
-
-    log_out = ""
-    try:
-      fmt = "%H" if branch == "staging" else "%h %s"
-      log_out = run(
-        [
-          "git", "log",
-          "--since", since_iso,
-          "-n", str(max_n),
-          f"--format={fmt}",
-          range_spec,
-        ],
-        str(root),
-        env=env,
-      )
-    except Exception:
-      log_out = ""
-
-    raw_lines = [ln.rstrip() for ln in log_out.splitlines() if ln.strip()]
-    if branch == "staging":
-      ensure_upstream_master_for_staging_email(root, env)
-      entries = [_staging_commit_display_block(root, env, ln.strip()) for ln in raw_lines]
-    else:
-      entries = [format_email_commit_line(ln) for ln in raw_lines]
-    return entries, total_today, total_all
-
-  def _upstream_branch_today_entries() -> list[str]:
-    """降级 / 无记录：取 upstream/<branch> 今日最新若干条，staging 时展开 master。"""
-    fmt = "%H" if branch == "staging" else "%h %s"
-    fb = run(
-      [
-        "git", "log",
-        "--since", since_iso,
-        "-n", str(max_n),
-        f"--format={fmt}",
-        f"upstream/{branch}",
-      ],
-      str(root),
-      env=env,
-    )
-    raw_lines = [ln.rstrip() for ln in fb.splitlines() if ln.strip()]
-    if branch == "staging":
-      ensure_upstream_master_for_staging_email(root, env)
-      return [_staging_commit_display_block(root, env, ln.strip()) for ln in raw_lines]
-    return [format_email_commit_line(ln) for ln in raw_lines]
-
-  if base_sha:
-    base_sha = base_sha.strip().lower()
-    ensure_git_objects_for_range(root, env, branch, base_sha, head_sha)
-    range_spec = f"{base_sha}..{head_sha}"
-
-    entries, total_today, total_all = _log_today_in_range(range_spec)
-
-    if entries:
-      extra = ""
-      if total_today > max_n:
-        extra = f"\n… 另有 {total_today - max_n} 条「今日」提交未列出（最多展示 {max_n} 条）。{day_hint}"
-      elif total_today >= 0 and total_today > len(entries):
-        extra = f"\n… 另有 {total_today - len(entries)} 条未列出。{day_hint}"
-      header = f"今日上游提交（区间内）{day_hint}\n"
-      return header + _bullet_prefix_entries(entries) + extra
-
-    if total_all == 0:
-      return "（相对上次记录无新增 superproject 提交；若仍触发了同步，请对照「分支核对」与 Actions 日志。）"
-
-    if total_today == 0 and total_all > 0:
-      return (
-        "（同步区间内虽有提交，但提交时间均不在「今日」自然日内，故邮件不展开历史 subject；"
-        f"完整列表见 GitHub。{day_hint}"
-      )
-
-    # 区间不可用（浅历史、缺失对象）：降级为上游分支「今日」最新几条
-    try:
-      lines = _upstream_branch_today_entries()
-      if not lines:
-        return (
-          f"（未能列出上游提交或今日尚无提交落在区间内；请见 GitHub。{day_hint}"
-          f"\n（降级查询 upstream/{branch} 今日仍为空的常见原因：浅克隆未加深到含「今日」提交。）"
-        )
-      hdr = f"（区间解析不完整，下列仅为 upstream/{branch} 上「今日」最新若干条，仅供参考）{day_hint}\n"
-      return hdr + _bullet_prefix_entries(lines)
-    except Exception:
-      return "（未能列出上游提交；请在 GitHub sunnypilot 仓库对应分支历史中查看。）"
-
-  # 无上次记录：仅展示上游分支「今日」最新若干条
+  _ = (branch, base_sha, reason_tag, max_commits)
   try:
-    lines = _upstream_branch_today_entries()
-    if not lines:
-      return f"（Gitee 侧无 upstream 记录；且 upstream/{branch} 在「今日」内无提交可列举。{day_hint}）"
-    hdr = f"（无上次 upstream 记录；下列为 upstream/{branch}「今日」提交）{day_hint}\n"
-    return hdr + _bullet_prefix_entries(lines)
+    return _collect_staging_synced_master_commits(root, env, head_sha)
   except Exception:
     return "（未能列出上游提交。）"
 
@@ -5852,11 +5869,13 @@ def main() -> None:
       "to_push": False,
       "branches": [],
       "sync_reason_tags": [],
+      "archive_tag_kind": archive_tag_kind_from_env(),
     }
     # load optional .env next to this repo (never committed)
     sp_dotenv = load_dotenv(REPO_ROOT / ".env")
     for k, v in sp_dotenv.items():
       env.setdefault(k, v)
+    ci_sync_state["archive_tag_kind"] = archive_tag_kind_from_env()
     ensure_sp_cn_token(env, required=args.build_installer)
     _push_sources = enabled_main_repo_push_sources()
     _device_src = main_repo_device_source()

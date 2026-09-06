@@ -45,6 +45,7 @@ jobs:
     env:
       # GitHub 将逐步收回 Node 20；邮件步骤所用 action 已升级到 node24 版本（见 dawidd6/action-send-mail）。
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+      SYNC_ARCHIVE_TAG_KIND: ${{ github.event.inputs.archive_tag_kind || 'Beta' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -173,8 +174,8 @@ jobs:
           SKIP_SUBMODULES: "auto"
           FORCE_SYNC: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.force_sync == 'true' && '1' || '' }}
           SYNC_EMAIL_LOG_TZ: "Asia/Shanghai"
-          SYNC_EMAIL_LOG_MAX: "12"
-          SYNC_EMAIL_LOG_HOURS: "16"
+          SYNC_EMAIL_STAGING_MASTER_HOURS: "6"
+          SYNC_EMAIL_STAGING_MASTER_MAX: "3"
           SP_CN_TOKEN: ${{ secrets.SP_CN_TOKEN }}
         run: |
           set -euo pipefail
@@ -304,6 +305,7 @@ jobs:
         env:
           CI_STEP_OUTCOME_CODEUP: ${{ steps.sync_push_codeup.outcome }}
           CI_STEP_OUTCOME_GITEE: ${{ steps.sync_push_gitee.outcome }}
+          SYNC_ARCHIVE_TAG_KIND: ${{ github.event.inputs.archive_tag_kind || 'Beta' }}
         run: |
           set -euo pipefail
           python3 "$GITHUB_WORKSPACE/tools/sync_to_gitee.py" \
@@ -338,10 +340,13 @@ jobs:
           username: ${{ secrets.SMTP_USER }}
           password: ${{ secrets.SMTP_PASS }}
           subject: >-
-            [FAIL] ${{ github.repository }} sync-to-gitee pull (run ${{ github.run_id }})
+            [FAIL] sp_cn_${{ github.event.inputs.archive_tag_kind == 'stable' && 'stable' || 'beta' }}_sync-bot
           to: ${{ secrets.MAIL_TO }}
           from: ${{ secrets.MAIL_FROM }}
           body: |
+            推送结果：
+            · 推送版本: ${{ github.event.inputs.archive_tag_kind == 'stable' && 'Stable' || 'Beta' }}
+
             spsync2026 同步失败：pull 阶段未成功（补丁/拉取），未执行推送。
 
             pull: ${{ steps.sync_pull.outcome }}
