@@ -542,7 +542,7 @@ def _build_sync_context_section(state: dict[str, object]) -> str:
   commit_blocks = state.get("upstream_commit_blocks") or []
   if commit_blocks:
     if variant == "force_only":
-      sec_title = "上游提交说明（本次为 Force 重同步，下列为各分支情况）"
+      sec_title = "上游提交说明（Force 重同步；下列为最近若干小时，不是相对 Gitee 的新增区间）"
     elif variant == "mixed":
       sec_title = "上游提交摘要（主仓库 subject，与 GitHub 一致；可能含 Force 分支的说明行）"
     else:
@@ -2051,6 +2051,16 @@ def ensure_git_objects_for_range(root: Path, env: dict[str, str], branch: str, b
       break
 
 
+def _email_log_tz() -> tuple[datetime.tzinfo, str]:
+  tz_name = (os.environ.get("SYNC_EMAIL_LOG_TZ") or "UTC").strip()
+  try:
+    tz = ZoneInfo(tz_name)
+  except Exception:
+    tz_name = "UTC"
+    tz = ZoneInfo(tz_name)
+  return tz, tz_name
+
+
 def _email_log_day_start_iso() -> tuple[str, str]:
   """
   邮件里「当天」的自然日起点（用于 git --since），按所选时区当日 0:00。
@@ -2058,14 +2068,24 @@ def _email_log_day_start_iso() -> tuple[str, str]:
   默认 UTC（更接近 GitHub/CI 常见“标准时间”视角）。
   环境变量 SYNC_EMAIL_LOG_TZ（IANA）可覆盖，例如 UTC、Asia/Shanghai。
   """
-  tz_name = (os.environ.get("SYNC_EMAIL_LOG_TZ") or "UTC").strip()
-  try:
-    tz = ZoneInfo(tz_name)
-  except Exception:
-    tz_name = "UTC"
-    tz = ZoneInfo(tz_name)
+  tz, tz_name = _email_log_tz()
   now = datetime.datetime.now(tz)
   start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+  return start.isoformat(), tz_name
+
+
+def _email_lookback_hours() -> int:
+  """Force 邮件回看小时数；默认 16。环境变量 SYNC_EMAIL_LOG_HOURS（1～168）。"""
+  raw = (os.environ.get("SYNC_EMAIL_LOG_HOURS") or "16").strip()
+  try:
+    return max(1, min(int(raw), 168))
+  except Exception:
+    return 16
+
+
+def _email_log_since_hours_iso(hours: int) -> tuple[str, str]:
+  tz, tz_name = _email_log_tz()
+  start = datetime.datetime.now(tz) - datetime.timedelta(hours=hours)
   return start.isoformat(), tz_name
 
 
@@ -2178,6 +2198,100 @@ def _bullet_prefix_entries(entries: list[str]) -> str:
   return "\n".join(lines_out)
 
 
+def _git_log_shas_since(
+  root: Path,
+  env: dict[str, str],
+  rev: str,
+  since_iso: str,
+  max_n: int,
+) -> list[str]:
+  try:
+    out = run(
+      [
+        "git", "log",
+        "--since", since_iso,
+        "-n", str(max_n),
+        "--format=%H",
+        rev,
+      ],
+      str(root),
+      env=env,
+    )
+  except Exception:
+    return []
+  return [ln.strip().lower() for ln in out.splitlines() if ln.strip()]
+
+
+def _plain_commit_email_block(root: Path, env: dict[str, str], sha: str) -> str:
+  """master 等普通提交：subject + 若干行正文。"""
+  sha = sha.strip().lower()
+  try:
+    short = short_sha(sha) or sha[:EMAIL_SHA_LEN]
+    subj = shorten_hashes_in_text(
+      run(["git", "log", "-1", "--format=%s", sha], str(root), env=env).strip()
+    )
+  except Exception:
+    return f"{sha[:EMAIL_SHA_LEN]} （无法读取提交）"
+  parts: list[str] = [f"{short} {subj}"]
+  max_body = _email_master_body_max_lines()
+  if max_body <= 0:
+    return parts[0]
+  mb_raw = ""
+  try:
+    mb_raw = run(["git", "log", "-1", "--format=%b", sha], str(root), env=env)
+  except Exception:
+    mb_raw = ""
+  taken = 0
+  for ln in mb_raw.splitlines():
+    s = ln.strip()
+    if not s or s == subj.strip():
+      continue
+    s = shorten_hashes_in_text(s)
+    if len(s) > 220:
+      s = s[:217] + "..."
+    parts.append(f"       {s}")
+    taken += 1
+    if taken >= max_body:
+      break
+  return "\n".join(parts)
+
+
+def _collect_force_lookback_commits(
+  root: Path,
+  env: dict[str, str],
+  branch: str,
+  max_n: int,
+) -> str:
+  """手动 Force：没有新增同步区间，改列最近 N 小时上游 master（及 staging 包装）提交说明。"""
+  hours = _email_lookback_hours()
+  since_iso, tz_label = _email_log_since_hours_iso(hours)
+  hint = f"（最近 {hours} 小时，时区 {tz_label}）"
+  parts = [
+    "手动 Force：上游 HEAD 相对上次 Gitee 记录未变，无「新增提交」同步区间。"
+    f"下列为最近 {hours} 小时上游提交说明，便于对照。{hint}"
+  ]
+  ensure_upstream_master_for_staging_email(root, env)
+
+  master_shas = _git_log_shas_since(root, env, "upstream/master", since_iso, max_n)
+  if master_shas:
+    entries = [_plain_commit_email_block(root, env, sha) for sha in master_shas]
+    extra = ""
+    if len(master_shas) >= max_n:
+      extra = f"\n… 最多展示 {max_n} 条（SYNC_EMAIL_LOG_MAX）。"
+    parts.append("upstream/master：\n" + _bullet_prefix_entries(entries) + extra)
+  else:
+    parts.append("upstream/master：该窗口内无提交。")
+
+  staging_rev = f"upstream/{branch}"
+  staging_shas = _git_log_shas_since(root, env, staging_rev, since_iso, max_n)
+  if staging_shas:
+    entries = [_staging_commit_display_block(root, env, sha) for sha in staging_shas]
+    parts.append(f"{staging_rev}（包装提交，含 master 指针展开）：\n" + _bullet_prefix_entries(entries))
+  else:
+    parts.append(f"{staging_rev}：该窗口内无包装提交。")
+  return "\n\n".join(parts)
+
+
 def collect_upstream_commits_for_email(
   root: Path,
   env: dict[str, str],
@@ -2205,9 +2319,7 @@ def collect_upstream_commits_for_email(
   day_hint = f"（自然日按 {tz_label}，自当日 0:00 起）"
 
   if reason_tag == "force_same":
-    return (
-      "（手动 Force：上游 HEAD 相对上次 Gitee 记录未变，无「新增提交」区间；本次仍会重跑补丁并推送。）"
-    )
+    return _collect_force_lookback_commits(root, env, branch, max_n)
 
   def _log_today_in_range(range_spec: str) -> tuple[list[str], int, int]:
     """返回 (展示行, 今日区间内总数, 区间内全部提交数（不限今日）)。"""

@@ -172,8 +172,9 @@ jobs:
           GITEE_REPO_SSH: ${{ secrets.GITEE_REPO_SSH }}
           SKIP_SUBMODULES: "auto"
           FORCE_SYNC: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.force_sync == 'true' && '1' || '' }}
-          SYNC_EMAIL_LOG_TZ: "UTC"
-          SYNC_EMAIL_LOG_MAX: "6"
+          SYNC_EMAIL_LOG_TZ: "Asia/Shanghai"
+          SYNC_EMAIL_LOG_MAX: "12"
+          SYNC_EMAIL_LOG_HOURS: "16"
           SP_CN_TOKEN: ${{ secrets.SP_CN_TOKEN }}
         run: |
           set -euo pipefail
