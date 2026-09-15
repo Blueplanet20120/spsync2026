@@ -2128,7 +2128,7 @@ def _mail_channel_slug(state: dict[str, object] | None = None) -> str:
 
 
 def _mail_channel_label(state: dict[str, object] | None = None) -> str:
-  return "Stable" if _mail_channel_slug(state) == "stable" else "Beta"
+  return _mail_channel_slug(state)
 
 
 def _parse_git_iso_dt(raw: str) -> datetime.datetime | None:
@@ -2240,15 +2240,19 @@ def _staging_commit_display_block(root: Path, env: dict[str, str], staging_full_
 
 
 def _bullet_prefix_entries(entries: list[str]) -> str:
-  """每条 entry 可为单行或多行（staging + master）。"""
+  """每条 entry 编号换行：1. …\\n2. …；多行正文缩进对齐。"""
   lines_out: list[str] = []
-  for e in entries:
+  for i, e in enumerate(entries, start=1):
     e = e.strip("\n")
+    prefix = f"{i}. "
+    pad = " " * len(prefix)
     if "\n" in e:
       first, rest = e.split("\n", 1)
-      lines_out.append(f"  • {first}\n{rest}")
+      body = "\n".join(pad + ln.lstrip() for ln in rest.splitlines() if ln.strip())
+      block = f"{prefix}{first}" + (f"\n{body}" if body else "")
     else:
-      lines_out.append(f"  • {e}")
+      block = f"{prefix}{e}"
+    lines_out.append(block)
   return "\n".join(lines_out)
 
 
