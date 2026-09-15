@@ -9,7 +9,7 @@
 - 可选（CLI 开关；云端 Actions 不使用）：``--build-installer``、``--sync-mapd-release``（需 GITEE_TOKEN）。
   mapd / 远端 installer 交互更适合在本机用 ``tools/sync_to_gitee_local.py``；本脚本内菜单不含这两项。
 - 提交并推送到你的 Gitee：staging
-- GitHub Actions 推送成功后默认打附注 tag ``Beta-{上游短SHA}-{北京时间 YYYYMMDD-HHMMSS}``，可选 ``stable-…``。说明（tag message）仍为上游 staging 包装提交里的 ``master commit`` 主题。``SYNC_SKIP_ARCHIVE_TAG=1`` 可关闭；``SYNC_ARCHIVE_TAG_KIND`` / ``--archive-tag-kind`` 指定种类。
+- GitHub Actions 推送成功后默认打附注 tag ``beta-{上游短SHA}-{北京时间 YYYYMMDD-HHMMSS}``，可选 ``stable-…``。说明（tag message）仍为上游 staging 包装提交里的 ``master commit`` 主题。``SYNC_SKIP_ARCHIVE_TAG=1`` 可关闭；``SYNC_ARCHIVE_TAG_KIND`` / ``--archive-tag-kind`` 指定种类。
 
 用法示例：
   python3 tools/sync_to_gitee.py --action all                  # CI / 一键同步（常用）
@@ -1717,9 +1717,9 @@ def subject_from_upstream_packaging(root: Path, env: dict[str, str], upstream_sh
   return _strip_github_pr_suffix(first) if first else None
 
 
-_ARCHIVE_TAG_KIND_DEFAULT = "Beta"
+_ARCHIVE_TAG_KIND_DEFAULT = "beta"
 _ARCHIVE_TAG_KIND_STABLE = "stable"
-_ARCHIVE_TAG_KIND_BETA = "Beta"
+_ARCHIVE_TAG_KIND_BETA = "beta"
 
 
 def _cn_archive_tz() -> datetime.tzinfo:
@@ -1742,9 +1742,9 @@ def cn_archive_tag_stamp(now: datetime.datetime | None = None) -> str:
 
 
 def normalize_archive_tag_kind(raw: str | None) -> str:
-  """stable / Beta。空、default、cn 均视为 Beta。"""
-  s = (raw or "").strip()
-  if s.lower() == "stable":
+  """stable / beta。空、default、cn、Beta 均视为 beta。"""
+  s = (raw or "").strip().lower()
+  if s == "stable":
     return _ARCHIVE_TAG_KIND_STABLE
   return _ARCHIVE_TAG_KIND_BETA
 
@@ -1763,12 +1763,12 @@ def cn_archive_tag_base(
   now: datetime.datetime | None = None,
 ) -> str:
   """
-  Beta / stable: {前缀}-{sha}-{北京 YYYYMMDD-HHMMSS}
-  未指定或 default 一律 Beta（不再使用 cn/staging-）。
+  beta / stable: {前缀}-{sha}-{北京 YYYYMMDD-HHMMSS}
+  未指定或 default 一律 beta（不再使用 cn/staging-）。
   """
   ts = cn_archive_tag_stamp(now)
   k = normalize_archive_tag_kind(kind)
-  prefix = "stable" if k == _ARCHIVE_TAG_KIND_STABLE else "Beta"
+  prefix = "stable" if k == _ARCHIVE_TAG_KIND_STABLE else "beta"
   return f"{prefix}-{upstream_short}-{ts}"
 
 
@@ -1811,7 +1811,7 @@ def create_and_push_cn_archive_tag(
 ) -> str | None:
   """
   在当前 HEAD 打一枚附注 tag，并推到已成功的远端。
-  默认 ``Beta-{短SHA}-{北京时间到秒}``；``tag_kind=stable`` 时为 ``stable-…``。
+  默认 ``beta-{短SHA}-{北京时间到秒}``；``tag_kind=stable`` 时为 ``stable-…``。
   说明优先用上游 staging 的 master commit 主题。
   """
   branch = (branch or (SYNC_BRANCHES[0] if SYNC_BRANCHES else "staging")).strip()
@@ -5811,7 +5811,7 @@ def main() -> None:
                     "执行模式：menu=交互菜单；pull=拉取+补丁；push=推全部启用源；"
                     "push-gitee/push-codeup=仅推一端（CI 分步）；emit-outputs=写 GITHUB_OUTPUT；"
                     "print-ci-push-targets=输出 workflow 条件变量；"
-                    "archive-tag=推送成功后打留档 tag（默认 Beta-短SHA-北京时间到秒，可选 stable）；"
+                    "archive-tag=推送成功后打留档 tag（默认 beta-短SHA-北京时间到秒，可选 stable）；"
                     "verify-tinygrad-models=仅校验 tinygrad_repo 与 models JSON ref；all=pull+push"
                   ))
   ap.add_argument("--build-installer", action="store_true", default=False, help="在 larch64 设备上构建 installer（需要 extras=on）")
@@ -5827,7 +5827,7 @@ def main() -> None:
       "--archive-tag-kind",
       default=None,
       metavar="KIND",
-      help="留档 tag：Beta（默认，Beta-SHA-北京时间到秒）或 stable。也可用 SYNC_ARCHIVE_TAG_KIND。",
+      help="留档 tag：beta（默认，beta-SHA-北京时间到秒）或 stable。也可用 SYNC_ARCHIVE_TAG_KIND。",
   )
   args = ap.parse_args()
   if getattr(args, "archive_tag_kind", None):

@@ -3,8 +3,8 @@ run-name: >-
   ${{
     github.event_name == 'schedule' && format('sync-to-gitee (scheduled) @ {0}', github.ref_name)
     || github.event_name == 'workflow_dispatch' && (
-      (github.event.inputs.force_sync == 'true' && format('sync-to-gitee (manual,force,{1}) @ {0}', github.ref_name, github.event.inputs.archive_tag_kind || 'Beta'))
-      || format('sync-to-gitee (manual,{1}) @ {0}', github.ref_name, github.event.inputs.archive_tag_kind || 'Beta')
+      (github.event.inputs.force_sync == 'true' && format('sync-to-gitee (manual,force,{1}) @ {0}', github.ref_name, github.event.inputs.archive_tag_kind || 'beta'))
+      || format('sync-to-gitee (manual,{1}) @ {0}', github.ref_name, github.event.inputs.archive_tag_kind || 'beta')
     )
     || format('sync-to-gitee ({0}) @ {1}', github.event_name, github.ref_name)
   }}
@@ -22,13 +22,13 @@ on:
         type: boolean
         default: false
       archive_tag_kind:
-        description: "推送成功后的 tag 名：Beta=Beta-短SHA-北京时间到秒（默认）；stable=stable-短SHA-北京时间"
+        description: "推送成功后的 tag 名：beta=beta-短SHA-北京时间到秒（默认）；stable=stable-短SHA-北京时间"
         required: false
         type: choice
         options:
-          - Beta
+          - beta
           - stable
-        default: Beta
+        default: beta
 
 concurrency:
   group: sync-to-gitee
@@ -45,7 +45,7 @@ jobs:
     env:
       # GitHub 将逐步收回 Node 20；邮件步骤所用 action 已升级到 node24 版本（见 dawidd6/action-send-mail）。
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-      SYNC_ARCHIVE_TAG_KIND: ${{ github.event.inputs.archive_tag_kind || 'Beta' }}
+      SYNC_ARCHIVE_TAG_KIND: ${{ github.event.inputs.archive_tag_kind || 'beta' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -287,7 +287,7 @@ jobs:
           GITEE_REPO_SSH: ${{ secrets.GITEE_REPO_SSH }}
           GIT_LFS_SKIP_PUSH: "1"
           SP_CN_TOKEN: ${{ secrets.SP_CN_TOKEN }}
-          SYNC_ARCHIVE_TAG_KIND: ${{ github.event.inputs.archive_tag_kind || 'Beta' }}
+          SYNC_ARCHIVE_TAG_KIND: ${{ github.event.inputs.archive_tag_kind || 'beta' }}
         run: |
           set -euo pipefail
           WORKDIR="$GITHUB_WORKSPACE/sunnypilot"
@@ -305,7 +305,7 @@ jobs:
         env:
           CI_STEP_OUTCOME_CODEUP: ${{ steps.sync_push_codeup.outcome }}
           CI_STEP_OUTCOME_GITEE: ${{ steps.sync_push_gitee.outcome }}
-          SYNC_ARCHIVE_TAG_KIND: ${{ github.event.inputs.archive_tag_kind || 'Beta' }}
+          SYNC_ARCHIVE_TAG_KIND: ${{ github.event.inputs.archive_tag_kind || 'beta' }}
         run: |
           set -euo pipefail
           python3 "$GITHUB_WORKSPACE/tools/sync_to_gitee.py" \
