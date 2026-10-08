@@ -4469,24 +4469,18 @@ def patch_gitmodules(root: Path) -> PatchResult:
   return res
 
 
-_CN_DM_WARP_COMPILE_MISSING = "cn_dm_warp_compile_missing_v2"
+_CN_DM_WARP_COMPILE_MISSING = "cn_dm_warp_compile_missing"
+_CN_TINYGRAD_COMPILE_WARP = "tinygrad_repo/examples/openpilot/compile_warp.py"
 
 _CN_ENSURE_DM_WARP_FN = '''
 def _cn_ensure_dm_warp(cam_w: int, cam_h: int):
-  # {sentinel}: git OTA 无 pkl、LFS 指针或损坏 pickle 时在设备上编译
+  # {sentinel}: git OTA has no SCons dm_warp pkl; compile once on device
   warp_path = MODELS_DIR / f'dm_warp_{{cam_w}}x{{cam_h}}_tinygrad.pkl'
-  min_ok = 50000
-  if warp_path.is_file() and warp_path.stat().st_size > min_ok:
-    try:
-      with open(warp_path, "rb") as f:
-        return pickle.load(f)
-    except Exception:
-      cloudlog.exception(f"DM warp pickle load failed ({{warp_path.name}}), will recompile")
-      try:
-        warp_path.unlink()
-      except FileNotFoundError:
-        pass
-  cloudlog.warning(f"compiling DM warp {{warp_path.name}} (missing/corrupt after git OTA)")
+  if warp_path.is_file() and warp_path.stat().st_size > 0:
+    with open(warp_path, "rb") as f:
+      obj = pickle.load(f)
+    return obj["run"] if isinstance(obj, dict) and "run" in obj else obj
+  cloudlog.warning(f"compiling missing DM warp {{warp_path.name}} (first onroad after git OTA)")
   from openpilot.common.transformations.model import DM_INPUT_SIZE
   from openpilot.selfdrive.modeld.compile_dm_warp import compile_dm_warp
   from openpilot.selfdrive.modeld.compile_modeld import NV12Frame
@@ -4501,7 +4495,40 @@ def _cn_ensure_dm_warp(cam_w: int, cam_h: int):
     except FileNotFoundError:
       pass
   with open(warp_path, "rb") as f:
-    return pickle.load(f)
+    obj = pickle.load(f)
+  return obj["run"] if isinstance(obj, dict) and "run" in obj else obj
+
+'''
+
+_CN_ENSURE_DM_WARP_FN_TG = '''
+def _cn_ensure_dm_warp(cam_w: int, cam_h: int):
+  # {sentinel}: git OTA has no SCons dm_warp pkl; compile once via tinygrad compile_warp
+  warp_path = MODELS_DIR / f'dm_warp_{{cam_w}}x{{cam_h}}_tinygrad.pkl'
+  if warp_path.is_file() and warp_path.stat().st_size > 0:
+    with open(warp_path, "rb") as f:
+      obj = pickle.load(f)
+    return obj["run"] if isinstance(obj, dict) and "run" in obj else obj
+  cloudlog.warning(f"compiling missing DM warp {{warp_path.name}} (first onroad after git OTA)")
+  import sys
+  from openpilot.common.basedir import BASEDIR
+  from openpilot.common.transformations.model import DM_INPUT_SIZE
+  tg_ex = os.path.join(BASEDIR, "tinygrad_repo", "examples")
+  if tg_ex not in sys.path:
+    sys.path.insert(0, tg_ex)
+  from examples.openpilot.compile_warp import NV12Frame, compile_warp, dump_pickle
+  nv12 = NV12Frame(cam_w, cam_h, *get_nv12_info(cam_w, cam_h))
+  artifact = compile_warp(nv12, DM_INPUT_SIZE, layout="luma", border_fill=16, benchmark_runs=3)
+  tmp_path = warp_path.with_name(warp_path.name + ".tmp")
+  try:
+    with open(tmp_path, "wb") as f:
+      dump_pickle(artifact, f)
+    os.replace(tmp_path, warp_path)
+  finally:
+    try:
+      os.unlink(tmp_path)
+    except FileNotFoundError:
+      pass
+  return artifact["run"]
 
 '''
 
@@ -4511,43 +4538,61 @@ _RE_CN_ENSURE_DM_WARP_FN = re.compile(
 )
 
 
+def _dm_warp_helper_src(root: Path) -> str:
+  if cn_path(root, "selfdrive/modeld/compile_dm_warp.py").is_file():
+    return _CN_ENSURE_DM_WARP_FN.format(sentinel=_CN_DM_WARP_COMPILE_MISSING)
+  tg = root / _CN_TINYGRAD_COMPILE_WARP
+  if not tg.is_file():
+    raise RuntimeError(
+      f"已引用 dm_warp_*.pkl 但既无 selfdrive/modeld/compile_dm_warp.py 也无 {tg}，"
+      f"无法注入 {_CN_DM_WARP_COMPILE_MISSING}"
+    )
+  return _CN_ENSURE_DM_WARP_FN_TG.format(sentinel=_CN_DM_WARP_COMPILE_MISSING)
+
+
 def patch_dm_warp_compile_missing(root: Path) -> PatchResult:
   """
-  上游 dmonitoringmodeld 改为加载 SCons/CI 编好的 dm_warp_WxH_tinygrad.pkl。
-  官方刷机有该文件；Gitee git OTA 可能没有，或只剩 LFS 指针。缺失/损坏时在设备上 compile_dm_warp。
-  v2：小文件/UnpicklingError 也会重编译（v1 只判断 size>0，指针文件会直接崩）。
+  上游 dmonitoringmodeld 加载 CI/SCons 编好的 dm_warp_WxH_tinygrad.pkl。
+  官方刷机有该文件；Gitee git OTA 没有。缺失时在设备上编一次：
+  有 compile_dm_warp.py 走旧脚本，否则走 tinygrad examples/openpilot/compile_warp.py。
   """
   res = PatchResult("dm_warp_compile_missing")
   path = cn_path(root, "selfdrive/modeld/dmonitoringmodeld.py")
   if not path.is_file():
     return res
   s = path.read_text(encoding="utf-8")
-  if _CN_DM_WARP_COMPILE_MISSING in s:
-    return res
   if "dm_warp_" not in s:
     return res
-  compile_py = cn_path(root, "selfdrive/modeld/compile_dm_warp.py")
-  if not compile_py.is_file():
-    raise RuntimeError(
-      f"{path}: 已引用 dm_warp_*.pkl 但缺少 {compile_py}，无法注入 {_CN_DM_WARP_COMPILE_MISSING}"
-    )
-  helper = _CN_ENSURE_DM_WARP_FN.format(sentinel=_CN_DM_WARP_COMPILE_MISSING)
-  if _RE_CN_ENSURE_DM_WARP_FN.search(s):
+  helper = _dm_warp_helper_src(root)
+  stale_legacy = (
+    _CN_DM_WARP_COMPILE_MISSING in s
+    and "compile_dm_warp" in s
+    and not cn_path(root, "selfdrive/modeld/compile_dm_warp.py").is_file()
+  )
+  if "cn_dm_warp_compile_missing_v2" in s or stale_legacy:
+    if not _RE_CN_ENSURE_DM_WARP_FN.search(s):
+      raise RuntimeError(f"{path}: 无法匹配已有 _cn_ensure_dm_warp，无法换成当前 helper")
     s2, n = _RE_CN_ENSURE_DM_WARP_FN.subn("\n" + helper.rstrip() + "\n", s, count=1)
     if n != 1:
-      raise RuntimeError(f"{path}: 无法升级 _cn_ensure_dm_warp 到 {_CN_DM_WARP_COMPILE_MISSING}")
+      raise RuntimeError(f"{path}: 无法替换已有 _cn_ensure_dm_warp")
     _track_change(res, path, write_if_changed(path, s2))
+    return res
+  if _CN_DM_WARP_COMPILE_MISSING in s:
     return res
   m = re.search(
     r"METADATA_PATH = MODELS_DIR / ['\"]dmonitoring_model_metadata\.pkl['\"]\n",
     s,
   )
-  if not m:
-    raise RuntimeError(f"{path}: 未找到 METADATA_PATH，无法注入 {_CN_DM_WARP_COMPILE_MISSING}")
-  s = s[: m.end()] + helper + s[m.end() :]
+  if m:
+    s = s[: m.end()] + helper + s[m.end() :]
+  else:
+    m2 = re.search(r"\nclass ModelState:\n", s)
+    if not m2:
+      raise RuntimeError(f"{path}: 未找到 class ModelState，无法注入 {_CN_DM_WARP_COMPILE_MISSING}")
+    s = s[: m2.start()] + "\n" + helper + s[m2.start() :]
   s2, n = re.subn(
     r"(?P<ind>[ \t]*)with open\(MODELS_DIR / f['\"]dm_warp_\{(?P<w>[^}]+)\}x\{(?P<h>[^}]+)\}_tinygrad\.pkl['\"], ['\"]rb['\"]\) as f:\n"
-    r"(?P=ind)  self\.image_warp = pickle\.load\(f\)",
+    r"(?P=ind)  self\.image_warp = pickle\.load\(f\)(?:\[['\"]run['\"]\])?",
     r"\g<ind>self.image_warp = _cn_ensure_dm_warp(\g<w>, \g<h>)",
     s,
     count=1,
@@ -4556,7 +4601,7 @@ def patch_dm_warp_compile_missing(root: Path) -> PatchResult:
     s2, n = re.subn(
       r"(?P<ind>[ \t]*)warp_path = MODELS_DIR / f['\"]dm_warp_\{(?P<w>[^}]+)\}x\{(?P<h>[^}]+)\}_tinygrad\.pkl['\"]\n"
       r"(?P=ind)with open\(warp_path, ['\"]rb['\"]\) as f:\n"
-      r"(?P=ind)  self\.image_warp = pickle\.load\(f\)",
+      r"(?P=ind)  self\.image_warp = pickle\.load\(f\)(?:\[['\"]run['\"]\])?",
       r"\g<ind>self.image_warp = _cn_ensure_dm_warp(\g<w>, \g<h>)",
       s,
       count=1,
@@ -4573,32 +4618,15 @@ _CN_DMONITORINGD_VALID_DS = "cn_dmonitoringd_valid_on_driverStateV2"
 
 
 def patch_dmonitoringd_valid_on_driverstate(root: Path) -> PatchResult:
-  """
-  dmonitoringd 用 sm.all_checks() 当 driverMonitoringState.valid。
-  上游 all_checks 含 modelV2：驾驶模型加载慢/频率抖动时 DM 一直 invalid，
-  selfdrived 就报 communication issue / driverMonitoringState。
-  国内化：只要 driverStateV2 有效就发 valid DM；run_step 失败只记日志。
-  """
+  """已废弃：卸掉 commIssue 试验补丁，恢复上游 all_checks。"""
   res = PatchResult("dmonitoringd_valid_on_driverstate")
   path = cn_path(root, "selfdrive/monitoring/dmonitoringd.py")
   if not path.is_file():
     return res
   s = path.read_text(encoding="utf-8")
-  if _CN_DMONITORINGD_VALID_DS in s:
+  if _CN_DMONITORINGD_VALID_DS not in s:
     return res
   old = (
-    "    valid = sm.all_checks()\n"
-    "    if demo_mode and sm.valid['driverStateV2']:\n"
-    "      DM.run_step(sm, demo=True)\n"
-    "    elif valid:\n"
-    "      DM.run_step(sm, demo=demo_mode)\n"
-    "\n"
-    "    # publish\n"
-    "    dat = DM.get_state_packet(valid=valid)\n"
-  )
-  if old not in s:
-    raise RuntimeError(f"{path}: 未找到 all_checks/run_step/publish 块，无法注入 {_CN_DMONITORINGD_VALID_DS}")
-  new = (
     f"    # {_CN_DMONITORINGD_VALID_DS}: valid DM 只跟 driverStateV2，不被 modelV2 拖成 commIssue\n"
     "    ds_ok = bool(sm.valid.get('driverStateV2', False))\n"
     "    try:\n"
@@ -4614,6 +4642,18 @@ def patch_dmonitoringd_valid_on_driverstate(root: Path) -> PatchResult:
     "    # publish\n"
     "    dat = DM.get_state_packet(valid=ds_ok)\n"
   )
+  new = (
+    "    valid = sm.all_checks()\n"
+    "    if demo_mode and sm.valid['driverStateV2']:\n"
+    "      DM.run_step(sm, demo=True)\n"
+    "    elif valid:\n"
+    "      DM.run_step(sm, demo=demo_mode)\n"
+    "\n"
+    "    # publish\n"
+    "    dat = DM.get_state_packet(valid=valid)\n"
+  )
+  if old not in s:
+    raise RuntimeError(f"{path}: 含 {_CN_DMONITORINGD_VALID_DS} 但无法匹配注入块，无法自动卸补丁")
   _track_change(res, path, write_if_changed(path, s.replace(old, new, 1)))
   return res
 
@@ -5400,28 +5440,31 @@ def verify_patches(root: Path) -> None:
     else:
       if "def _cn_ensure_dm_warp(" not in dm_warp_tx:
         errors.append(f"{dm_warp_rel}: 缺少 _cn_ensure_dm_warp")
-      if "compile_dm_warp(" not in dm_warp_tx:
-        errors.append(f"{dm_warp_rel}: _cn_ensure_dm_warp 未调用 compile_dm_warp")
+      if "compile_dm_warp(" not in dm_warp_tx and "compile_warp(" not in dm_warp_tx:
+        errors.append(f"{dm_warp_rel}: _cn_ensure_dm_warp 未调用 compile_dm_warp/compile_warp")
       if "warp_path.is_file()" not in dm_warp_tx:
         errors.append(f"{dm_warp_rel}: 未在缺失时才编译 dm_warp pkl")
-      if "min_ok" not in dm_warp_tx:
-        errors.append(f"{dm_warp_rel}: warp 加载未拒绝过小/损坏 pickle（需 {_CN_DM_WARP_COMPILE_MISSING}）")
+      if "cn_dm_warp_compile_missing_v2" in dm_warp_tx:
+        errors.append(f"{dm_warp_rel}: 仍含已废弃的 warp v2 helper")
+      if "min_ok" in dm_warp_tx:
+        errors.append(f"{dm_warp_rel}: 仍含已废弃的 min_ok warp 逻辑")
       if re.search(
         r"with open\(MODELS_DIR / f['\"]dm_warp_",
         dm_warp_tx,
       ):
         errors.append(f"{dm_warp_rel}: 仍直接 open dm_warp pkl，未走缺失编译")
       compile_rel = rpath("selfdrive/modeld/compile_dm_warp.py")
-      if not (root / compile_rel).is_file():
-        errors.append(f"{compile_rel}: 缺少 compile_dm_warp.py")
+      has_legacy = (root / compile_rel).is_file()
+      has_tg = (root / _CN_TINYGRAD_COMPILE_WARP).is_file()
+      if not has_legacy and not has_tg:
+        errors.append(f"{compile_rel} / {_CN_TINYGRAD_COMPILE_WARP}: 缺少 warp 编译脚本")
+      if "compile_dm_warp" in dm_warp_tx and not has_legacy:
+        errors.append(f"{dm_warp_rel}: helper 仍引用已删除的 compile_dm_warp.py")
 
   dmd_rel = rpath("selfdrive/monitoring/dmonitoringd.py")
   dmd_tx = rt("selfdrive/monitoring/dmonitoringd.py")
-  if dmd_tx.strip():
-    if _CN_DMONITORINGD_VALID_DS not in dmd_tx:
-      errors.append(f"{dmd_rel}: 缺少 {_CN_DMONITORINGD_VALID_DS}（modelV2 抖动会 commIssue）")
-    if "valid = sm.all_checks()" in dmd_tx:
-      errors.append(f"{dmd_rel}: 仍用 sm.all_checks() 作为 driverMonitoringState.valid")
+  if dmd_tx.strip() and _CN_DMONITORINGD_VALID_DS in dmd_tx:
+    errors.append(f"{dmd_rel}: 仍含已废弃的 {_CN_DMONITORINGD_VALID_DS}，应恢复上游 all_checks")
 
   # 语法兜底（不验证逻辑正确性）
   py_verify = [
