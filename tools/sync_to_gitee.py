@@ -4471,6 +4471,7 @@ def patch_gitmodules(root: Path) -> PatchResult:
 
 _CN_DM_WARP_COMPILE_MISSING = "cn_dm_warp_compile_missing"
 _CN_TINYGRAD_COMPILE_WARP = "tinygrad_repo/examples/openpilot/compile_warp.py"
+_CN_STOCK_WARP_DEPS = "sunnypilot/modeld_v2/stock_dependencies.py"
 
 _CN_ENSURE_DM_WARP_FN = '''
 def _cn_ensure_dm_warp(cam_w: int, cam_h: int):
@@ -4532,6 +4533,53 @@ def _cn_ensure_dm_warp(cam_w: int, cam_h: int):
 
 '''
 
+_CN_ENSURE_DM_WARP_FN_STOCK = '''
+def _cn_ensure_dm_warp(cam_w: int, cam_h: int):
+  # {sentinel}: git OTA has no dm_warp pkl; compile luma warp from stock_dependencies
+  warp_path = MODELS_DIR / f'dm_warp_{{cam_w}}x{{cam_h}}_tinygrad.pkl'
+  if warp_path.is_file() and warp_path.stat().st_size > 0:
+    with open(warp_path, "rb") as f:
+      obj = pickle.load(f)
+    return obj["run"] if isinstance(obj, dict) and "run" in obj else obj
+  cloudlog.warning(f"compiling missing DM warp {{warp_path.name}} (first onroad after git OTA)")
+  import numpy as np
+  from openpilot.common.transformations.model import DM_INPUT_SIZE
+  from openpilot.sunnypilot.modeld_v2.stock_dependencies import NV12Frame, warp_perspective_tinygrad
+  from tinygrad.device import Device
+  from tinygrad.engine.jit import TinyJit
+  from tinygrad.tensor import Tensor
+  nv12 = NV12Frame(cam_w, cam_h, *get_nv12_info(cam_w, cam_h))
+  dm_w, dm_h = DM_INPUT_SIZE
+
+  def _warp(input_frame, M_inv):
+    M_inv = M_inv.to(Device.DEFAULT).realize()
+    return warp_perspective_tinygrad(
+      input_frame[:nv12.height * nv12.stride], M_inv,
+      (dm_w, dm_h), (nv12.height, nv12.width), nv12.stride - nv12.width,
+      border_fill_val=16,
+    ).reshape(-1, dm_h * dm_w)
+
+  jit = TinyJit(_warp, prune=True)
+  rng = np.random.default_rng(0)
+  for _ in range(3):
+    frame = Tensor(rng.integers(0, 256, nv12.size, dtype=np.uint8), device=Device.DEFAULT).realize()
+    M = Tensor((rng.standard_normal((3, 3)) * 8).astype(np.float32), device="NPY")
+    jit(frame, M).realize()
+  artifact = {{"run": jit}}
+  tmp_path = warp_path.with_name(warp_path.name + ".tmp")
+  try:
+    with open(tmp_path, "wb") as f:
+      pickle.dump(artifact, f)
+    os.replace(tmp_path, warp_path)
+  finally:
+    try:
+      os.unlink(tmp_path)
+    except FileNotFoundError:
+      pass
+  return jit
+
+'''
+
 _RE_CN_ENSURE_DM_WARP_FN = re.compile(
   r"\ndef _cn_ensure_dm_warp\(cam_w: int, cam_h: int\):\n.*?(?=\nclass ModelState:)",
   re.S,
@@ -4541,20 +4589,23 @@ _RE_CN_ENSURE_DM_WARP_FN = re.compile(
 def _dm_warp_helper_src(root: Path) -> str:
   if cn_path(root, "selfdrive/modeld/compile_dm_warp.py").is_file():
     return _CN_ENSURE_DM_WARP_FN.format(sentinel=_CN_DM_WARP_COMPILE_MISSING)
-  tg = root / _CN_TINYGRAD_COMPILE_WARP
-  if not tg.is_file():
-    raise RuntimeError(
-      f"已引用 dm_warp_*.pkl 但既无 selfdrive/modeld/compile_dm_warp.py 也无 {tg}，"
-      f"无法注入 {_CN_DM_WARP_COMPILE_MISSING}"
-    )
-  return _CN_ENSURE_DM_WARP_FN_TG.format(sentinel=_CN_DM_WARP_COMPILE_MISSING)
+  if (root / _CN_TINYGRAD_COMPILE_WARP).is_file():
+    return _CN_ENSURE_DM_WARP_FN_TG.format(sentinel=_CN_DM_WARP_COMPILE_MISSING)
+  stock = cn_path(root, _CN_STOCK_WARP_DEPS)
+  if stock.is_file():
+    return _CN_ENSURE_DM_WARP_FN_STOCK.format(sentinel=_CN_DM_WARP_COMPILE_MISSING)
+  raise RuntimeError(
+    "已引用 dm_warp_*.pkl，但没有 compile_dm_warp.py、"
+    f"{root / _CN_TINYGRAD_COMPILE_WARP} 或 {stock}，无法注入 {_CN_DM_WARP_COMPILE_MISSING}"
+  )
 
 
 def patch_dm_warp_compile_missing(root: Path) -> PatchResult:
   """
   上游 dmonitoringmodeld 加载 CI/SCons 编好的 dm_warp_WxH_tinygrad.pkl。
   官方刷机有该文件；Gitee git OTA 没有。缺失时在设备上编一次：
-  有 compile_dm_warp.py 走旧脚本，否则走 tinygrad examples/openpilot/compile_warp.py。
+  有 compile_dm_warp.py 走旧脚本；否则 tinygrad compile_warp.py；
+  两者都没有时用 sunnypilot modeld_v2 stock_dependencies 的 luma warp。
   """
   res = PatchResult("dm_warp_compile_missing")
   path = cn_path(root, "selfdrive/modeld/dmonitoringmodeld.py")
@@ -4564,12 +4615,16 @@ def patch_dm_warp_compile_missing(root: Path) -> PatchResult:
   if "dm_warp_" not in s:
     return res
   helper = _dm_warp_helper_src(root)
-  stale_legacy = (
+  has_legacy = cn_path(root, "selfdrive/modeld/compile_dm_warp.py").is_file()
+  has_tg = (root / _CN_TINYGRAD_COMPILE_WARP).is_file()
+  stale_helper = (
     _CN_DM_WARP_COMPILE_MISSING in s
-    and "compile_dm_warp" in s
-    and not cn_path(root, "selfdrive/modeld/compile_dm_warp.py").is_file()
+    and (
+      ("compile_dm_warp" in s and not has_legacy)
+      or ("examples.openpilot.compile_warp" in s and not has_tg)
+    )
   )
-  if "cn_dm_warp_compile_missing_v2" in s or stale_legacy:
+  if "cn_dm_warp_compile_missing_v2" in s or stale_helper:
     if not _RE_CN_ENSURE_DM_WARP_FN.search(s):
       raise RuntimeError(f"{path}: 无法匹配已有 _cn_ensure_dm_warp，无法换成当前 helper")
     s2, n = _RE_CN_ENSURE_DM_WARP_FN.subn("\n" + helper.rstrip() + "\n", s, count=1)
@@ -5440,8 +5495,12 @@ def verify_patches(root: Path) -> None:
     else:
       if "def _cn_ensure_dm_warp(" not in dm_warp_tx:
         errors.append(f"{dm_warp_rel}: 缺少 _cn_ensure_dm_warp")
-      if "compile_dm_warp(" not in dm_warp_tx and "compile_warp(" not in dm_warp_tx:
-        errors.append(f"{dm_warp_rel}: _cn_ensure_dm_warp 未调用 compile_dm_warp/compile_warp")
+      if (
+        "compile_dm_warp(" not in dm_warp_tx
+        and "compile_warp(" not in dm_warp_tx
+        and "warp_perspective_tinygrad" not in dm_warp_tx
+      ):
+        errors.append(f"{dm_warp_rel}: _cn_ensure_dm_warp 未调用可用的 warp 编译函数")
       if "warp_path.is_file()" not in dm_warp_tx:
         errors.append(f"{dm_warp_rel}: 未在缺失时才编译 dm_warp pkl")
       if "cn_dm_warp_compile_missing_v2" in dm_warp_tx:
@@ -5456,10 +5515,13 @@ def verify_patches(root: Path) -> None:
       compile_rel = rpath("selfdrive/modeld/compile_dm_warp.py")
       has_legacy = (root / compile_rel).is_file()
       has_tg = (root / _CN_TINYGRAD_COMPILE_WARP).is_file()
-      if not has_legacy and not has_tg:
-        errors.append(f"{compile_rel} / {_CN_TINYGRAD_COMPILE_WARP}: 缺少 warp 编译脚本")
+      has_stock = cn_path(root, _CN_STOCK_WARP_DEPS).is_file()
+      if not has_legacy and not has_tg and not has_stock:
+        errors.append(f"{compile_rel} / compile_warp.py / {_CN_STOCK_WARP_DEPS}: 缺少 warp 编译来源")
       if "compile_dm_warp" in dm_warp_tx and not has_legacy:
         errors.append(f"{dm_warp_rel}: helper 仍引用已删除的 compile_dm_warp.py")
+      if "examples.openpilot.compile_warp" in dm_warp_tx and not has_tg:
+        errors.append(f"{dm_warp_rel}: helper 仍引用已删除的 tinygrad compile_warp.py")
 
   dmd_rel = rpath("selfdrive/monitoring/dmonitoringd.py")
   dmd_tx = rt("selfdrive/monitoring/dmonitoringd.py")
