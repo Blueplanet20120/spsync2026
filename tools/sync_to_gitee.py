@@ -3527,10 +3527,35 @@ def _vendored_tinygrad_already_aligned(tg: Path, *, target_commit: str, target_t
   return bool(marker_tree and marker_tree == target_tree)
 
 
+def _tinygrad_buffer_requires_dtype(device_py: str) -> bool:
+  """旧 tinygrad：Buffer(device, size, dtype) 的 dtype 是必填。"""
+  return "def __init__(self, device:str, size:int, dtype:DType" in device_py
+
+
+def _keep_vendored_tinygrad_for_plain_loader(root: Path) -> bool:
+  """
+  modeld_v2 的 plain artifact 加载器跟着本仓库 tinygrad 走：Buffer(device, nbytes)，没有 dtype。
+  models JSON 的 tinygrad_ref 仍可能是更旧的 pickle 引脚（dtype 必填，load_pickle 接收文件对象）。
+  把 vendored tinygrad 降到那个引脚后，modeld 在 Buffer(device, 1) 崩溃，
+  dmonitoringmodeld 把 Path 交给 load_pickle 崩溃。mici 上就是
+  modelV2 / extrinsicsCalibration / driverMonitoringState 的 commIssue。
+  """
+  if (os.environ.get("SYNC_TINYGRAD_FORCE_MODELS_REF") or "").strip().lower() in ("1", "true", "yes", "on"):
+    return False
+  helpers = cn_path(root, "sunnypilot/modeld_v2/helpers.py")
+  device_py = root / "tinygrad_repo" / "tinygrad" / "device.py"
+  if not helpers.is_file() or not device_py.is_file():
+    return False
+  loader = helpers.read_text(encoding="utf-8", errors="replace")
+  device_src = device_py.read_text(encoding="utf-8", errors="replace")
+  return "Buffer(device, 1)" in loader and not _tinygrad_buffer_requires_dtype(device_src)
+
+
 def patch_tinygrad_vendored_align(root: Path) -> PatchResult:
   """
   upstream staging 将 tinygrad_repo vendored 为 tree，可能与 models JSON tinygrad_ref 不一致。
-  国内镜像在此对齐 vendored 内容，避免 OTA 上 ModelManager 下载模型 unpickle 失败（nan m/s）。
+  旧 pickle 模型需要两边一致，否则 unpickle 失败（nan m/s）。
+  plain artifact 加载器则必须留在仓库自带的 tinygrad 上，不能降到 JSON 里的旧引脚。
   """
   res = PatchResult("tinygrad_vendored_align")
   if (os.environ.get("SYNC_PATCH_TINYGRAD_VENDORED") or "1").strip().lower() in ("0", "false", "no", "off"):
@@ -3559,6 +3584,14 @@ def patch_tinygrad_vendored_align(root: Path) -> PatchResult:
       f"patch_tinygrad_vendored_align: 无法解析 {ref_source} commit={target_commit[:12]} 的根 tree"
     )
   if _vendored_tinygrad_already_aligned(tg, target_commit=target_commit, target_tree=target_tree):
+    return res
+
+  if _keep_vendored_tinygrad_for_plain_loader(root):
+    log(
+      "tinygrad",
+      f"保持上游 vendored tinygrad，不对齐 {target_commit[:7]}（{ref_source}）。"
+      "modeld_v2 与仓库内 tinygrad 是一套；降到 models JSON 引脚会让 modeld / dmonitoringmodeld 启动即崩溃。",
+    )
     return res
 
   log(
@@ -5111,6 +5144,13 @@ def collect_tinygrad_models_verify_errors(root: Path) -> list[str]:
 
   if not workdir_sha:
     errors.append(f"workdir tinygrad: {workdir_src}")
+  elif models_ref and workdir_sha != models_ref and _keep_vendored_tinygrad_for_plain_loader(root):
+    log(
+      "warn",
+      "tinygrad_repo 与 models JSON tinygrad_ref 不一致，但 plain loader 绑定仓库内 tinygrad，不降级："
+      f"workdir={workdir_sha[:12]} ({workdir_src})，models tinygrad_ref={models_ref[:12]}。"
+      "降级会让 modeld 的 Buffer(device, nbytes) 和 dmonitoringmodeld 的 load_pickle(path) 在旧 tinygrad 上崩溃。",
+    )
   elif models_ref and workdir_sha != models_ref:
     errors.append(
       "tinygrad_repo 与 models JSON tinygrad_ref 不一致："
