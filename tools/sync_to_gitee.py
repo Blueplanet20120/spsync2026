@@ -5142,9 +5142,16 @@ def collect_tinygrad_models_verify_errors(root: Path) -> list[str]:
     else:
       log("warn", pin_msg + "（对齐跟 JSON，默认非阻塞；设 SYNC_TINYGRAD_REQUIRE_PIN_MATCH=1 可强制失败）")
 
-  if not workdir_sha:
+  keep_vendored = _keep_vendored_tinygrad_for_plain_loader(root)
+  if not workdir_sha and keep_vendored:
+    log(
+      "warn",
+      "tinygrad_repo 是上游 vendored tree，对不上 models JSON tinygrad_ref，但 plain loader 绑定这份 tinygrad，不拦截推送："
+      f"{workdir_src}",
+    )
+  elif not workdir_sha:
     errors.append(f"workdir tinygrad: {workdir_src}")
-  elif models_ref and workdir_sha != models_ref and _keep_vendored_tinygrad_for_plain_loader(root):
+  elif models_ref and workdir_sha != models_ref and keep_vendored:
     log(
       "warn",
       "tinygrad_repo 与 models JSON tinygrad_ref 不一致，但 plain loader 绑定仓库内 tinygrad，不降级："
@@ -5688,7 +5695,18 @@ def ensure_tinygrad_submodule_commit_reachable(root: Path | None = None) -> None
   """
   确保 Gitee tinygrad 镜像含对齐目标 commit（优先 models JSON tinygrad_ref）。
   子模块 update 阶段仍走 GitHub upstream；此处仅为 Gitee 克隆者兜底。
+  tinygrad_repo 已是上游 vendored tree 时没有子模块指针，不必把 JSON 旧引脚推到镜像。
   """
+  if root is not None:
+    ent = _git_ls_tree_entry(root, "HEAD", "tinygrad_repo")
+    if ent and ent[0] != "commit":
+      log(
+        "tinygrad",
+        "tinygrad_repo 已随上游放进主仓库（不是子模块指针），"
+        "跳过把 models JSON tinygrad_ref 推到 Gitee tinygrad 镜像。",
+      )
+      return
+
   sha = TINYGRAD_MODELS_REF
   if root is not None:
     resolved, source, _ = _resolve_tinygrad_models_ref(root, offline_ok=True)
