@@ -3121,13 +3121,58 @@ def patch_opendbc_pyproject(root: Path) -> PatchResult:
   return res
 
 
+def _github_models_doc_names() -> set[str] | None:
+  """GitHub sunnypilot-models gh-pages/docs 下的文件名。失败时返回 None。"""
+  url = "https://api.github.com/repos/sunnypilot/sunnypilot-models/contents/docs?ref=gh-pages"
+  try:
+    req = urllib.request.Request(
+      url,
+      headers={"User-Agent": "spsync-models-json/1", "Accept": "application/vnd.github+json"},
+    )
+    with urllib.request.urlopen(req, timeout=20) as resp:
+      data = json.loads(resp.read().decode("utf-8", errors="replace"))
+  except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError, ValueError):
+    return None
+  if not isinstance(data, list):
+    return None
+  return {str(item.get("name") or "") for item in data if isinstance(item, dict)}
+
+
+def _promote_models_json_name(json_name: str) -> str:
+  """
+  本地 pull 设置 SYNC_MODELS_FOLLOW_LATEST=1 时，把 driving_models*_vN.json
+  升到 GitHub gh-pages 上同系列的最高版本。上游 fetcher 仍写 v25 时，车上也能拉到 v26。
+  """
+  if (os.environ.get("SYNC_MODELS_FOLLOW_LATEST") or "").strip().lower() not in ("1", "true", "yes", "on"):
+    return json_name
+  m = _MODELS_JSON_VER_RE.match((json_name or "").strip())
+  if not m:
+    return json_name
+  prefix, ver = m.group(1), int(m.group(2))
+  names = _github_models_doc_names()
+  if not names:
+    log("warn", f"无法列出 GitHub 模型清单，{json_name} 保持上游版本")
+    return json_name
+  best = ver
+  for name in names:
+    mm = _MODELS_JSON_VER_RE.match(name)
+    if not mm or mm.group(1).lower() != prefix.lower():
+      continue
+    best = max(best, int(mm.group(2)))
+  if best == ver:
+    return json_name
+  promoted = f"{prefix}_v{best}.json"
+  log("models", f"清单 {json_name} → {promoted}（GitHub gh-pages 同系列最高版本）")
+  return promoted
+
+
 def _rewrite_models_url_attr(s: str, attr: str, *, required: bool, path: Path) -> str:
   m = re.search(rf'{attr}\s*=\s*"([^"]+)"', s)
   if not m:
     if required:
       raise RuntimeError(f"{path}: 找不到 {attr} 赋值")
     return s
-  json_name = _extract_model_json_basename(m.group(1))
+  json_name = _promote_models_json_name(_extract_model_json_basename(m.group(1)))
   new_url = _resolve_gitee_models_json_url(json_name)
   current = _fix_models_json_url_typos(m.group(1).strip())
   if current == new_url:
