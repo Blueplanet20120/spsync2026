@@ -177,6 +177,7 @@ jobs:
           GITEE_UPLOAD_TIMEOUT_S: "900"
         run: |
           set -euo pipefail
+          # sunnypilot-models 在默认列表里：镜像 gh-pages（含最新 driving_models*_vN.json）并打印最高版本
           python3 "$GITHUB_WORKSPACE/tools/sync_dep_mirrors.py"
 
       - name: Cleanup old workflow runs (keep latest 5)

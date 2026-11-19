@@ -179,6 +179,8 @@ def sync_one(cache_dir: Path, owner: str, use_https: bool, m: RepoMirror) -> Non
   dry = _run(push_args[:2] + ["--porcelain", "--dry-run"] + push_args[2:], cwd=mirror_dir)
   if not _push_would_change(dry):
     print("[dep] already up-to-date, skip push")
+    if m.label == "sunnypilot-models":
+      _print_models_manifest_tips(mirror_dir)
     return
 
   push_tries = int((os.environ.get("DEP_MIRROR_PUSH_TRIES") or "4").strip() or "4")
@@ -189,6 +191,38 @@ def sync_one(cache_dir: Path, owner: str, use_https: bool, m: RepoMirror) -> Non
     tries=max(1, push_tries),
     base_sleep_s=push_base,
   )
+  if m.label == "sunnypilot-models":
+    _print_models_manifest_tips(mirror_dir)
+
+
+_MODELS_JSON_VER_RE = re.compile(
+  r"^(driving_models(?:_chestnut|_usbgpu)?)_v(\d+)\.json$",
+  re.IGNORECASE,
+)
+
+
+def _print_models_manifest_tips(mirror_dir: Path) -> None:
+  """镜像完成后打印 gh-pages 上各系列最高的模型清单文件名。"""
+  try:
+    out = _run(["git", "ls-tree", "-r", "--name-only", "refs/heads/gh-pages", "docs"], cwd=mirror_dir)
+  except Exception as e:
+    print(f"[dep] 无法列出 gh-pages 模型清单: {e}")
+    return
+  best: dict[str, tuple[int, str]] = {}
+  for line in out.splitlines():
+    name = line.strip().rsplit("/", 1)[-1]
+    m = _MODELS_JSON_VER_RE.match(name)
+    if not m:
+      continue
+    prefix, ver = m.group(1), int(m.group(2))
+    prev = best.get(prefix.lower())
+    if prev is None or ver > prev[0]:
+      best[prefix.lower()] = (ver, name)
+  if not best:
+    print("[dep] gh-pages/docs 里没有 driving_models*_vN.json")
+    return
+  tips = ", ".join(item[1] for item in sorted(best.values()))
+  print(f"[dep] 模型清单已随 gh-pages 镜像，当前最高版本: {tips}")
 
 
 def _load_sync_to_gitee_impl() -> object:
