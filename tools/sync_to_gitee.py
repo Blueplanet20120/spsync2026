@@ -829,6 +829,32 @@ def _env_truthy(name: str, *, default: str = "") -> bool:
   return raw in ("1", "true", "yes", "on", "y")
 
 
+_SP_CHANNEL_LINE_RE = re.compile(r"(?m)^sp-channel:\s*\S+\s*$")
+
+
+def sp_channel_mark_from_env(env: dict[str, str] | None = None) -> str | None:
+  """本次要打的 tag：beta → dev，stable → sta。未明确指定则不写。"""
+  e = env if env is not None else os.environ
+  raw = (e.get("SYNC_ARCHIVE_TAG_KIND") or e.get("ARCHIVE_TAG_KIND") or "").strip().lower()
+  if raw == "stable":
+    return "sta"
+  if raw == "beta":
+    return "dev"
+  return None
+
+
+def with_sp_channel_trailer(msg: str, env: dict[str, str] | None = None) -> str:
+  mark = sp_channel_mark_from_env(env)
+  if not mark:
+    return msg
+  line = f"sp-channel: {mark}"
+  if _SP_CHANNEL_LINE_RE.search(msg):
+    msg = _SP_CHANNEL_LINE_RE.sub(line, msg)
+  else:
+    msg = msg.rstrip() + "\n" + line
+  return msg.rstrip() + "\n"
+
+
 def squash_branch_single_commit(root: Path, branch: str, env: dict[str, str]) -> None:
   """
   Gitee 免费版单仓库约 1GB；长期推送完整 upstream 历史会超限。
@@ -837,7 +863,7 @@ def squash_branch_single_commit(root: Path, branch: str, env: dict[str, str]) ->
   注意：远端体积需偶尔在 Gitee 仓库设置执行「Git GC」回收旧对象。
   """
   run(["git", "checkout", branch], str(root), env=env)
-  msg = run(["git", "log", "-1", "--format=%B"], str(root), env=env).rstrip() + "\n"
+  msg = with_sp_channel_trailer(run(["git", "log", "-1", "--format=%B"], str(root), env=env), env)
   tmp = f"__sp_squash_{branch}"
   run(["git", "checkout", "--orphan", tmp], str(root), env=env)
   run(["git", "add", "-A"], str(root), env=env)
@@ -1489,6 +1515,7 @@ def _render_cn_main_repo_route_py(gitee: MainRepoSource, codeup: MainRepoSource)
   return f'''#!/usr/bin/env python3
 # {_CN_MAIN_REPO_ROUTE_SENTINEL} — sunnypilot_cn dynamic main-repo routing (private key = author flag)
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -1534,8 +1561,46 @@ def git_ssh_command_codeup() -> str | None:
   )
 
 
+def _sp_channel_mark() -> str:
+  """beta tag → dev，stable tag → sta。优先读提交说明里的 sp-channel，其次看指向 HEAD 的 tag。"""
+  repo = Path(__file__).resolve().parent
+  try:
+    body = subprocess.check_output(
+      ["git", "log", "-1", "--format=%B"],
+      cwd=str(repo),
+      stderr=subprocess.DEVNULL,
+      encoding="utf-8",
+      timeout=3,
+    )
+  except (subprocess.CalledProcessError, OSError):
+    body = ""
+  found = re.search(r"(?m)^sp-channel:\\s*(sta|dev)\\s*$", body or "")
+  if found:
+    return found.group(1)
+  try:
+    tags = subprocess.check_output(
+      ["git", "tag", "--points-at", "HEAD"],
+      cwd=str(repo),
+      stderr=subprocess.DEVNULL,
+      encoding="utf-8",
+      timeout=3,
+    )
+  except (subprocess.CalledProcessError, OSError):
+    return ""
+  names = [t.strip() for t in (tags or "").splitlines() if t.strip()]
+  if any(n.startswith("stable-") for n in names):
+    return "sta"
+  if any(n.startswith("beta-") for n in names):
+    return "dev"
+  return ""
+
+
 def main_repo_ui_suffix() -> str:
-  return " (Codeup)" if is_author_device() else " (Gitee)"
+  host = "Codeup" if is_author_device() else "Gitee"
+  mark = _sp_channel_mark()
+  if mark:
+    return f" ({{host}}-{{mark}})"
+  return f" ({{host}})"
 
 
 def resolve_main_repo_urls() -> tuple[str, str]:
@@ -5253,7 +5318,7 @@ def verify_patches(root: Path) -> None:
   if _CN_MAIN_REPO_ROUTE_SENTINEL not in route_tx:
     errors.append(f"{route_rel}: 缺少路由模块或 sentinel")
   else:
-    for fn in ("ensure_codeup_ssh_key", "codeup_ssh_identity_file", "prepare_main_repo_git", "main_repo_ui_suffix"):
+    for fn in ("ensure_codeup_ssh_key", "codeup_ssh_identity_file", "prepare_main_repo_git", "main_repo_ui_suffix", "_sp_channel_mark"):
       if f"def {fn}" not in route_tx:
         errors.append(f"{route_rel}: 缺少 {fn}")
     if codeup.ssh_url not in route_tx or gitee.https_url not in route_tx:
@@ -6329,11 +6394,12 @@ def main() -> None:
       if status.strip():
         run(["git", "add", "-A"], str(root), env=env)
         upstream_short = upstream_sha[:7]
-        msg = (
+        msg = with_sp_channel_trailer(
           f"based-on: sunnypilot/{branch}@{upstream_short}\n\n"
           "cn: redirect GitHub URLs to Gitee mirrors\n"
           f"upstream-{branch}: {upstream_sha}\n"
-          "Made-with: tools\n"
+          "Made-with: tools\n",
+          env,
         )
         run(["git",
              "-c", "user.name=sunnypilot-cn-bot",
@@ -6342,11 +6408,12 @@ def main() -> None:
       else:
         # 若没有任何补丁改动但 upstream 已变化，也提交一个空提交记录 upstream SHA，便于后续跳过。
         upstream_short = upstream_sha[:7]
-        msg = (
+        msg = with_sp_channel_trailer(
           f"based-on: sunnypilot/{branch}@{upstream_short}\n\n"
           "cn: sync upstream (no patch changes)\n"
           f"upstream-{branch}: {upstream_sha}\n"
-          "Made-with: tools\n"
+          "Made-with: tools\n",
+          env,
         )
         run(["git",
              "-c", "user.name=sunnypilot-cn-bot",
